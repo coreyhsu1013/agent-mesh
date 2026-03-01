@@ -1,0 +1,11 @@
+.agent-mesh/
+node_modules/
+.env
+*.pem
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+.mypy_cache/
+plan.json

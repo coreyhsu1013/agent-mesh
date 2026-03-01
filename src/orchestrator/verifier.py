@@ -1,0 +1,467 @@
+"""
+Agent Mesh v0.7 — Verifier
+Runs mechanical checks (conflict scan, build, test, lint) and
+LLM-powered spec diff (Gemini + Opus dual verification).
+
+Verify steps (ordered by cost):
+  1. Conflict markers scan        — 0 tokens, instant
+  2. Build (tsc / hardhat compile) — 0 tokens, seconds
+  3. Lint                          — 0 tokens, seconds
+  4. Test                          — 0 tokens, seconds
+  5. Spec diff (Gemini + Opus)     — $$ tokens, minutes
+  6. AC checklist (Gemini + Opus)  — $$ tokens, minutes
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+logger = logging.getLogger("agent-mesh")
+
+
+# ── Data Structures ──
+
+@dataclass
+class VerifyIssue:
+    """Single issue found during verification."""
+    category: str        # conflict | build | lint | test | spec_gap | ac_fail
+    severity: str        # HIGH | MEDIUM | LOW
+    message: str
+    file: str | None = None
+    module: str | None = None
+    found_by: list[str] = field(default_factory=lambda: ["mechanical"])
+
+    def to_dict(self) -> dict:
+        return {
+            "category": self.category,
+            "severity": self.severity,
+            "message": self.message,
+            "file": self.file,
+            "module": self.module,
+            "found_by": self.found_by,
+        }
+
+
+@dataclass
+class VerifyReport:
+    """Full verification report for a cycle."""
+    cycle: int
+    issues: list[VerifyIssue] = field(default_factory=list)
+    build_ok: bool = False
+    test_ok: bool = False
+    lint_ok: bool = False
+    spec_gap_count: int = 0
+    duration_s: float = 0.0
+
+    @property
+    def passed(self) -> bool:
+        return len(self.issues) == 0
+
+    @property
+    def high_issues(self) -> list[VerifyIssue]:
+        return [i for i in self.issues if i.severity == "HIGH"]
+
+    def summary(self) -> str:
+        status = "✅ PASSED" if self.passed else f"❌ {len(self.issues)} issues"
+        parts = [
+            f"[Verify Cycle {self.cycle}] {status}",
+            f"  Build: {'✅' if self.build_ok else '❌'}",
+            f"  Test:  {'✅' if self.test_ok else '❌'}",
+            f"  Lint:  {'✅' if self.lint_ok else '❌'}",
+            f"  Spec gaps: {self.spec_gap_count}",
+            f"  Duration: {self.duration_s:.1f}s",
+        ]
+        if self.issues:
+            parts.append("  Issues:")
+            for i in self.issues[:10]:
+                parts.append(f"    [{i.severity}] {i.category}: {i.message}")
+            if len(self.issues) > 10:
+                parts.append(f"    ... and {len(self.issues) - 10} more")
+        return "\n".join(parts)
+
+    def to_dict(self) -> dict:
+        return {
+            "cycle": self.cycle,
+            "passed": self.passed,
+            "build_ok": self.build_ok,
+            "test_ok": self.test_ok,
+            "lint_ok": self.lint_ok,
+            "spec_gap_count": self.spec_gap_count,
+            "issue_count": len(self.issues),
+            "high_count": len(self.high_issues),
+            "duration_s": self.duration_s,
+            "issues": [i.to_dict() for i in self.issues],
+        }
+
+
+# ── Verifier ──
+
+class Verifier:
+    """Runs verification checks on a repo."""
+
+    def __init__(self, repo_dir: str, config: dict):
+        self.repo_dir = repo_dir
+        self.config = config
+        verify_cfg = config.get("verify", {})
+        self.build_cmd = verify_cfg.get("build_cmd", "pnpm build")
+        self.test_cmd = verify_cfg.get("test_cmd", "pnpm test")
+        self.lint_cmd = verify_cfg.get("lint_cmd", "pnpm lint")
+        self.skip_lint = verify_cfg.get("skip_lint", True)  # many projects don't have lint
+        self.skip_test = verify_cfg.get("skip_test", False)
+
+    async def run(self, cycle: int = 1, spec_path: str | None = None) -> VerifyReport:
+        """Run all verification steps and return report."""
+        t0 = time.time()
+        report = VerifyReport(cycle=cycle)
+
+        # Step 1: Conflict markers (instant, free)
+        conflicts = await self._scan_conflicts()
+        for f in conflicts:
+            report.issues.append(VerifyIssue(
+                category="conflict",
+                severity="HIGH",
+                message=f"Git conflict markers in {f}",
+                file=f,
+            ))
+
+        # Step 2: Build
+        build_ok, build_errors = await self._run_build()
+        report.build_ok = build_ok
+        if not build_ok:
+            for err in build_errors[:20]:  # cap at 20
+                report.issues.append(VerifyIssue(
+                    category="build",
+                    severity="HIGH",
+                    message=err,
+                ))
+
+        # Step 3: Lint (optional)
+        if not self.skip_lint:
+            lint_ok, lint_warnings = await self._run_lint()
+            report.lint_ok = lint_ok
+            if not lint_ok:
+                for w in lint_warnings[:10]:
+                    report.issues.append(VerifyIssue(
+                        category="lint",
+                        severity="MEDIUM",
+                        message=w,
+                    ))
+        else:
+            report.lint_ok = True
+
+        # Step 4: Test (optional)
+        if not self.skip_test:
+            test_ok, test_failures = await self._run_tests()
+            report.test_ok = test_ok
+            if not test_ok:
+                for f in test_failures[:10]:
+                    report.issues.append(VerifyIssue(
+                        category="test",
+                        severity="HIGH",
+                        message=f,
+                    ))
+        else:
+            report.test_ok = True
+
+        # Step 5-6: Spec diff (LLM) — only if spec provided and mechanical checks pass
+        if spec_path and report.build_ok:
+            spec_issues = await self._spec_diff(spec_path)
+            report.issues.extend(spec_issues)
+            report.spec_gap_count = len(spec_issues)
+
+        report.duration_s = time.time() - t0
+        return report
+
+    # ── Mechanical Checks ──
+
+    async def _scan_conflicts(self) -> list[str]:
+        """Scan for git conflict markers in source files."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                'grep -rl "<<<<<<< " --include="*.ts" --include="*.tsx" '
+                '--include="*.js" --include="*.json" --include="*.prisma" '
+                '--include="*.sol" --include="*.yaml" --include="*.yml" '
+                '| grep -v node_modules | grep -v .agent-mesh',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if stdout:
+                return [f.strip() for f in stdout.decode().strip().split('\n') if f.strip()]
+            return []
+        except Exception:
+            return []
+
+    async def _run_build(self) -> tuple[bool, list[str]]:
+        """Run build command, return (success, error_lines)."""
+        return await self._run_cmd(self.build_cmd)
+
+    async def _run_lint(self) -> tuple[bool, list[str]]:
+        """Run lint command, return (success, warning_lines)."""
+        return await self._run_cmd(self.lint_cmd)
+
+    async def _run_tests(self) -> tuple[bool, list[str]]:
+        """Run test command, return (success, failure_lines)."""
+        return await self._run_cmd(self.test_cmd)
+
+    async def _run_cmd(self, cmd: str) -> tuple[bool, list[str]]:
+        """Run a shell command, return (success, relevant_output_lines)."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=300
+            )
+            output = (stdout.decode() + "\n" + stderr.decode()).strip()
+            success = proc.returncode == 0
+
+            if not success:
+                # Extract error lines
+                errors = []
+                for line in output.split('\n'):
+                    line = line.strip()
+                    if any(kw in line.lower() for kw in ['error', 'failed', 'fail', 'cannot find']):
+                        if len(line) > 200:
+                            line = line[:200] + "..."
+                        errors.append(line)
+                return False, errors[:20]
+
+            return True, []
+
+        except asyncio.TimeoutError:
+            return False, [f"Command timed out after 300s: {cmd}"]
+        except Exception as e:
+            return False, [f"Command failed: {e}"]
+
+    # ── LLM Spec Diff ──
+
+    async def _spec_diff(self, spec_path: str) -> list[VerifyIssue]:
+        """
+        LLM-powered spec diff: compare spec vs actual code.
+        Uses dual-model verification (Gemini + Opus) for thorough coverage.
+        Returns list of spec gap issues.
+        """
+        # Read spec
+        try:
+            with open(spec_path, 'r') as f:
+                spec_content = f.read()
+        except Exception as e:
+            logger.warning(f"[Verifier] Cannot read spec: {e}")
+            return []
+
+        # Get code tree summary
+        code_tree = await self._get_code_tree()
+
+        # Build prompt
+        prompt = self._build_spec_diff_prompt(spec_content, code_tree)
+
+        # Run dual model verification in parallel
+        gemini_task = self._run_gemini_verify(prompt)
+        opus_task = self._run_opus_verify(prompt)
+
+        gemini_issues, opus_issues = await asyncio.gather(
+            gemini_task, opus_task, return_exceptions=True
+        )
+
+        # Handle errors
+        if isinstance(gemini_issues, Exception):
+            logger.warning(f"[Verifier] Gemini verify failed: {gemini_issues}")
+            gemini_issues = []
+        if isinstance(opus_issues, Exception):
+            logger.warning(f"[Verifier] Opus verify failed: {opus_issues}")
+            opus_issues = []
+
+        # Merge: union of all gaps
+        return self._merge_gap_reports(gemini_issues, opus_issues)
+
+    async def _get_code_tree(self) -> str:
+        """Get a summary of the code tree (file listing + key file contents)."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                'find . -name "*.ts" -o -name "*.tsx" -o -name "*.prisma" -o -name "*.sol" '
+                '| grep -v node_modules | grep -v .agent-mesh | grep -v typechain | sort',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            file_list = stdout.decode().strip()
+
+            # Read key files (services, routes) up to ~50K chars total
+            result_parts = [f"=== File Tree ===\n{file_list}\n"]
+            total_chars = len(file_list)
+            char_limit = 80_000  # stay within context limits
+
+            for filepath in file_list.split('\n'):
+                filepath = filepath.strip()
+                if not filepath:
+                    continue
+                # Prioritize: services, routes, schemas, workers
+                if any(kw in filepath for kw in ['/services/', '/routes/', '/schemas/', '/workers/', 'schema.prisma']):
+                    full_path = os.path.join(self.repo_dir, filepath)
+                    try:
+                        with open(full_path, 'r') as f:
+                            content = f.read()
+                        if total_chars + len(content) > char_limit:
+                            break
+                        result_parts.append(f"\n=== {filepath} ===\n{content}")
+                        total_chars += len(content)
+                    except Exception:
+                        continue
+
+            return '\n'.join(result_parts)
+
+        except Exception as e:
+            return f"Error getting code tree: {e}"
+
+    def _build_spec_diff_prompt(self, spec: str, code_tree: str) -> str:
+        """Build the prompt for spec diff verification."""
+        return f"""You are a senior code reviewer verifying a project against its specification.
+
+## Task
+Compare the SPECIFICATION below against the ACTUAL CODE and identify gaps.
+
+## Output Format
+Respond ONLY with a JSON array of gap objects. No other text.
+Each gap object:
+{{
+  "module": "Module name from spec",
+  "requirement": "Specific requirement from spec",
+  "status": "NOT_IMPLEMENTED" | "PARTIAL" | "INCORRECT",
+  "evidence": "What you see (or don't see) in the code",
+  "severity": "HIGH" | "MEDIUM" | "LOW",
+  "suggested_fix": "Brief description of what needs to be done"
+}}
+
+If everything is implemented correctly, return an empty array: []
+
+## SPECIFICATION
+{spec}
+
+## ACTUAL CODE
+{code_tree}
+"""
+
+    async def _run_gemini_verify(self, prompt: str) -> list[VerifyIssue]:
+        """Run spec diff with Gemini CLI."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f'echo {_shell_escape(prompt)} | gemini -p',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=600
+            )
+            return self._parse_gap_json(stdout.decode(), source="gemini")
+        except Exception as e:
+            logger.warning(f"[Verifier] Gemini spec diff failed: {e}")
+            return []
+
+    async def _run_opus_verify(self, prompt: str) -> list[VerifyIssue]:
+        """Run spec diff with Claude Opus CLI."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f'cat {prompt_file} | claude -p --model claude-opus-4-6 --output-format text',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=900
+            )
+            return self._parse_gap_json(stdout.decode(), source="opus")
+        except Exception as e:
+            logger.warning(f"[Verifier] Opus spec diff failed: {e}")
+            return []
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except Exception:
+                pass
+
+    def _parse_gap_json(self, raw: str, source: str) -> list[VerifyIssue]:
+        """Parse JSON gap report from LLM output."""
+        # Try to extract JSON array from response
+        raw = raw.strip()
+        # Remove markdown fences if present
+        if '```json' in raw:
+            raw = raw.split('```json')[1].split('```')[0].strip()
+        elif '```' in raw:
+            raw = raw.split('```')[1].split('```')[0].strip()
+
+        try:
+            gaps = json.loads(raw)
+            if not isinstance(gaps, list):
+                gaps = [gaps]
+        except json.JSONDecodeError:
+            # Try to find array in text
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start >= 0 and end > start:
+                try:
+                    gaps = json.loads(raw[start:end + 1])
+                except json.JSONDecodeError:
+                    logger.warning(f"[Verifier] Cannot parse {source} gap report")
+                    return []
+            else:
+                return []
+
+        issues = []
+        for gap in gaps:
+            if not isinstance(gap, dict):
+                continue
+            issues.append(VerifyIssue(
+                category="spec_gap",
+                severity=gap.get("severity", "MEDIUM"),
+                message=f"{gap.get('module', '?')}: {gap.get('requirement', '?')} — {gap.get('status', '?')}",
+                module=gap.get("module"),
+                found_by=[source],
+            ))
+        return issues
+
+    def _merge_gap_reports(
+        self,
+        gemini_issues: list[VerifyIssue],
+        opus_issues: list[VerifyIssue],
+    ) -> list[VerifyIssue]:
+        """Merge gap reports: union of all gaps, mark duplicates found by both."""
+        merged: dict[str, VerifyIssue] = {}
+
+        for issue in gemini_issues:
+            key = (issue.module or "") + "|" + issue.message
+            merged[key] = issue
+
+        for issue in opus_issues:
+            key = (issue.module or "") + "|" + issue.message
+            if key in merged:
+                # Both found it — high confidence
+                merged[key].found_by = ["gemini", "opus"]
+                # Upgrade severity if both found it
+                if merged[key].severity == "MEDIUM":
+                    merged[key].severity = "HIGH"
+            else:
+                merged[key] = issue
+
+        return list(merged.values())
+
+
+def _shell_escape(s: str) -> str:
+    """Escape string for shell use."""
+    return "'" + s.replace("'", "'\\''") + "'"

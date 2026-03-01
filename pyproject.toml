@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-mesh"
+version = "0.6.5"
+description = "Multi-Agent CLI Orchestration — Planner → DAG → Dispatcher → CLI Agents → Reviewer → Git Merge"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+gemini = ["google-generativeai>=0.3.0"]
+all = ["google-generativeai>=0.3.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
