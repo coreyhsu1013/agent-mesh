@@ -1,14 +1,53 @@
 # Agent Mesh v0.6.5 Configuration
 # ============================
 
-version: "0.7.0"
+version: "0.7.1"
 
 # ── Planner ──
 planner:
   provider: "gemini"
-  model: "gemini-2.0-flash"
-  fallback: "claude"
+  classify: "gemini-3-flash-preview"     # intent + complexity classification
+  backend: "deepseek/deepseek-reasoner"  # backend-heavy planning
+  frontend: "xai/grok-3-fast"            # frontend / UI planning
+  fallback: "claude-sonnet-4-6"          # when all else fails
   timeout: 300
+
+# ── Routing Matrix (escalation chains per complexity, smoke-tested) ──
+routing:
+  matrix:
+    L:   # Low: CRUD, boilerplate, docs, CSS, tests
+      chain:
+        - "xai/grok-4-fast-non-reasoning"
+        - "xai/grok-4-1-fast-non-reasoning"
+        - "deepseek/deepseek-reasoner"
+        - "xai/grok-code-fast-1"
+        - "claude-sonnet-4-6"
+    M:   # Medium: API endpoints, services, stateful components
+      chain:
+        - "xai/grok-4-fast-reasoning"
+        - "xai/grok-code-fast-1"
+        - "deepseek/deepseek-reasoner"
+        - "claude-sonnet-4-6"
+        - "claude-opus-4-6"
+    H:   # High: architecture, auth, payment, security
+      chain:
+        - "xai/grok-4-1-fast-reasoning"
+        - "claude-sonnet-4-6"
+        - "claude-opus-4-6"
+        - "claude-opus-4-6"              # retry with 2× timeout
+
+# ── Timeouts per runner type (seconds) ──
+timeouts:
+  aider:
+    idle: 300               # Grok 需要更長 idle
+    max: 600
+  claude:
+    idle: 600               # Sonnet/Opus 都需要長 idle
+    max_sonnet: 600
+    max_opus: 1200
+    idle_opus: 600
+  gemini:
+    max: 300
 
 # ── Agents ──
 agents:
@@ -39,12 +78,18 @@ agents:
     api_key_env: "DEEPSEEK_API_KEY"
     max_parallel: 3
 
+  grok_aider:
+    enabled: true
+    model: "xai/grok-code-fast-1"
+    timeout: 600
+    api_key_env: "XAI_API_KEY"
+
   codex:
     enabled: false
 
 # ── Heartbeat ──
 heartbeat:
-  idle_timeout: 120       # 連續 N 秒沒 stdout → 判定卡住（Opus 有獨立 600s）
+  idle_timeout: 600       # 連續 N 秒沒 stdout → 判定卡住（所有 model 統一 600s）
   # max_timeout 用各 agent 自己的 timeout_* 值
 
 # ── ReAct Loop ──
@@ -72,8 +117,9 @@ dispatcher:
 
 # ── Model Loading Target ──
 # Claude Opus:   ~15% (H complexity + review)
-# Claude Sonnet: ~15% (M complexity Claude tasks)
-# DeepSeek:      ~50% (L/M complexity)
+# Claude Sonnet: ~15% (M complexity Claude tasks + escalation)
+# Grok:          ~40% (L/M complexity, first choice for code tasks)
+# DeepSeek:      ~10% (fallback / specific tasks)
 # Gemini:        ~20% (planning + verify)
 
 # ── Verify (v0.7) ──

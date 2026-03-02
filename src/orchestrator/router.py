@@ -1,16 +1,14 @@
 """
-Agent Mesh v0.6.5 — Model Router
-回傳 RoutingDecision（包含 agent type + 具體 model name + 原因）。
+Agent Mesh v0.7.1 — Model Router (Matrix-based)
 
-Model 分配（v0.6.5 — no chat tier）：
-  Claude Opus      → H complexity, auth/security/payment 核心邏輯
-  Claude Sonnet    → M complexity Claude tasks（快 3x, 省 5x）
-  DeepSeek Reasoner → L/M complexity, all DeepSeek tasks
+從 config.yaml routing.matrix 讀取 escalation chain。
+每個 complexity (L/M/H) 有自己的 model chain。
+attempt 1 → chain[0], attempt 2 → chain[1], ...
+最後一級 retry: timeout_multiplier = 2.0
 """
 
 from __future__ import annotations
 import logging
-import re
 from dataclasses import dataclass
 
 from ..models.task import Task, AgentType
@@ -20,133 +18,109 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RoutingDecision:
-    """路由結果：agent + model + 原因。"""
+    """路由結果：agent + model + 原因 + timeout 倍率。"""
     agent_type: AgentType
     model: str
     reason: str
-    use_chat: bool = False   # for DeepSeek: True=chat, False=reasoner
+    timeout_multiplier: float = 1.0
+
+    @property
+    def model_short(self) -> str:
+        return self.model.split("/")[-1]
 
 
-# ── Keywords ──
+# ── Default chains (smoke-tested model strings) ──
 
-# Claude 核心任務（title-level matching）
-CLAUDE_KEYWORDS = [
-    "architect", "architecture",
-    "security",
-    "auth",
-    "payment", "billing", "transaction",
-    "database migration", "db migration",
-    "encryption", "jwt middleware", "jwt auth",
-    "websocket",
-]
+DEFAULT_MATRIX: dict[str, list[str]] = {
+    "L": [
+        "xai/grok-4-fast-non-reasoning",
+        "xai/grok-4-1-fast-non-reasoning",
+        "deepseek/deepseek-reasoner",
+        "xai/grok-code-fast-1",
+        "claude-sonnet-4-6",
+    ],
+    "M": [
+        "xai/grok-4-fast-reasoning",
+        "xai/grok-code-fast-1",
+        "deepseek/deepseek-reasoner",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+    ],
+    "H": [
+        "xai/grok-4-1-fast-reasoning",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+        "claude-opus-4-6",
+    ],
+}
 
-# DeepSeek 優先匹配（先檢查，優先級高於 Claude keywords）
-DEEPSEEK_KEYWORDS = [
-    "crud", "boilerplate", "scaffold",
-    "readme", "documentation", "docs",
-    "seed", "mock", "fixture",
-    "css", "style", "tailwind",
-    "i18n", "translation", "locale",
-    "test", "spec", "unit test", "integration test",
-    "validation", "validator", "schema",
-    "config", "configuration", "setup", "initialize",
-    "entry point", "index",
-]
 
-
-def _title_matches(title_lower: str, keywords: list[str]) -> bool:
-    for kw in keywords:
-        if " " in kw:
-            if kw in title_lower:
-                return True
-        else:
-            if re.search(rf'\b{re.escape(kw)}\b', title_lower):
-                return True
-    return False
+def _model_to_agent_type(model: str) -> AgentType:
+    """Model string prefix → AgentType."""
+    if model.startswith("xai/"):
+        return AgentType.GROK_AIDER
+    if model.startswith("deepseek/"):
+        return AgentType.DEEPSEEK_AIDER
+    return AgentType.CLAUDE_CODE
 
 
 class ModelRouter:
 
     def __init__(self, config: dict):
         self.config = config
+        routing_cfg = config.get("routing", {})
+        raw_matrix = routing_cfg.get("matrix", {})
+
+        # Build matrix from config, fallback to defaults
+        self.matrix: dict[str, list[str]] = {}
+        for level in ("L", "M", "H"):
+            entry = raw_matrix.get(level, {})
+            self.matrix[level] = entry.get("chain", DEFAULT_MATRIX[level])
+
+        # Keep opus model ref for review
         agents_cfg = config.get("agents", {})
-
-        # Claude models
         claude_cfg = agents_cfg.get("claude_code", {})
-        self.claude_enabled = claude_cfg.get("enabled", True)
         self.model_opus = claude_cfg.get("model_opus", "claude-opus-4-6")
-        self.model_sonnet = claude_cfg.get("model_sonnet", "claude-sonnet-4-6")
 
-        # DeepSeek models
-        ds_cfg = agents_cfg.get("deepseek_aider", {})
-        self.deepseek_enabled = ds_cfg.get("enabled", False)
-        self.model_reasoner = ds_cfg.get("model_reasoner", "deepseek/deepseek-reasoner")
-        self.model_chat = ds_cfg.get("model_chat", "deepseek/deepseek-chat")
+    def get_model_for_attempt(
+        self, complexity: str, attempt: int, *, log: bool = True,
+    ) -> RoutingDecision:
+        """
+        查表返回第 attempt 次該用哪個 model。
+        attempt 從 1 開始。最後一級 retry: timeout_multiplier = 2.0。
+        """
+        chain = self.matrix.get(complexity, self.matrix["M"])
+        idx = min(attempt - 1, len(chain) - 1)
+        model = chain[idx]
+        agent_type = _model_to_agent_type(model)
 
-    def route(self, task: Task) -> RoutingDecision:
-        """完整路由決策，回傳 agent + model + 原因。"""
+        # Last slot in chain + not first attempt → 2× timeout
+        is_last_retry = (idx == len(chain) - 1) and (attempt > 1)
+        timeout_multiplier = 2.0 if is_last_retry else 1.0
 
-        complexity = getattr(task, "complexity", "M")
-        title_lower = task.title.lower()
+        reason = f"chain[{complexity}][{idx}]"
+        if timeout_multiplier > 1:
+            reason += f" (timeout ×{timeout_multiplier:.0f})"
 
-        # ── 規則 0：手動指定 ──
-        if hasattr(task, "agent_type") and task.agent_type:
-            try:
-                explicit = AgentType(task.agent_type)
-                model = self._default_model(explicit, complexity)
-                decision = RoutingDecision(explicit, model, "manual override")
-                self._log(task, decision)
-                return decision
-            except ValueError:
-                pass
-
-        # ── 規則 1：H complexity → Claude Opus ──
-        if complexity == "H":
-            d = RoutingDecision(AgentType.CLAUDE_CODE, self.model_opus, "complexity=H → Opus")
-            self._log(task, d)
-            return d
-
-        # ── 規則 2：DeepSeek 未啟用 → 全走 Claude ──
-        if not self.deepseek_enabled:
-            model = self.model_opus if complexity == "H" else self.model_sonnet
-            d = RoutingDecision(AgentType.CLAUDE_CODE, model, "deepseek disabled")
-            self._log(task, d)
-            return d
-
-        # ── 規則 3：DeepSeek keywords 優先（test/config/validation 等）──
-        if _title_matches(title_lower, DEEPSEEK_KEYWORDS):
-            d = RoutingDecision(
-                AgentType.DEEPSEEK_AIDER, self.model_reasoner,
-                "DeepSeek keyword → reasoner", use_chat=False
-            )
-            self._log(task, d)
-            return d
-
-        # ── 規則 4：Claude keywords（auth/security/payment）──
-        if _title_matches(title_lower, CLAUDE_KEYWORDS):
-            if complexity == "H":
-                d = RoutingDecision(AgentType.CLAUDE_CODE, self.model_opus, "Claude keyword + H → Opus")
-            else:
-                d = RoutingDecision(AgentType.CLAUDE_CODE, self.model_sonnet, "Claude keyword + M → Sonnet")
-            self._log(task, d)
-            return d
-
-        # ── 規則 5：L complexity → DeepSeek reasoner ──
-        if complexity == "L":
-            d = RoutingDecision(
-                AgentType.DEEPSEEK_AIDER, self.model_reasoner,
-                "complexity=L → reasoner", use_chat=False
-            )
-            self._log(task, d)
-            return d
-
-        # ── 規則 6：M complexity default → DeepSeek reasoner ──
-        d = RoutingDecision(
-            AgentType.DEEPSEEK_AIDER, self.model_reasoner,
-            "default M → reasoner", use_chat=False
+        decision = RoutingDecision(
+            agent_type=agent_type,
+            model=model,
+            reason=reason,
+            timeout_multiplier=timeout_multiplier,
         )
-        self._log(task, d)
-        return d
+
+        if log:
+            logger.info(
+                f"[Router] complexity={complexity} attempt={attempt}/{len(chain)} → "
+                f"{agent_type.value} ({decision.model_short}) [{reason}]"
+            )
+
+        return decision
+
+    def get_max_attempts(self, complexity: str) -> int:
+        """Return chain length for this complexity."""
+        chain = self.matrix.get(complexity, self.matrix["M"])
+        return len(chain)
 
     def route_for_review(self) -> RoutingDecision:
         """Review 永遠用 Opus。"""
@@ -155,30 +129,11 @@ class ModelRouter:
         )
 
     def get_routing_summary(self, tasks: list[Task]) -> dict:
-        """路由統計（不重複 log）。"""
+        """路由統計（第一個 attempt 的 model，不 log）。"""
         summary: dict[str, list[str]] = {}
         for task in tasks:
-            d = self._route_quiet(task)
-            key = f"{d.agent_type.value} ({d.model.split('/')[-1]})"
+            complexity = getattr(task, "complexity", "M")
+            d = self.get_model_for_attempt(complexity, 1, log=False)
+            key = f"{d.agent_type.value} ({d.model_short})"
             summary.setdefault(key, []).append(task.title)
         return summary
-
-    def _route_quiet(self, task: Task) -> RoutingDecision:
-        """Same as route() but without logging."""
-        old_log = self._log
-        self._log = lambda *a: None
-        d = self.route(task)
-        self._log = old_log
-        return d
-
-    def _default_model(self, agent: AgentType, complexity: str) -> str:
-        if agent == AgentType.CLAUDE_CODE:
-            return self.model_opus if complexity == "H" else self.model_sonnet
-        elif agent == AgentType.DEEPSEEK_AIDER:
-            return self.model_reasoner  # v0.6.5: always reasoner, no chat tier
-        return self.model_sonnet
-
-    @staticmethod
-    def _log(task: Task, d: RoutingDecision):
-        model_short = d.model.split("/")[-1]
-        logger.info(f"[Router] '{task.title}' → {d.agent_type.value} ({model_short}) [{d.reason}]")

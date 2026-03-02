@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import tempfile
 import time
 from typing import Optional
@@ -125,10 +126,27 @@ async def heartbeat_wait(
             timeout_reason = result
 
     if timeout_reason:
-        # Monitor won → kill process
+        # Monitor won → kill process tree + close pipes
         try:
-            proc.kill()
-            await proc.wait()
+            # Kill entire process group (aider may spawn children)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            # Close pipes explicitly to unblock readline()
+            for pipe in [proc.stdout, proc.stderr]:
+                if pipe:
+                    try:
+                        pipe.feed_eof()
+                    except Exception:
+                        pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
         except Exception:
             pass
 
@@ -136,13 +154,13 @@ async def heartbeat_wait(
     finished.set()
     await asyncio.sleep(0.5)
 
-    # Cancel all pending tasks
+    # Cancel all pending tasks (with timeout to prevent hang)
     for task in list(pending) + [read_out, read_err, monitor_task]:
         if not task.done():
             task.cancel()
             try:
-                await task
-            except (asyncio.CancelledError, Exception):
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
 
     stdout = "".join(stdout_chunks)
@@ -162,21 +180,49 @@ async def heartbeat_wait(
 
 class AiderRunner:
     """
-    DeepSeek agent via aider CLI.
-    Heartbeat timeout: idle 120s, max 因 model 不同。
+    Generic aider CLI runner — supports DeepSeek, Grok, and any aider-compatible model.
+    Model can be overridden per-call via kwargs['model'].
+    API key auto-detected from model prefix (xai/ → XAI_API_KEY, deepseek/ → DEEPSEEK_API_KEY).
     """
 
-    IDLE_TIMEOUT = 120
+    # Model prefix → env var mapping (auto-inject correct API key)
+    MODEL_ENV_MAP = {
+        "xai/": "XAI_API_KEY",
+        "deepseek/": "DEEPSEEK_API_KEY",
+        "openrouter/": "OPENROUTER_API_KEY",
+    }
 
     def __init__(self, config: dict):
         ds_cfg = config.get("agents", {}).get("deepseek_aider", {})
+        grok_cfg = config.get("agents", {}).get("grok_aider", {})
         hb_cfg = config.get("heartbeat", {})
+
         self.idle_timeout = hb_cfg.get("idle_timeout", 120)
+
+        # DeepSeek defaults
         self.model_reasoner = ds_cfg.get("model_reasoner", "deepseek/deepseek-reasoner")
         self.model_chat = ds_cfg.get("model_chat", "deepseek/deepseek-chat")
-        self.api_key_env = ds_cfg.get("api_key_env", "DEEPSEEK_API_KEY")
         self.timeout_reasoner = ds_cfg.get("timeout_reasoner", 600)
         self.timeout_chat = ds_cfg.get("timeout_chat", 300)
+
+        # Grok defaults
+        self.model_grok = grok_cfg.get("model", "xai/grok-code-fast-1")
+        self.timeout_grok = grok_cfg.get("timeout", 600)
+
+    def _resolve_api_key(self, model: str) -> tuple[str | None, str]:
+        """Find the right API key env var for a given model prefix."""
+        for prefix, env_var in self.MODEL_ENV_MAP.items():
+            if model.startswith(prefix):
+                return os.environ.get(env_var), env_var
+        return None, f"(no MODEL_ENV_MAP entry for '{model}')"
+
+    def _resolve_timeout(self, model: str, use_chat: bool) -> int:
+        """Get the right timeout for a given model."""
+        if model.startswith("xai/"):
+            return self.timeout_grok
+        if use_chat:
+            return self.timeout_chat
+        return self.timeout_reasoner
 
     async def execute(
         self,
@@ -186,15 +232,20 @@ class AiderRunner:
         use_chat: bool = False,
         **kwargs,
     ) -> RunResult:
-        api_key = os.environ.get(self.api_key_env)
+        # ★ Model override from kwargs (used by escalation chain / router)
+        model = kwargs.pop("model", None)
+        if not model:
+            model = self.model_chat if use_chat else self.model_reasoner
+
+        # ★ Auto-detect API key from model prefix
+        api_key, key_env = self._resolve_api_key(model)
         if not api_key:
             return RunResult(
                 success=False,
-                error=f"Environment variable {self.api_key_env} is not set"
+                error=f"Environment variable {key_env} is not set (needed for {model})"
             )
 
-        model = self.model_chat if use_chat else self.model_reasoner
-        max_timeout = self.timeout_chat if use_chat else self.timeout_reasoner
+        max_timeout = self._resolve_timeout(model, use_chat)
         model_short = model.split("/")[-1]
 
         # ★ Retry with extended timeout
@@ -202,7 +253,8 @@ class AiderRunner:
         max_timeout = int(max_timeout * timeout_multiplier)
 
         env = {**os.environ}
-        env["DEEPSEEK_API_KEY"] = api_key
+        # Set all possible API key env vars so aider/litellm can find the right one
+        env[key_env] = api_key
         env["BROWSER"] = ""
 
         cmd = [
@@ -217,6 +269,26 @@ class AiderRunner:
         ]
 
         if target_files:
+            # ★ Expand directories to actual files (aider needs specific file paths)
+            expanded = []
+            for f in target_files:
+                full_path = os.path.join(workspace_dir, f)
+                if os.path.isdir(full_path):
+                    # Find .ts/.tsx/.js/.json/.prisma/.sol files in directory
+                    for root, _, files in os.walk(full_path):
+                        # Skip node_modules and hidden dirs
+                        if "node_modules" in root or "/." in root:
+                            continue
+                        for fname in files:
+                            if fname.endswith(('.ts', '.tsx', '.js', '.json', '.prisma', '.sol')):
+                                rel = os.path.relpath(os.path.join(root, fname), workspace_dir)
+                                expanded.append(rel)
+                elif os.path.isfile(full_path):
+                    expanded.append(f)
+                # else: skip non-existent paths
+            target_files = expanded[:20]  # cap at 20 files to avoid token overflow
+            if not target_files:
+                logger.warning(f"[AiderRunner] No files found after expanding directories")
             cmd.extend(target_files)
 
         logger.info(
@@ -230,6 +302,7 @@ class AiderRunner:
                 *cmd, cwd=workspace_dir, env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # ★ allow killpg to kill child processes
             )
 
             stdout, stderr, timed_out, reason = await heartbeat_wait(
@@ -347,6 +420,7 @@ class ClaudeRunner:
                 cmd, cwd=workspace_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # ★ allow killpg to kill child processes
             )
 
             stdout, stderr, timed_out, reason = await heartbeat_wait(

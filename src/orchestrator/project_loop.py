@@ -87,7 +87,7 @@ class ProjectLoop:
         self.gap_analyzer.save_fix_plan(plan, plan_path)
 
         logger.info(
-            f"[ProjectLoop] 📋 Fix-plan generated: {plan['task_count']} tasks "
+            f"[ProjectLoop] 📋 Fix-plan generated: {len(plan['tasks'])} tasks "
             f"→ {plan_path}"
         )
         return report, plan
@@ -175,7 +175,7 @@ class ProjectLoop:
             # Show convergence progress
             logger.info(
                 f"[ProjectLoop] Cycle {cycle}: {len(report.issues)} issues remaining, "
-                f"{plan['task_count'] if plan else 0} fix tasks generated"
+                f"{len(plan['tasks']) if plan else 0} fix tasks generated"
             )
 
         # Max cycles reached

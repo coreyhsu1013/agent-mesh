@@ -1,11 +1,15 @@
 """
-Agent Mesh v0.6.0 — Gemini Planner
-用 Gemini API 取代 Claude 做 planning，減少 Claude loading。
+Agent Mesh v0.7.1 — Gemini Planner (Two-Phase)
 
-支援三種模式：
-1. Gemini API（推薦，最穩定）
-2. Gemini CLI（如果支援 pipe mode）
-3. Claude CLI（fallback）
+Two-phase planning:
+  Phase 1 — Task Classification (fast model, e.g. Gemini Flash)
+    Read spec → identify tasks → assign category (backend/frontend/fullstack)
+  Phase 2 — Detail Planning (specialized models, parallel)
+    backend tasks   → config.planner.backend model
+    frontend/fullstack → config.planner.frontend model
+    failure         → config.planner.fallback model
+
+Fallback: if classification fails, revert to single-phase planning (original v0.6 flow).
 """
 
 from __future__ import annotations
@@ -25,20 +29,21 @@ class PlannerError(Exception):
 
 class GeminiPlanner:
     """
-    用 Gemini 產生 plan.json。
+    Two-phase planner: classify → detail.
 
-    Gemini 2.0 Flash 特點：
-    - 便宜（免費額度大）
-    - 速度快
-    - 長 context（100萬+ tokens）
-    - planning 品質對標 GPT-4o
+    Phase 1 (classify model): fast classification of tasks from spec.
+    Phase 2 (backend/frontend models): detailed planning per category.
     """
 
     def __init__(self, config: dict):
         planner_cfg = config.get("planner", {})
         self.provider = planner_cfg.get("provider", "gemini")
-        self.model = planner_cfg.get("model", "gemini-2.0-flash")
-        self.fallback = planner_cfg.get("fallback", "claude")
+        self.model_classify = planner_cfg.get(
+            "classify", planner_cfg.get("model", "gemini-3-flash-preview")
+        )
+        self.model_backend = planner_cfg.get("backend", "gemini-3-flash-preview")
+        self.model_frontend = planner_cfg.get("frontend", "claude-opus-4-6")
+        self.model_fallback = planner_cfg.get("fallback", "claude-sonnet-4-6")
         self.timeout = planner_cfg.get("timeout", 300)
 
     async def plan(
@@ -48,56 +53,253 @@ class GeminiPlanner:
         project_name: str = "project",
     ) -> dict:
         """
-        讀 spec → 產生 plan.json。
-
-        Args:
-            spec_content: 專案規格文件內容
-            agents_md: AGENTS.md 內容（任務分配規則）
-            project_name: 專案名稱
-        Returns:
-            plan.json dict
+        Two-phase planning with single-phase fallback.
+        Interface unchanged: spec → plan dict.
         """
+        # Try two-phase
+        try:
+            plan = await self._plan_two_phase(spec_content, agents_md, project_name)
+            logger.info(
+                f"[GeminiPlanner] Two-phase plan: {len(plan.get('tasks', []))} tasks"
+            )
+            return plan
+        except Exception as e:
+            logger.warning(
+                f"[GeminiPlanner] Two-phase failed ({e}), falling back to single-phase"
+            )
+
+        # Fallback: single-phase (original flow)
+        return await self._plan_single_phase(spec_content, agents_md, project_name)
+
+    # ══════════════════════════════════════════════════════════
+    # Two-Phase Planning
+    # ══════════════════════════════════════════════════════════
+
+    async def _plan_two_phase(
+        self, spec_content: str, agents_md: str, project_name: str,
+    ) -> dict:
+        """Phase 1 classify → Phase 2 detail (parallel) → merge."""
+
+        # ── Phase 1: Classification ──
+        logger.info(
+            f"[GeminiPlanner] Phase 1: classifying tasks with {self.model_classify}"
+        )
+        classify_prompt = self._build_classify_prompt(
+            spec_content, agents_md, project_name,
+        )
+        raw = await self._call_model(self.model_classify, classify_prompt)
+        skeleton = self._parse_plan(raw)
+
+        tasks = skeleton.get("tasks", [])
+        if not tasks:
+            raise PlannerError("Phase 1 produced no tasks")
+
+        # Split by category
+        backend_tasks = [t for t in tasks if t.get("category") == "backend"]
+        frontend_tasks = [
+            t for t in tasks if t.get("category") in ("frontend", "fullstack")
+        ]
+        # Uncategorized → treat as backend
+        uncategorized = [
+            t for t in tasks
+            if t.get("category") not in ("backend", "frontend", "fullstack")
+        ]
+        backend_tasks.extend(uncategorized)
+
+        logger.info(
+            f"[GeminiPlanner] Phase 1 done: "
+            f"{len(backend_tasks)} backend, {len(frontend_tasks)} frontend/fullstack"
+        )
+
+        # Save id→category mapping (in case Phase 2 drops it)
+        category_map = {t["id"]: t.get("category", "backend") for t in tasks}
+
+        # ── Phase 2: Detail Planning (parallel) ──
+        coros = []
+        if backend_tasks:
+            coros.append(
+                self._detail_with_fallback(
+                    self.model_backend, backend_tasks,
+                    spec_content, agents_md, project_name, "backend",
+                )
+            )
+        if frontend_tasks:
+            coros.append(
+                self._detail_with_fallback(
+                    self.model_frontend, frontend_tasks,
+                    spec_content, agents_md, project_name, "frontend",
+                )
+            )
+
+        detailed_tasks: list[dict] = []
+        if coros:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    label = "backend" if i == 0 and backend_tasks else "frontend"
+                    logger.error(
+                        f"[GeminiPlanner] Phase 2 {label} failed: {result}, "
+                        f"using skeleton tasks"
+                    )
+                    # Use skeleton tasks as fallback
+                    group = backend_tasks if label == "backend" else frontend_tasks
+                    detailed_tasks.extend(group)
+                else:
+                    detailed_tasks.extend(result)
+
+        # Restore category from Phase 1 (in case Phase 2 dropped it)
+        for t in detailed_tasks:
+            if not t.get("category") and t.get("id") in category_map:
+                t["category"] = category_map[t["id"]]
+
+        # ── Merge ──
+        plan = {
+            "project_name": skeleton.get("project_name", project_name),
+            "shared_context": skeleton.get("shared_context", {}),
+            "modules": skeleton.get("modules", {}),
+            "tasks": detailed_tasks,
+        }
+        self._apply_defaults(plan)
+        return plan
+
+    async def _detail_with_fallback(
+        self,
+        model: str,
+        tasks: list[dict],
+        spec_content: str,
+        agents_md: str,
+        project_name: str,
+        label: str,
+    ) -> list[dict]:
+        """Try primary model for Phase 2, fallback if it fails."""
+        try:
+            result = await self._phase2_detail(
+                model, tasks, spec_content, agents_md, project_name,
+            )
+            logger.info(
+                f"[GeminiPlanner] Phase 2 {label}: "
+                f"{len(result)} tasks detailed with {model}"
+            )
+            return result
+        except Exception as e:
+            if model == self.model_fallback:
+                raise  # Already using fallback
+            logger.warning(
+                f"[GeminiPlanner] Phase 2 {label} with {model} failed ({e}), "
+                f"trying fallback {self.model_fallback}"
+            )
+            result = await self._phase2_detail(
+                self.model_fallback, tasks, spec_content, agents_md, project_name,
+            )
+            logger.info(
+                f"[GeminiPlanner] Phase 2 {label}: "
+                f"{len(result)} tasks detailed with {self.model_fallback} (fallback)"
+            )
+            return result
+
+    async def _phase2_detail(
+        self,
+        model: str,
+        task_skeletons: list[dict],
+        spec_content: str,
+        agents_md: str,
+        project_name: str,
+    ) -> list[dict]:
+        """Call model to produce detailed tasks from skeletons."""
+        prompt = self._build_detail_prompt(
+            task_skeletons, spec_content, agents_md, project_name,
+        )
+        raw = await self._call_model(model, prompt)
+        parsed = self._parse_json(raw)
+
+        # Handle {"tasks": [...]} or bare [...]
+        if isinstance(parsed, dict):
+            tasks = parsed.get("tasks", [])
+        elif isinstance(parsed, list):
+            tasks = parsed
+        else:
+            raise PlannerError(f"Phase 2 returned unexpected type: {type(parsed)}")
+
+        if not tasks:
+            raise PlannerError(f"Phase 2 ({model}) produced no tasks")
+
+        return tasks
+
+    # ══════════════════════════════════════════════════════════
+    # Single-Phase Fallback (original v0.6 flow)
+    # ══════════════════════════════════════════════════════════
+
+    async def _plan_single_phase(
+        self, spec_content: str, agents_md: str, project_name: str,
+    ) -> dict:
+        """Original single-phase planning: spec → full plan in one shot."""
         prompt = self._build_planning_prompt(spec_content, agents_md, project_name)
 
         if self.provider == "gemini":
-            # 優先嘗試 Gemini CLI（已驗證支援 pipe mode）
+            # Gemini CLI → API → Claude fallback
             try:
-                logger.info("[GeminiPlanner] Trying Gemini CLI (pipe mode)...")
+                logger.info("[GeminiPlanner] Single-phase: trying Gemini CLI...")
                 result = await self._call_gemini_cli(prompt)
                 plan = self._parse_plan(result)
-                logger.info(f"[GeminiPlanner] Plan generated via CLI: {len(plan.get('tasks', []))} tasks")
+                logger.info(
+                    f"[GeminiPlanner] Plan via CLI: "
+                    f"{len(plan.get('tasks', []))} tasks"
+                )
                 return plan
             except Exception as cli_err:
                 logger.warning(f"[GeminiPlanner] Gemini CLI failed: {cli_err}")
 
-            # Fallback: Gemini API（需要 GOOGLE_API_KEY）
             try:
-                logger.info("[GeminiPlanner] Trying Gemini API fallback...")
-                result = await self._call_gemini_api(prompt)
+                logger.info("[GeminiPlanner] Single-phase: trying Gemini API...")
+                result = await self._call_gemini_api(prompt, self.model_classify)
                 plan = self._parse_plan(result)
-                logger.info(f"[GeminiPlanner] Plan generated via API: {len(plan.get('tasks', []))} tasks")
+                logger.info(
+                    f"[GeminiPlanner] Plan via API: "
+                    f"{len(plan.get('tasks', []))} tasks"
+                )
                 return plan
             except Exception as api_err:
-                logger.warning(f"[GeminiPlanner] Gemini API also failed: {api_err}")
+                logger.warning(f"[GeminiPlanner] Gemini API failed: {api_err}")
 
-            # Final fallback: Claude
-            if self.fallback == "claude":
-                logger.info("[GeminiPlanner] Falling back to Claude CLI...")
-                return await self._call_claude_fallback(prompt)
+            logger.info(
+                f"[GeminiPlanner] Single-phase: "
+                f"Claude fallback ({self.model_fallback})..."
+            )
+            raw = await self._call_claude_cli(prompt, self.model_fallback)
+            return self._parse_plan(raw)
 
-            raise PlannerError(f"All Gemini methods failed. CLI: {cli_err}, API: {api_err}")
-
-        # Claude as primary
-        if self.provider == "claude":
-            return await self._call_claude_fallback(prompt)
+        elif self.provider == "claude":
+            raw = await self._call_claude_cli(prompt, self.model_fallback)
+            return self._parse_plan(raw)
 
         raise PlannerError(f"Unknown planner provider: {self.provider}")
 
-    async def _call_gemini_api(self, prompt: str) -> str:
-        """
-        呼叫 Gemini API（google-generativeai SDK）。
-        需要 GOOGLE_API_KEY 環境變數。
-        """
+    # ══════════════════════════════════════════════════════════
+    # Model Dispatchers
+    # ══════════════════════════════════════════════════════════
+
+    async def _call_model(self, model: str, prompt: str) -> str:
+        """Route to the right backend based on model prefix."""
+        if model.startswith("gemini"):
+            return await self._call_gemini(model, prompt)
+        elif model.startswith("claude"):
+            return await self._call_claude_cli(prompt, model)
+        else:
+            # deepseek, xai, openrouter, etc. → litellm
+            return await self._call_litellm(model, prompt)
+
+    async def _call_gemini(self, model: str, prompt: str) -> str:
+        """Try Gemini CLI, then Gemini API."""
+        try:
+            return await self._call_gemini_cli(prompt)
+        except Exception as e:
+            logger.warning(f"[GeminiPlanner] Gemini CLI failed: {e}, trying API")
+            return await self._call_gemini_api(prompt, model)
+
+    async def _call_gemini_api(
+        self, prompt: str, model: str | None = None,
+    ) -> str:
+        """Gemini API via google-generativeai SDK."""
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise PlannerError(
@@ -113,17 +315,17 @@ class GeminiPlanner:
                 "Run: pip install google-generativeai"
             )
 
+        use_model = model or self.model_classify
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(self.model)
+        gm = genai.GenerativeModel(use_model)
 
-        logger.info(f"[GeminiPlanner] Calling {self.model}...")
+        logger.info(f"[GeminiPlanner] Calling Gemini API: {use_model}")
 
-        # Gemini API 是同步的，用 run_in_executor 包裝成 async
         loop = asyncio.get_event_loop()
         response = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                lambda: model.generate_content(
+                lambda: gm.generate_content(
                     prompt,
                     generation_config=genai.GenerationConfig(
                         temperature=0.2,
@@ -137,15 +339,12 @@ class GeminiPlanner:
         return response.text
 
     async def _call_gemini_cli(self, prompt: str) -> str:
-        """
-        嘗試用 Gemini CLI（如果支援非互動模式）。
-        """
+        """Gemini CLI pipe mode."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(prompt)
             prompt_file = f.name
 
         try:
-            # 嘗試 pipe mode
             cmd = f"cat {prompt_file} | gemini"
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -163,16 +362,21 @@ class GeminiPlanner:
         finally:
             os.unlink(prompt_file)
 
-    async def _call_claude_fallback(self, prompt: str) -> dict:
-        """
-        Claude CLI fallback（跟 v0.5.0 一樣）。
-        """
+    async def _call_claude_cli(
+        self, prompt: str, model: str | None = None,
+    ) -> str:
+        """Claude CLI for text generation."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(prompt)
             prompt_file = f.name
 
         try:
-            cmd = f"cat {prompt_file} | claude --output-format text"
+            use_model = model or self.model_fallback
+            cmd = (
+                f"cat {prompt_file} | claude -p "
+                f"--model {use_model} "
+                f"--output-format text"
+            )
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -183,49 +387,170 @@ class GeminiPlanner:
             )
 
             if proc.returncode != 0:
-                raise PlannerError(f"Claude fallback failed: {stderr.decode()[:500]}")
+                raise PlannerError(
+                    f"Claude CLI ({use_model}) failed: {stderr.decode()[:500]}"
+                )
 
-            result = stdout.decode()
-            return self._parse_plan(result)
+            return stdout.decode()
         finally:
             os.unlink(prompt_file)
 
-    def _parse_plan(self, raw_output: str) -> dict:
-        """
-        從 LLM 輸出中提取 JSON plan。
-        處理 markdown code block 包裝。
-        """
-        text = raw_output.strip()
-
-        # 移除 markdown code block
-        if "```json" in text:
-            start = text.index("```json") + 7
-            end = text.index("```", start)
-            text = text[start:end].strip()
-        elif "```" in text:
-            start = text.index("```") + 3
-            end = text.index("```", start)
-            text = text[start:end].strip()
-
+    async def _call_litellm(self, model: str, prompt: str) -> str:
+        """Call any model via litellm (deepseek, xai, openrouter, etc.)."""
         try:
-            plan = json.loads(text)
-        except json.JSONDecodeError as e:
-            logger.error(f"[GeminiPlanner] JSON parse failed: {e}\nRaw: {text[:500]}")
-            raise PlannerError(f"Failed to parse plan JSON: {e}")
+            import litellm
+        except ImportError:
+            raise PlannerError(
+                "litellm not installed. Run: pip install litellm"
+            )
 
-        # 驗證必要欄位
-        if "tasks" not in plan:
-            raise PlannerError("Plan missing 'tasks' field")
+        logger.info(f"[GeminiPlanner] Calling litellm: {model}")
 
-        # 設定 defaults
-        for task in plan["tasks"]:
-            task.setdefault("complexity", "M")
-            task.setdefault("agent_type", "")  # 空 = 自動路由
-            task.setdefault("dependencies", [])
-            task.setdefault("target_files", [])
-            task.setdefault("module", "core")
+        loop = asyncio.get_event_loop()
+        response = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: litellm.completion(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=8192,
+                )
+            ),
+            timeout=self.timeout,
+        )
 
-        return plan
+        return response.choices[0].message.content
+
+    # ══════════════════════════════════════════════════════════
+    # Prompts
+    # ══════════════════════════════════════════════════════════
+
+    def _build_classify_prompt(
+        self,
+        spec_content: str,
+        agents_md: str,
+        project_name: str,
+    ) -> str:
+        """Phase 1: classify tasks into backend/frontend/fullstack."""
+        return f"""You are a senior software architect. Read the project specification and break it into tasks with categories.
+
+## Project: {project_name}
+
+## Specification:
+{spec_content}
+
+{f"## Agent Rules:{chr(10)}{agents_md}" if agents_md else ""}
+
+## Your Job:
+1. Break the project into tasks (small, 5-10 minutes each)
+2. Classify each task into ONE category:
+   - "backend": API endpoints, database, service logic, auth, payment, middleware, data models, migrations, seed data
+   - "frontend": UI components, pages, layouts, CSS/styling, animations, UX flows, client-side state
+   - "fullstack": Cross-cutting tasks that span both frontend and backend (e.g. form + API + DB)
+3. Assign complexity (L/M/H) and identify dependencies
+
+## Output Format (JSON only, no markdown):
+
+{{
+  "project_name": "{project_name}",
+  "shared_context": {{
+    "tech_stack": "...",
+    "conventions": "..."
+  }},
+  "modules": {{
+    "module_name": {{
+      "description": "...",
+      "interface_files": [],
+      "imports": [],
+      "exports": []
+    }}
+  }},
+  "tasks": [
+    {{
+      "id": "unique-uuid",
+      "title": "Short descriptive title",
+      "description": "Brief description (1-2 sentences) of what this task does",
+      "category": "backend|frontend|fullstack",
+      "complexity": "L|M|H",
+      "module": "module_name",
+      "dependencies": ["other-task-id"],
+      "priority": 1
+    }}
+  ]
+}}
+
+## Rules:
+1. Each task must be independently executable in an isolated git worktree
+2. Tasks should be small enough to complete in 5-10 minutes
+3. Wave 0 must include all shared types, interfaces, and DB schema
+4. Dependencies must form a valid DAG (no cycles)
+5. ALWAYS assign both category and complexity for every task
+6. For projects with >15 tasks, split into modules with interface layers
+
+Output ONLY valid JSON. No explanation, no markdown code blocks.
+"""
+
+    def _build_detail_prompt(
+        self,
+        task_skeletons: list[dict],
+        spec_content: str,
+        agents_md: str,
+        project_name: str,
+    ) -> str:
+        """Phase 2: produce detailed implementation instructions for each task."""
+        skeleton_json = json.dumps(task_skeletons, indent=2, ensure_ascii=False)
+        # Truncate spec to save tokens (Phase 2 already has task context)
+        spec_truncated = spec_content[:4000]
+        if len(spec_content) > 4000:
+            spec_truncated += "\n... (truncated)"
+
+        return f"""You are a senior software engineer. Refine the following task skeletons into detailed implementation plans.
+
+## Project: {project_name}
+
+## Specification (for context):
+{spec_truncated}
+
+{f"## Agent Rules:{chr(10)}{agents_md}" if agents_md else ""}
+
+## Tasks to Detail:
+{skeleton_json}
+
+## Your Job:
+For EACH task above, produce a detailed version with:
+1. **description**: Full, specific instructions for an AI coding agent. Include:
+   - What files to create/modify
+   - What functions/classes to implement
+   - What patterns to follow
+   - Error handling requirements
+2. **target_files**: Specific file paths that will be created or modified
+3. **acceptance_criteria**: Testable conditions for success
+
+IMPORTANT: Preserve the original id, title, category, complexity, module, dependencies, priority from the input. Do NOT add or remove tasks.
+
+## Output Format (JSON only, no markdown):
+
+{{
+  "tasks": [
+    {{
+      "id": "same-as-input",
+      "title": "same-as-input",
+      "description": "DETAILED implementation instructions...",
+      "category": "same-as-input",
+      "agent_type": "",
+      "complexity": "same-as-input",
+      "module": "same-as-input",
+      "target_files": ["src/path/to/file.ts"],
+      "dependencies": ["same-as-input"],
+      "acceptance_criteria": "Build passes, tests pass, ...",
+      "priority": 1
+    }}
+  ]
+}}
+
+Output ONLY valid JSON. No explanation, no markdown code blocks.
+"""
 
     def _build_planning_prompt(
         self,
@@ -233,10 +558,7 @@ class GeminiPlanner:
         agents_md: str,
         project_name: str,
     ) -> str:
-        """
-        建構 planning prompt。
-        v0.6.0 改進：加入 complexity 和 agent_type 建議。
-        """
+        """Single-phase full planning prompt (fallback, unchanged from v0.6)."""
         return f"""You are a senior software architect and project planner.
 
 Read the following project specification and produce a detailed execution plan as JSON.
@@ -271,6 +593,7 @@ Read the following project specification and produce a detailed execution plan a
       "description": "Full instructions for the agent. Be specific about what files to create/modify, what functions to implement, what patterns to follow.",
       "agent_type": "",
       "complexity": "L|M|H",
+      "category": "backend|frontend|fullstack",
       "module": "foundation",
       "target_files": ["path/to/file.ts"],
       "dependencies": ["other-task-id"],
@@ -285,6 +608,11 @@ Read the following project specification and produce a detailed execution plan a
 - **M** (Medium): API endpoints, service logic, components with state, database queries
 - **H** (High): Architecture decisions, security/auth, payment, complex integrations, DB migrations, abstract patterns
 
+## Category Guidelines:
+- **backend**: API, database, service logic, auth, payment, middleware
+- **frontend**: UI components, pages, layouts, CSS, animations, UX flows
+- **fullstack**: Cross-cutting tasks spanning both frontend and backend
+
 ## Agent Type (leave empty for auto-routing, or specify):
 - `claude_code`: For H complexity, architecture, security, auth, payment
 - `deepseek_aider`: For L/M complexity, CRUD, boilerplate, refactoring, tests
@@ -297,7 +625,58 @@ Read the following project specification and produce a detailed execution plan a
 4. Dependencies must form a valid DAG (no cycles)
 5. Target files should be specific (not entire directories)
 6. For projects with >15 tasks, split into modules with interface layers
-7. Always assign complexity (L/M/H) to help the router
+7. Always assign complexity (L/M/H) and category (backend/frontend/fullstack)
 
 Output ONLY valid JSON. No explanation, no markdown code blocks.
 """
+
+    # ══════════════════════════════════════════════════════════
+    # Parsing
+    # ══════════════════════════════════════════════════════════
+
+    def _parse_plan(self, raw_output: str) -> dict:
+        """
+        Parse LLM output as plan JSON.
+        Handles markdown code block wrapping.
+        Validates 'tasks' field and sets defaults.
+        """
+        plan = self._parse_json(raw_output)
+        if not isinstance(plan, dict):
+            raise PlannerError(f"Plan is not a dict: {type(plan)}")
+
+        if "tasks" not in plan:
+            raise PlannerError("Plan missing 'tasks' field")
+
+        self._apply_defaults(plan)
+        return plan
+
+    def _parse_json(self, raw_output: str):
+        """Generic JSON parser — strips markdown code blocks."""
+        text = raw_output.strip()
+
+        # Remove markdown code block
+        if "```json" in text:
+            start = text.index("```json") + 7
+            end = text.index("```", start)
+            text = text[start:end].strip()
+        elif "```" in text:
+            start = text.index("```") + 3
+            end = text.index("```", start)
+            text = text[start:end].strip()
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.error(f"[GeminiPlanner] JSON parse failed: {e}\nRaw: {text[:500]}")
+            raise PlannerError(f"Failed to parse JSON: {e}")
+
+    @staticmethod
+    def _apply_defaults(plan: dict):
+        """Apply defaults to all tasks in plan."""
+        for task in plan.get("tasks", []):
+            task.setdefault("complexity", "M")
+            task.setdefault("agent_type", "")
+            task.setdefault("dependencies", [])
+            task.setdefault("target_files", [])
+            task.setdefault("module", "core")
+            task.setdefault("category", "backend")

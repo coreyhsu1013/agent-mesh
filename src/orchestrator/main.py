@@ -213,7 +213,7 @@ async def run_verify(config: dict, repo_dir: str, spec_path: str | None = None,
         if plan:
             plan_path = os.path.join(repo_dir, ".agent-mesh/fix-plan-1.json")
             logger.info(f"\n📋 Fix-plan: {plan_path}")
-            logger.info(f"   {plan['task_count']} fix tasks from {plan['issue_count']} issues")
+            logger.info(f"   {len(plan['tasks'])} fix tasks from {plan['shared_context'].get('original_issue_count', '?')} issues")
             logger.info(f"\n   Run with: python3 -m src.orchestrator.main --plan {plan_path} --repo {repo_dir} --no-review -v")
     else:
         report = await loop.verify(cycle=1)

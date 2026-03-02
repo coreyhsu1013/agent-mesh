@@ -129,14 +129,12 @@ class ReactLoop:
     """
     ReAct Loop: Think → Act → Observe → Evaluate → Retry
 
-    v0.6.5: Model Escalation — 每次 retry 可以升級 model
-    escalation_chain = [(runner, kwargs, label), ...]
-    attempt 1 用 chain[0], attempt 2 用 chain[1], ...
+    v0.7.1: Matrix-based routing — router.get_model_for_attempt(complexity, attempt)
+    每個 attempt 從 routing matrix 查表取 model + runner。
     """
 
     def __init__(self, config: dict | None = None):
         react_cfg = (config or {}).get("react", {})
-        self.max_attempts = react_cfg.get("max_attempts", 4)
         self.run_tests = react_cfg.get("run_tests", True)
         self.run_build = react_cfg.get("run_build", True)
         self.run_lint = react_cfg.get("run_lint", False)
@@ -145,41 +143,39 @@ class ReactLoop:
     async def execute_task(
         self,
         task: Any,
-        agent_runner: AgentRunner,
+        runners: dict,       # AgentType → runner instance
+        router: Any,         # ModelRouter
         workspace_dir: str,
         shared_context: str = "",
-        agent_kwargs: dict | None = None,
-        escalation_chain: list | None = None,  # ★ [(runner, kwargs, label), ...]
     ) -> TaskResult:
+        from ..models.task import AgentType
+
         history = LoopHistory()
         start_time = time.time()
-        kwargs = agent_kwargs or {}
+        complexity = getattr(task, "complexity", "M")
+        max_attempts = router.get_max_attempts(complexity)
 
-        # ★ Dynamic max_attempts: chain length + 1, minimum 2
-        # reasoner: 2+1=3, sonnet: 1+1=2, opus: 0+1→min 2
-        effective_max = max(len(escalation_chain or []) + 1, 2)
+        for attempt in range(1, max_attempts + 1):
+            # ★ Query routing matrix for this attempt
+            decision = router.get_model_for_attempt(complexity, attempt)
+            current_runner = runners.get(decision.agent_type)
+            if not current_runner:
+                current_runner = runners.get(AgentType.CLAUDE_CODE)
 
-        for attempt in range(1, effective_max + 1):
-            # ★ Escalation: 選擇這個 attempt 的 runner/kwargs
-            current_runner = agent_runner
-            current_kwargs = dict(kwargs)  # copy to allow per-attempt modification
-            escalation_label = ""
+            current_kwargs: dict[str, Any] = {"model": decision.model}
+            if decision.timeout_multiplier != 1.0:
+                current_kwargs["timeout_multiplier"] = decision.timeout_multiplier
 
-            if escalation_chain and attempt > 1:
-                # attempt 2 → chain[0], attempt 3 → chain[1]
-                chain_idx = min(attempt - 2, len(escalation_chain) - 1)
-                esc_runner, esc_kwargs, esc_label = escalation_chain[chain_idx]
-                current_runner = esc_runner
-                current_kwargs = dict(esc_kwargs)
-                escalation_label = f" [⬆ {esc_label}]"
-            elif not escalation_chain and attempt > 1:
-                # ★ No escalation (opus): retry same model with 2× timeout
-                current_kwargs["timeout_multiplier"] = 2
-                escalation_label = " [retry 2× timeout]"
+            model_label = decision.model_short
+            escalation_info = ""
+            if attempt > 1:
+                escalation_info = f" [⬆ {model_label}]"
+            if decision.timeout_multiplier > 1:
+                escalation_info += f" [timeout ×{decision.timeout_multiplier:.0f}]"
 
             logger.info(
-                f"[ReAct] Task '{task.title}' — Attempt {attempt}/{effective_max}"
-                f"{escalation_label}"
+                f"[ReAct] Task '{task.title}' — Attempt {attempt}/{max_attempts}"
+                f"{escalation_info}"
             )
 
             # ── THINK ──
@@ -199,10 +195,8 @@ class ReactLoop:
             observation = await self._observe(workspace_dir, run_result)
             observation.duration_sec = act_duration
 
-            current_model_label = escalation_label.strip(" [⬆ ]") if escalation_label else "original"
-
             history.add_attempt(
-                thinking=f"Attempt {attempt} ({current_model_label}): {task.title}",
+                thinking=f"Attempt {attempt} ({model_label}): {task.title}",
                 observation=observation,
             )
 
@@ -210,7 +204,7 @@ class ReactLoop:
                 f"[ReAct] Task '{task.title}' — Attempt {attempt} → "
                 f"{'✅ Success' if observation.success else '❌ Failed'} "
                 f"({observation.duration_sec:.1f}s, {len(observation.files_changed)} files)"
-                f"{escalation_label}"
+                f"{escalation_info}"
             )
 
             # ── EVALUATE ──
@@ -219,17 +213,17 @@ class ReactLoop:
                     task_id=task.id, status="completed", attempts=attempt,
                     final_diff=observation.diff, history=history,
                     total_duration_sec=time.time() - start_time,
-                    final_model=current_model_label,
+                    final_model=decision.model,
                 )
 
-            if attempt == effective_max:
+            if attempt == max_attempts:
                 logger.warning(f"[ReAct] Task '{task.title}' — Max attempts reached")
                 return TaskResult(
                     task_id=task.id, status="failed", attempts=attempt,
                     error=observation.error or "Max attempts reached",
                     final_diff=observation.diff, history=history,
                     total_duration_sec=time.time() - start_time,
-                    final_model=current_model_label,
+                    final_model=decision.model,
                 )
 
             delay = self.retry_delay_base * attempt
@@ -237,7 +231,7 @@ class ReactLoop:
             await asyncio.sleep(delay)
 
         return TaskResult(
-            task_id=task.id, status="failed", attempts=effective_max,
+            task_id=task.id, status="failed", attempts=max_attempts,
             error="Unexpected exit", history=history,
             total_duration_sec=time.time() - start_time,
         )

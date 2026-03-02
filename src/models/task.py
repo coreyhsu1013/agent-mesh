@@ -15,6 +15,7 @@ class AgentType(str, Enum):
     GEMINI_CLI = "gemini_cli"
     CODEX = "codex"
     DEEPSEEK_AIDER = "deepseek_aider"   # ← v0.6.0 新增
+    GROK_AIDER = "grok_aider"           # ← v0.7.1 新增
 
 
 class WorkspaceType(str, Enum):
@@ -31,6 +32,7 @@ AGENT_TO_WORKSPACE = {
     AgentType.GEMINI_CLI: WorkspaceType.GEMINI_CLI,
     AgentType.CODEX: WorkspaceType.CODEX_WORKER,
     AgentType.DEEPSEEK_AIDER: WorkspaceType.DEEPSEEK_AIDER,  # ← v0.6.0 新增
+    AgentType.GROK_AIDER: WorkspaceType.DEEPSEEK_AIDER,      # shares aider workspace
 }
 
 
@@ -49,6 +51,7 @@ class Task:
     description: str = ""
     agent_type: str = ""               # 空 = 自動路由
     complexity: str = "M"              # L | M | H
+    category: str = ""                 # backend | frontend | fullstack (optional, from planner)
     module: str = "core"
     target_files: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
@@ -75,6 +78,7 @@ class Task:
             description=d.get("description", ""),
             agent_type=d.get("agent_type", ""),
             complexity=d.get("complexity", "M"),
+            category=d.get("category", ""),
             module=d.get("module", "core"),
             target_files=d.get("target_files", []),
             dependencies=d.get("dependencies", []),
@@ -97,6 +101,7 @@ class Task:
             "description": self.description,
             "agent_type": self.agent_type,
             "complexity": self.complexity,
+            "category": self.category,
             "module": self.module,
             "target_files": self.target_files,
             "dependencies": self.dependencies,

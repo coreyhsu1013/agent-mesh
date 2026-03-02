@@ -1,12 +1,10 @@
 """
-Agent Mesh v0.6.5 — Dispatcher
+Agent Mesh v0.7 — Dispatcher (Wave-based)
 
-v0.6.5 改進：
-- RoutingDecision 的 model/use_chat 正確傳給 runner
-- Claude Opus vs Sonnet 根據 task 複雜度分流
-- DeepSeek reasoner vs chat 根據 task 類型分流
-- Merge lock 防止並行 merge 衝突
-- WorkspacePool 每 task 一個 slot
+v0.7 改進：
+- Wave-based merge: 執行期間 main 不動，Wave 結束統一 merge
+- 每個 task 一個 slot（不回收），Wave 結束才 merge + cleanup
+- merge 順序可控，衝突大幅減少
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ from typing import Optional
 from ..models.task import Task, TaskPlan, TaskStatus, AgentType
 from ..context.store import ContextStore
 from ..auth.aider_runner import AiderRunner, ClaudeRunner
-from .router import ModelRouter, RoutingDecision
+from .router import ModelRouter
 from .react_loop import ReactLoop, TaskResult
 from .reviewer import Reviewer
 from .workspace import WorkspacePool
@@ -39,9 +37,11 @@ class Dispatcher:
         self.reviewer = Reviewer(config, repo_dir)
         self.pool = WorkspacePool(repo_dir, config)
 
+        aider = AiderRunner(config)
         self.runners = {
             AgentType.CLAUDE_CODE: ClaudeRunner(config),
-            AgentType.DEEPSEEK_AIDER: AiderRunner(config),
+            AgentType.DEEPSEEK_AIDER: aider,
+            AgentType.GROK_AIDER: aider,  # same runner, different AgentType
         }
 
         disp_cfg = config.get("dispatcher", {})
@@ -49,7 +49,6 @@ class Dispatcher:
         self.semaphore_claude = asyncio.Semaphore(disp_cfg.get("semaphore_claude", 2))
         self.semaphore_deepseek = asyncio.Semaphore(disp_cfg.get("semaphore_deepseek", 3))
         self.global_semaphore = asyncio.Semaphore(self.max_parallel)
-        self.merge_lock = asyncio.Lock()
 
         self.shared_context = ""
         self.no_review = config.get("no_review", False)
@@ -62,8 +61,6 @@ class Dispatcher:
         waves: list[int] | None = None,
         resume: bool = False,
     ):
-        await self.pool.setup()
-
         if plan.shared_context:
             self.shared_context = json.dumps(plan.shared_context, indent=2)
 
@@ -71,7 +68,6 @@ class Dispatcher:
         if modules:
             tasks = [t for t in tasks if t.module in modules]
         if resume:
-            # ★ Resume: 從 DB 讀 completed 狀態，只跑 pending/failed
             db_tasks = self.store.get_all_tasks()
             completed_from_db = {t.id for t in db_tasks if t.status == TaskStatus.COMPLETED.value}
             tasks = [t for t in tasks if t.id not in completed_from_db]
@@ -83,7 +79,7 @@ class Dispatcher:
 
         self._print_routing_preview(tasks)
 
-        # Build completed set (from DB for resume, or from plan)
+        # Build completed/failed sets
         completed_ids = set()
         failed_ids = set()
         if resume:
@@ -97,7 +93,7 @@ class Dispatcher:
         while pending:
             wave_num += 1
 
-            # ★ Cascade propagation: 連鎖跳過所有被 failed 擋住的 task
+            # ★ Cascade propagation: skip tasks blocked by failed deps
             while True:
                 blocked = [
                     t for t in pending
@@ -107,7 +103,7 @@ class Dispatcher:
                     break
                 for t in blocked:
                     t.status = TaskStatus.FAILED.value
-                    t.error = f"Blocked: upstream dependency failed"
+                    t.error = "Blocked: upstream dependency failed"
                     self.store.update_task(t)
                     failed_ids.add(t.id)
                     pending.remove(t)
@@ -143,12 +139,37 @@ class Dispatcher:
                 f"{'='*60}"
             )
 
+            # ═══════════════════════════════════════════
+            # ★ Phase 1: Setup wave slots (one per task)
+            # ═══════════════════════════════════════════
+            slot_map = await self.pool.setup_wave(len(ready))
+            # Assign slot_id to each task
+            task_slot: dict[str, int] = {}  # task.id → slot_id
+            for idx, task in enumerate(ready):
+                task_slot[task.id] = idx
+
+            # ═══════════════════════════════════════════
+            # ★ Phase 2: Execute all tasks (semaphore limits parallelism)
+            # ═══════════════════════════════════════════
             results = await asyncio.gather(
-                *[self._execute_single_task(t) for t in ready],
+                *[
+                    self._execute_task_in_slot(
+                        task=t,
+                        slot_id=task_slot[t.id],
+                        workspace_dir=slot_map[task_slot[t.id]],
+                    )
+                    for t in ready
+                ],
                 return_exceptions=True,
             )
 
+            # Collect results
+            completed_slots = []     # slot_ids that succeeded
+            task_labels = {}         # slot_id → task title (for commit msgs)
+            wave_results = {}        # task.id → TaskResult
+
             for task, result in zip(ready, results):
+                sid = task_slot[task.id]
                 if isinstance(result, Exception):
                     logger.error(f"[Dispatcher] '{task.title}' exception: {result}")
                     task.status = TaskStatus.FAILED.value
@@ -156,122 +177,127 @@ class Dispatcher:
                     self.store.update_task(task)
                     failed_ids.add(task.id)
                 elif result and result.status == "completed":
-                    completed_ids.add(task.id)
+                    completed_slots.append(sid)
+                    model_short = (result.final_model or "unknown").split("/")[-1]
+                    task_labels[sid] = f"{model_short}: {task.title}"
+                    wave_results[task.id] = result
                 else:
-                    # Task failed normally
+                    task.status = TaskStatus.FAILED.value
+                    task.error = result.error if result else "Unknown failure"
+                    self.store.update_task(task)
                     failed_ids.add(task.id)
-                pending.remove(task)
+                    logger.warning(
+                        f"[Dispatcher] ❌ '{task.title}' failed "
+                        f"({result.attempts if result else 0} attempts)"
+                    )
+
+            # ═══════════════════════════════════════════
+            # ★ Phase 3: Merge all completed slots → main
+            # ═══════════════════════════════════════════
+            if completed_slots:
+                merge_results = await self.pool.merge_wave(completed_slots, task_labels)
+
+                # Update task status based on merge result
+                for task in ready:
+                    sid = task_slot[task.id]
+                    result = wave_results.get(task.id)
+                    if result and result.status == "completed":
+                        if merge_results.get(sid, False):
+                            task.status = TaskStatus.COMPLETED.value
+                            task.diff = result.final_diff[:5000]
+                            completed_ids.add(task.id)
+                            dur = task.duration_sec
+                            model = result.final_model or "unknown"
+                            logger.info(
+                                f"[Dispatcher] ✅ '{task.title}' "
+                                f"({model.split('/')[-1]}, {result.attempts} att, {dur:.0f}s)"
+                            )
+                        else:
+                            task.status = TaskStatus.FAILED.value
+                            task.error = "Merge failed"
+                            failed_ids.add(task.id)
+                            logger.warning(f"[Dispatcher] ❌ '{task.title}' merge failed")
+                        self.store.update_task(task)
+
+            # ═══════════════════════════════════════════
+            # ★ Phase 4: Cleanup wave slots
+            # ═══════════════════════════════════════════
+            await self.pool.cleanup_wave()
+
+            # Remove processed tasks from pending
+            for task in ready:
+                if task in pending:
+                    pending.remove(task)
 
         self._print_summary(plan)
 
-    async def _execute_single_task(self, task: Task) -> Optional[TaskResult]:
+    async def _execute_task_in_slot(
+        self, task: Task, slot_id: int, workspace_dir: str
+    ) -> Optional[TaskResult]:
+        """
+        Execute a single task in its assigned slot.
+        No merge here — just run the agent and return result.
+        """
         task.status = TaskStatus.RUNNING.value
         self.store.update_task(task)
         start_time = time.time()
 
-        # 1) Route → 拿到 agent + model + use_chat
-        decision = self.router.route(task)
-        task.agent_used = f"{decision.agent_type.value}:{decision.model.split('/')[-1]}"
+        # 1) Preview first model for logging + semaphore
+        complexity = getattr(task, "complexity", "M")
+        first_decision = self.router.get_model_for_attempt(complexity, 1, log=False)
         task.routed_by = "manual" if task.agent_type else "auto"
+        task.agent_used = f"{first_decision.agent_type.value}:{first_decision.model_short}"
 
-        runner = self.runners.get(decision.agent_type)
-        if not runner:
-            runner = self.runners[AgentType.CLAUDE_CODE]
-            decision = RoutingDecision(AgentType.CLAUDE_CODE, "claude-sonnet-4-6", "fallback")
+        semaphore = self._get_semaphore(first_decision.agent_type)
+        max_att = self.router.get_max_attempts(complexity)
 
-        semaphore = self._get_semaphore(decision.agent_type)
+        # Build chain preview for log
+        chain_preview = []
+        for i in range(1, max_att + 1):
+            d = self.router.get_model_for_attempt(complexity, i, log=False)
+            chain_preview.append(d.model_short)
+        chain_str = " → ".join(chain_preview)
 
-        # ★ 建構 runner kwargs（model/use_chat）
-        agent_kwargs = {}
-        if decision.agent_type == AgentType.DEEPSEEK_AIDER:
-            agent_kwargs["use_chat"] = decision.use_chat
-        elif decision.agent_type == AgentType.CLAUDE_CODE:
-            agent_kwargs["model"] = decision.model
-
-        # ★ 建構 escalation chain: 失敗就升級 model
-        escalation_chain = self._build_escalation_chain(decision)
-
-        slot_id = -1
         try:
             async with self.global_semaphore:
                 async with semaphore:
-                    slot_id, workspace_dir = await self.pool.acquire()
-
-                    model_short = decision.model.split("/")[-1]
-                    esc_info = ""
-                    if escalation_chain:
-                        esc_models = [e[2] for e in escalation_chain]
-                        esc_info = f" escalation: {' → '.join(esc_models)}"
                     logger.info(
                         f"[Dispatcher] 🚀 '{task.title}' → "
-                        f"{decision.agent_type.value} ({model_short}) "
-                        f"[slot_{slot_id}, {task.complexity}]{esc_info}"
+                        f"{first_decision.agent_type.value} ({first_decision.model_short}) "
+                        f"[slot_{slot_id}, {complexity}] chain: {chain_str}"
                     )
 
-                    # 2) ReAct Loop（★ escalation_chain 傳入）
+                    # 2) ReAct Loop — router picks model per attempt
                     result = await self.react_loop.execute_task(
                         task=task,
-                        agent_runner=runner,
+                        runners=self.runners,
+                        router=self.router,
                         workspace_dir=workspace_dir,
                         shared_context=self.shared_context,
-                        agent_kwargs=agent_kwargs,
-                        escalation_chain=escalation_chain,
                     )
 
                     task.attempts = result.attempts
                     task.duration_sec = time.time() - start_time
                     if result.history:
                         task.react_history = result.history.to_json()
-                    # ★ Track actual model (may have escalated)
-                    if result.final_model and result.final_model != "original":
-                        task.agent_used = f"escalated:{result.final_model}"
+                    if result.final_model:
+                        model_short = result.final_model.split("/")[-1]
+                        task.agent_used = f"{'escalated:' if result.attempts > 1 else ''}{model_short}"
 
-                    if result.status == "completed":
-                        # 3) Review
-                        approved = True
-                        if not self.no_review:
-                            review = await self.reviewer.review(
-                                diff=result.final_diff,
-                                task_title=task.title,
-                                task_description=task.description,
-                                acceptance_criteria=task.acceptance_criteria,
-                                attempt=result.attempts,
-                            )
-                            approved = review.approved
-                            if not approved:
-                                logger.warning(f"[Reviewer] Rejected: {review.feedback}")
-
-                        if approved:
-                            # 4) Merge（★ 加鎖，一次一個）
-                            async with self.merge_lock:
-                                commit_msg = f"[agent-mesh] {model_short}: {task.title}"
-                                merged = await self.pool.merge_to_main(slot_id, commit_msg)
-
-                            if merged:
-                                task.status = TaskStatus.COMPLETED.value
-                                task.diff = result.final_diff[:5000]
-                                dur = time.time() - start_time
-                                logger.info(
-                                    f"[Dispatcher] ✅ '{task.title}' "
-                                    f"({model_short}, {result.attempts} att, {dur:.0f}s)"
-                                )
-                            else:
-                                task.status = TaskStatus.FAILED.value
-                                task.error = "Merge failed"
-                                logger.warning(f"[Dispatcher] ❌ '{task.title}' merge failed")
-                        else:
-                            task.status = TaskStatus.FAILED.value
-                            task.error = "Review rejected"
-                            logger.warning(f"[Dispatcher] ❌ '{task.title}' review rejected")
-                    else:
-                        task.status = TaskStatus.FAILED.value
-                        task.error = result.error or "Unknown failure"
-                        logger.warning(
-                            f"[Dispatcher] ❌ '{task.title}' failed "
-                            f"({result.attempts} attempts): {result.error}"
+                    # 3) Review (optional, no merge here)
+                    if result.status == "completed" and not self.no_review:
+                        review = await self.reviewer.review(
+                            diff=result.final_diff,
+                            task_title=task.title,
+                            task_description=task.description,
+                            acceptance_criteria=task.acceptance_criteria,
+                            attempt=result.attempts,
                         )
+                        if not review.approved:
+                            logger.warning(f"[Reviewer] Rejected: {review.feedback}")
+                            result.status = "failed"
+                            result.error = f"Review rejected: {review.feedback}"
 
-                    self.store.update_task(task)
                     return result
 
         except Exception as e:
@@ -281,46 +307,13 @@ class Dispatcher:
             self.store.update_task(task)
             logger.error(f"[Dispatcher] Exception '{task.title}': {e}")
             raise
-        finally:
-            if slot_id >= 0:
-                self.pool.release(slot_id)
 
     def _get_semaphore(self, agent_type: AgentType) -> asyncio.Semaphore:
         if agent_type == AgentType.CLAUDE_CODE:
             return self.semaphore_claude
-        elif agent_type == AgentType.DEEPSEEK_AIDER:
+        elif agent_type in (AgentType.DEEPSEEK_AIDER, AgentType.GROK_AIDER):
             return self.semaphore_deepseek
         return self.global_semaphore
-
-    def _build_escalation_chain(self, decision: RoutingDecision) -> list:
-        """
-        2-level model escalation（3 attempts total, no duplicate opus）。
-        回傳 [(runner, kwargs, label), ...] for attempt 2, 3
-
-        Escalation paths:
-          reasoner → sonnet → opus
-          sonnet   → opus
-          opus     → (retry same)
-        """
-        chain = []
-        claude_runner = self.runners.get(AgentType.CLAUDE_CODE)
-
-        model = decision.model
-
-        if "deepseek" in model:
-            # reasoner → sonnet → opus
-            if claude_runner:
-                chain.append((claude_runner, {"model": self.router.model_sonnet}, "claude-sonnet"))
-                chain.append((claude_runner, {"model": self.router.model_opus}, "claude-opus"))
-
-        elif "sonnet" in model:
-            # sonnet → opus
-            if claude_runner:
-                chain.append((claude_runner, {"model": self.router.model_opus}, "claude-opus"))
-
-        # opus → no escalation, retry same model
-
-        return chain
 
     def _print_routing_preview(self, tasks: list[Task]):
         summary = self.router.get_routing_summary(tasks)
@@ -343,7 +336,7 @@ class Dispatcher:
 
         logger.info(f"""
 {'='*60}
-📊 Execution Summary (v0.6.5)
+📊 Execution Summary (v0.7)
 {'='*60}
   Total:     {total}
   Completed: {status.get('completed', 0)} ✅
