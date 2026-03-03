@@ -225,6 +225,9 @@ async def run_cycles(config: dict, repo_dir: str, spec_path: str,
                      initial_plan: str, max_cycles: int = 5,
                      max_parallel: int = 3, no_review: bool = True):
     """Run project-level ReAct loop with auto cycles."""
+    from ..context.store import ContextStore
+    from ..models.task import TaskPlan
+    from .dispatcher import Dispatcher
     from .project_loop import ProjectLoop
 
     logger.info(f"\n🔄 Agent Mesh v{config.get('version', '0.7.0')} — Auto Cycle Mode")
@@ -232,17 +235,38 @@ async def run_cycles(config: dict, repo_dir: str, spec_path: str,
     logger.info(f"📋 Spec: {spec_path}")
     logger.info(f"🔄 Max cycles: {max_cycles}")
 
+    store = ContextStore(repo_dir)
+
+    class _DispatcherWrapper:
+        """Adapts Dispatcher to the factory interface expected by run_auto."""
+        def __init__(self, plan_path: str, max_parallel: int, no_review: bool):
+            with open(plan_path) as f:
+                plan_data = json.load(f)
+            self.plan = TaskPlan.from_dict(plan_data)
+            self.run_id = store.save_plan(self.plan)
+            cfg = {**config, "no_review": no_review}
+            cfg.setdefault("dispatcher", {})["max_parallel"] = max_parallel
+            self.dispatcher = Dispatcher(cfg, repo_dir, store)
+
+        async def run(self):
+            await self.dispatcher.execute_plan(
+                plan=self.plan,
+                run_id=self.run_id,
+                resume=True,  # skip already-completed tasks across cycles
+            )
+            return "done"
+
     loop = ProjectLoop(config, repo_dir, spec_path)
 
-    # For auto mode, we need a dispatcher factory
-    # (will be implemented when auto-cycle execution is ready)
     success = await loop.run_auto(
         max_cycles=max_cycles,
+        dispatcher_factory=_DispatcherWrapper,
         initial_plan_path=initial_plan,
         max_parallel=max_parallel,
         no_review=no_review,
     )
 
+    store.close()
     return success
 
 
