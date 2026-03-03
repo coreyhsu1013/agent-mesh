@@ -329,10 +329,12 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
         code_tree: str,
         exclude_modules: list[str],
         max_gaps: int = 5,
+        known_gaps: list[dict] | None = None,
     ) -> list[VerifyIssue]:
         """
         Bounded scan for NEW critical gaps not previously identified.
         Uses Opus for thoroughness but caps output.
+        known_gaps: list of remaining gaps from regression — excluded from scan.
         """
         verify_cfg = self.config.get("verify", {})
         model = verify_cfg.get("scan_model", "claude-opus-4-6")
@@ -347,6 +349,20 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
 
         exclude_str = ", ".join(exclude_modules) if exclude_modules else "none"
 
+        # Build known gaps section so LLM doesn't re-report them
+        known_section = ""
+        if known_gaps:
+            known_lines = []
+            for idx, gap in enumerate(known_gaps, 1):
+                msg = gap.get("message", "")
+                module = gap.get("module", "?")
+                known_lines.append(f"{idx}. [{module}] {msg}")
+            known_section = (
+                "\n## ALREADY KNOWN GAPS (do NOT re-report these)\n"
+                + "\n".join(known_lines)
+                + "\n"
+            )
+
         prompt = f"""You are scanning for NEW critical gaps not previously identified.
 
 ## CONSTRAINTS
@@ -354,8 +370,9 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
 - Maximum {max_gaps} new gaps
 - EXCLUDE these modules entirely: {exclude_str}
 - Do NOT re-report issues that are already partially implemented
+- Do NOT re-report any issue listed in ALREADY KNOWN GAPS below
 - Focus on completely MISSING functionality only
-
+{known_section}
 ## Output Format
 Respond ONLY with a JSON array (max {max_gaps} items). No other text.
 Each item:

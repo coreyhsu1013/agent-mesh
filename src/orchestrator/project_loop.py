@@ -130,33 +130,40 @@ class ProjectLoop:
         else:
             logger.info("[ClosedLoop] No previous gaps to regress against")
 
-        # Step 2: Bounded new gap scan
-        new_gaps = []
+        # Step 2: Bounded new gap scan (pass remaining_gaps so it won't re-report)
         new_gap_issues = []
         if report.build_ok:  # only scan if build passes
             new_gap_issues = await self.verifier.run_bounded_scan(
-                self.spec_path, code_tree, exclude_modules, max_new
+                self.spec_path, code_tree, exclude_modules, max_new,
+                known_gaps=remaining_gaps,
             )
             logger.info(f"[ClosedLoop] New scan: {len(new_gap_issues)} new gaps (max {max_new})")
-
-            # Convert VerifyIssues to dicts for remaining_gaps compatibility
-            for issue in new_gap_issues:
-                new_gaps.append(issue.to_dict())
-                report.issues.append(issue)
         else:
             logger.info("[ClosedLoop] Skipping new gap scan — build failed")
 
         # Add remaining gaps back to report as VerifyIssues
-        for gap in remaining_gaps:
-            report.issues.append(VerifyIssue(
-                category=gap.get("category", "spec_gap"),
-                severity=gap.get("severity", "MEDIUM"),
-                message=gap.get("message", ""),
-                module=gap.get("module"),
-                found_by=gap.get("found_by", ["regression"]),
-            ))
+        # Use module+message key to dedup against new_gap_issues
+        seen_keys: set[str] = set()
 
-        all_gap_count = len(remaining_gaps) + len(new_gap_issues) if report.build_ok else len(remaining_gaps)
+        for gap in remaining_gaps:
+            key = (gap.get("module") or "").lower() + "|" + (gap.get("message") or "").lower()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                report.issues.append(VerifyIssue(
+                    category=gap.get("category", "spec_gap"),
+                    severity=gap.get("severity", "MEDIUM"),
+                    message=gap.get("message", ""),
+                    module=gap.get("module"),
+                    found_by=gap.get("found_by", ["regression"]),
+                ))
+
+        for issue in new_gap_issues:
+            key = (issue.module or "").lower() + "|" + issue.message.lower()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                report.issues.append(issue)
+
+        all_gap_count = len([i for i in report.issues if i.category == "spec_gap"])
         report.spec_gap_count = all_gap_count
 
         # Save report
