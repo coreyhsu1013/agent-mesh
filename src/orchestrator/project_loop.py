@@ -252,7 +252,7 @@ class ProjectLoop:
                     break
 
                 plan_path = os.path.join(
-                    self.repo_dir, f".agent-mesh/fix-plan-{cycle}.json"
+                    self.repo_dir, f".agent-mesh/fix-plan-{cycle - 1}.json"
                 )
                 if not os.path.exists(plan_path):
                     logger.error(f"[ProjectLoop] No fix-plan found for cycle {cycle}")
