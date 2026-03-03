@@ -134,3 +134,9 @@ verify:
   lint_cmd: "npx turbo lint"
   skip_lint: true          # many projects don't have lint configured
   skip_test: false
+  # ── Convergence settings (v0.7.4) ──
+  exclude_modules: []                    # e.g. ["Module 1: Android Capture Service"]
+  max_new_gaps_per_cycle: 5
+  convergence_threshold: 3               # remaining + new <= this → converged
+  regression_model: "claude-sonnet-4-6"  # cheaper model for regression check
+  scan_model: "claude-opus-4-6"          # stronger model for new gap scan

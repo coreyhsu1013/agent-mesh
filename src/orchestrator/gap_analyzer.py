@@ -48,6 +48,8 @@ class GapAnalyzer:
     def __init__(self, config: dict):
         self.config = config
         self.max_issues_per_task = 5  # split if more
+        verify_cfg = config.get("verify", {})
+        self.exclude_modules: list[str] = verify_cfg.get("exclude_modules", [])
 
     def generate_fix_plan(self, report: VerifyReport) -> dict:
         """
@@ -60,6 +62,20 @@ class GapAnalyzer:
                 "shared_context": {"cycle": report.cycle, "status": "PASSED"},
                 "tasks": [],
             }
+
+        # Safety net: filter out excluded modules before generating tasks
+        if self.exclude_modules:
+            before_count = len(report.issues)
+            report.issues = [
+                i for i in report.issues
+                if not self._is_excluded_module(i)
+            ]
+            filtered = before_count - len(report.issues)
+            if filtered > 0:
+                logger.info(
+                    f"[GapAnalyzer] Filtered {filtered} issues from excluded modules: "
+                    f"{self.exclude_modules}"
+                )
 
         all_tasks = []
         task_counter = 0
@@ -240,6 +256,18 @@ class GapAnalyzer:
         }
 
     # ── Issue Classification ──
+
+    def _is_excluded_module(self, issue: VerifyIssue) -> bool:
+        """Check if issue belongs to an excluded module."""
+        if not self.exclude_modules:
+            return False
+        issue_module = (issue.module or "").lower()
+        issue_message = issue.message.lower()
+        for excluded in self.exclude_modules:
+            excluded_lower = excluded.lower()
+            if excluded_lower in issue_module or excluded_lower in issue_message:
+                return True
+        return False
 
     def _is_schema_issue(self, issue: VerifyIssue) -> bool:
         """Check if issue is about data model / schema changes."""

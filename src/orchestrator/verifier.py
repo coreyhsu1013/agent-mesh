@@ -177,6 +177,262 @@ class Verifier:
         report.duration_s = time.time() - t0
         return report
 
+    async def run_mechanical(self, cycle: int = 1) -> VerifyReport:
+        """Run only mechanical checks (conflicts, build, test, lint). No LLM."""
+        t0 = time.time()
+        report = VerifyReport(cycle=cycle)
+
+        # Step 1: Conflict markers
+        conflicts = await self._scan_conflicts()
+        for f in conflicts:
+            report.issues.append(VerifyIssue(
+                category="conflict",
+                severity="HIGH",
+                message=f"Git conflict markers in {f}",
+                file=f,
+            ))
+
+        # Step 2: Build
+        build_ok, build_errors = await self._run_build()
+        report.build_ok = build_ok
+        if not build_ok:
+            for err in build_errors[:20]:
+                report.issues.append(VerifyIssue(
+                    category="build",
+                    severity="HIGH",
+                    message=err,
+                ))
+
+        # Step 3: Lint (optional)
+        if not self.skip_lint:
+            lint_ok, lint_warnings = await self._run_lint()
+            report.lint_ok = lint_ok
+            if not lint_ok:
+                for w in lint_warnings[:10]:
+                    report.issues.append(VerifyIssue(
+                        category="lint",
+                        severity="MEDIUM",
+                        message=w,
+                    ))
+        else:
+            report.lint_ok = True
+
+        # Step 4: Test (optional)
+        if not self.skip_test:
+            test_ok, test_failures = await self._run_tests()
+            report.test_ok = test_ok
+            if not test_ok:
+                for f in test_failures[:10]:
+                    report.issues.append(VerifyIssue(
+                        category="test",
+                        severity="HIGH",
+                        message=f,
+                    ))
+        else:
+            report.test_ok = True
+
+        report.duration_s = time.time() - t0
+        return report
+
+    async def run_regression(
+        self,
+        prev_gaps: list[dict],
+        spec_path: str,
+        code_tree: str,
+    ) -> list[dict]:
+        """
+        Regression check: verify whether previously identified gaps have been fixed.
+        Uses Sonnet (cheaper) since this is a yes/no checklist.
+        Returns only gaps that are NOT fixed.
+        """
+        if not prev_gaps:
+            return []
+
+        verify_cfg = self.config.get("verify", {})
+        model = verify_cfg.get("regression_model", "claude-sonnet-4-6")
+
+        # Build checklist of previous gaps
+        gap_lines = []
+        for idx, gap in enumerate(prev_gaps, 1):
+            msg = gap.get("message", "")
+            module = gap.get("module", "?")
+            gap_lines.append(f"{idx}. [{module}] {msg}")
+        gap_checklist = "\n".join(gap_lines)
+
+        prompt = f"""You are verifying whether previously identified gaps have been fixed.
+For each gap below, check the ACTUAL CODE and respond with ONLY a JSON array.
+Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence": "brief explanation"}}
+
+## PREVIOUS GAPS
+{gap_checklist}
+
+## ACTUAL CODE
+{code_tree}
+"""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f'cat {prompt_file} | claude -p --model {model} --output-format text',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+            raw = stdout.decode().strip()
+
+            # Parse JSON response
+            results = self._parse_json_array(raw)
+            if not results:
+                logger.warning("[Verifier] Regression check: could not parse response, treating all as remaining")
+                return prev_gaps
+
+            # Filter: return only gaps that are NOT fixed
+            remaining = []
+            fixed_indices = set()
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                idx = item.get("index", 0)
+                status = item.get("status", "REMAINING")
+                if status == "FIXED":
+                    fixed_indices.add(idx)
+
+            for idx, gap in enumerate(prev_gaps, 1):
+                if idx not in fixed_indices:
+                    remaining.append(gap)
+
+            logger.info(
+                f"[Verifier] Regression: {len(fixed_indices)} fixed, "
+                f"{len(remaining)} remaining out of {len(prev_gaps)}"
+            )
+            return remaining
+
+        except asyncio.TimeoutError:
+            logger.warning("[Verifier] Regression check timed out, treating all as remaining")
+            return prev_gaps
+        except Exception as e:
+            logger.warning(f"[Verifier] Regression check failed: {e}")
+            return prev_gaps
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except Exception:
+                pass
+
+    async def run_bounded_scan(
+        self,
+        spec_path: str,
+        code_tree: str,
+        exclude_modules: list[str],
+        max_gaps: int = 5,
+    ) -> list[VerifyIssue]:
+        """
+        Bounded scan for NEW critical gaps not previously identified.
+        Uses Opus for thoroughness but caps output.
+        """
+        verify_cfg = self.config.get("verify", {})
+        model = verify_cfg.get("scan_model", "claude-opus-4-6")
+
+        # Read spec
+        try:
+            with open(spec_path, 'r') as f:
+                spec_content = f.read()
+        except Exception as e:
+            logger.warning(f"[Verifier] Cannot read spec for bounded scan: {e}")
+            return []
+
+        exclude_str = ", ".join(exclude_modules) if exclude_modules else "none"
+
+        prompt = f"""You are scanning for NEW critical gaps not previously identified.
+
+## CONSTRAINTS
+- Only report HIGH severity gaps that affect core functionality
+- Maximum {max_gaps} new gaps
+- EXCLUDE these modules entirely: {exclude_str}
+- Do NOT re-report issues that are already partially implemented
+- Focus on completely MISSING functionality only
+
+## Output Format
+Respond ONLY with a JSON array (max {max_gaps} items). No other text.
+Each item:
+{{
+  "module": "Module name from spec",
+  "requirement": "Specific requirement from spec",
+  "status": "NOT_IMPLEMENTED" | "PARTIAL" | "INCORRECT",
+  "evidence": "What you see (or don't see) in the code",
+  "severity": "HIGH",
+  "suggested_fix": "Brief description of what needs to be done"
+}}
+
+If no new gaps, return: []
+
+## SPECIFICATION
+{spec_content}
+
+## ACTUAL CODE
+{code_tree}
+"""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f'cat {prompt_file} | claude -p --model {model} --output-format text',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
+            issues = self._parse_gap_json(stdout.decode(), source="bounded-scan")
+
+            # Cap at max_gaps
+            if len(issues) > max_gaps:
+                logger.info(f"[Verifier] Bounded scan returned {len(issues)}, capping at {max_gaps}")
+                issues = issues[:max_gaps]
+
+            return issues
+
+        except asyncio.TimeoutError:
+            logger.warning("[Verifier] Bounded scan timed out")
+            return []
+        except Exception as e:
+            logger.warning(f"[Verifier] Bounded scan failed: {e}")
+            return []
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except Exception:
+                pass
+
+    def _parse_json_array(self, raw: str) -> list[dict] | None:
+        """Parse a JSON array from LLM output, handling markdown fences."""
+        raw = raw.strip()
+        if '```json' in raw:
+            raw = raw.split('```json')[1].split('```')[0].strip()
+        elif '```' in raw:
+            raw = raw.split('```')[1].split('```')[0].strip()
+
+        try:
+            result = json.loads(raw)
+            if isinstance(result, list):
+                return result
+            return [result]
+        except json.JSONDecodeError:
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start >= 0 and end > start:
+                try:
+                    return json.loads(raw[start:end + 1])
+                except json.JSONDecodeError:
+                    return None
+            return None
+
     # ── Mechanical Checks ──
 
     async def _scan_conflicts(self) -> list[str]:
