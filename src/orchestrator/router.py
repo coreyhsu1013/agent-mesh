@@ -1,10 +1,12 @@
 """
-Agent Mesh v0.7.1 — Model Router (Matrix-based)
+Agent Mesh v0.7.5 — Model Router (Matrix-based)
 
 從 config.yaml routing.matrix 讀取 escalation chain。
 每個 complexity (L/S/M/H) 有自己的 model chain。
 attempt 1 → chain[0], attempt 2 → chain[1], ...
 最後一級 retry: timeout_multiplier = 2.0
+
+v0.7.5: outer_loop_min_tier — 外層循環根據收斂情況動態提升最低模型等級
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import logging
 from dataclasses import dataclass
 
 from ..models.task import Task, AgentType
+from .model_ranking import get_model_tier
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +120,12 @@ class ModelRouter:
         claude_cfg = agents_cfg.get("claude_code", {})
         self.model_opus = claude_cfg.get("model_opus", "claude-opus-4-6")
 
+        # ★ Outer-loop escalation: minimum model tier (set by ProjectLoop)
+        self.outer_loop_min_tier: int = routing_cfg.get("outer_loop_min_tier", 0)
+        self.outer_loop_timeout_mul: float = routing_cfg.get(
+            "outer_loop_timeout_multiplier", 1.0
+        )
+
     def apply_complexity_floor(self, task: Task) -> str:
         """Bump task complexity if title/module matches foundational keywords."""
         original = getattr(task, "complexity", "M")
@@ -142,9 +151,16 @@ class ModelRouter:
     def get_start_attempt(self, task: Task) -> int:
         """
         Determine which attempt to start from.
-        Foundational tasks and fix tasks skip Grok/DeepSeek → start at first Claude model.
+        Three rules are evaluated and the HIGHEST start attempt wins:
+          1. Foundational task keywords → force Sonnet
+          2. Fix tasks (cycle 2+) → force Sonnet
+          3. Outer-loop escalation → enforce min tier for ALL tasks
         Returns 1-based attempt index.
         """
+        complexity = getattr(task, "complexity", "M")
+        chain = self.matrix.get(complexity, self.matrix["M"])
+        start = 1
+
         title_lower = (task.title or "").lower()
         module_lower = (task.module or "").lower()
         task_id = (task.id or "").lower()
@@ -162,22 +178,32 @@ class ModelRouter:
         if task_id.startswith("fix-"):
             should_force = True
 
-        if not should_force:
-            return 1
+        if should_force:
+            for idx, model in enumerate(chain):
+                if model.startswith("claude-"):
+                    candidate = idx + 1  # 1-based
+                    if candidate > start:
+                        start = candidate
+                    logger.info(
+                        f"[Router] Force Sonnet: '{task.title}' → attempt {candidate} "
+                        f"({model})"
+                    )
+                    break
 
-        # Find first Claude model in the chain
-        complexity = getattr(task, "complexity", "M")
-        chain = self.matrix.get(complexity, self.matrix["M"])
-        for idx, model in enumerate(chain):
-            if model.startswith("claude-"):
-                start = idx + 1  # 1-based
-                logger.info(
-                    f"[Router] Force Sonnet: '{task.title}' → skip to attempt {start} "
-                    f"({model})"
-                )
-                return start
+        # Rule 3: outer-loop escalation — enforce min tier for ALL tasks
+        if self.outer_loop_min_tier > 0:
+            for idx, model in enumerate(chain):
+                if get_model_tier(model) >= self.outer_loop_min_tier:
+                    candidate = idx + 1  # 1-based
+                    if candidate > start:
+                        start = candidate
+                        logger.info(
+                            f"[Router] Outer-loop tier {self.outer_loop_min_tier}: "
+                            f"'{task.title}' → attempt {candidate} ({model})"
+                        )
+                    break
 
-        return 1
+        return start
 
     def get_model_for_attempt(
         self, complexity: str, attempt: int, *, log: bool = True,
@@ -194,6 +220,10 @@ class ModelRouter:
         # Last slot in chain + not first attempt → 2× timeout
         is_last_retry = (idx == len(chain) - 1) and (attempt > 1)
         timeout_multiplier = 2.0 if is_last_retry else 1.0
+
+        # ★ Outer-loop timeout extension (top tier retry)
+        if self.outer_loop_timeout_mul > 1.0:
+            timeout_multiplier *= self.outer_loop_timeout_mul
 
         reason = f"chain[{complexity}][{idx}]"
         if timeout_multiplier > 1:

@@ -127,6 +127,20 @@ dispatcher:
 # DeepSeek:      ~10% (fallback / specific tasks)
 # Gemini:        ~20% (planning + verify)
 
+# ── Model Ranking & Outer-Loop Escalation (v0.7.5) ──
+model_ranking:
+  tiers:
+    - name: "budget"
+      prefixes: ["xai/"]
+    - name: "standard"
+      prefixes: ["deepseek/", "claude-sonnet"]
+    - name: "premium"
+      prefixes: ["claude-opus"]
+  escalation:
+    gap_reduction_threshold: 0.15    # escalate if gaps reduce < 15%
+    max_retries_at_top_tier: 3       # #1 (Opus) gets 3 tries before give up
+    timeout_extension: 1.5           # multiply timeout each retry at top tier
+
 # ── Verify (v0.7) ──
 verify:
   build_cmd: "pnpm build"

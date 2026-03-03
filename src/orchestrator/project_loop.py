@@ -1,5 +1,5 @@
 """
-Agent Mesh v0.7 — Project-level ReAct Loop
+Agent Mesh v0.7.5 — Project-level ReAct Loop
 
 Outer loop that orchestrates the full cycle:
   Spec → Plan → Execute → Verify → Fix-Plan → Execute → Verify → ... → Done
@@ -7,11 +7,16 @@ Outer loop that orchestrates the full cycle:
 This wraps the existing dispatcher (inner loop) with a verification
 and fix-plan generation layer.
 
+v0.7.5: Model ranking & outer-loop escalation
+  - Tracks gap count per cycle
+  - If gap reduction < threshold → escalate to higher model tier
+  - At top tier: extend timeout, retry N times before giving up
+
 Expected convergence:
-  Cycle 1: spec.md → 20 tasks → execute → 8 gaps (60% done)
-  Cycle 2: fix-plan → 8 tasks → execute → 3 gaps (85% done)
-  Cycle 3: fix-plan → 3 tasks → execute → 1 gap  (95% done)
-  Cycle 4: fix-plan → 1 task  → execute → 0 gaps  → Done ✅
+  Cycle 1: spec.md → 20 tasks (Grok) → execute → 8 gaps (60% done)
+  Cycle 2: fix-plan → 8 tasks (Grok) → execute → 3 gaps (85% done)
+  Cycle 3: fix-plan → 3 tasks (Sonnet↑) → execute → 1 gap  (95% done)
+  Cycle 4: fix-plan → 1 task (Opus↑)  → execute → 0 gaps  → Done ✅
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ from typing import Any
 
 from .verifier import Verifier, VerifyReport, VerifyIssue
 from .gap_analyzer import GapAnalyzer
+from .model_ranking import OuterLoopEscalation
 
 logger = logging.getLogger("agent-mesh")
 
@@ -50,6 +56,7 @@ class ProjectLoop:
         self.spec_path = spec_path
         self.verifier = Verifier(repo_dir, config)
         self.gap_analyzer = GapAnalyzer(config)
+        self.escalation = OuterLoopEscalation(config)
         self.cycle_history: list[dict] = []
 
     async def verify(self, cycle: int = 1) -> VerifyReport:
@@ -290,11 +297,16 @@ class ProjectLoop:
                 report, plan = await self.verify_and_plan(cycle)
 
             # Record cycle
+            gap_count = len([
+                i for i in report.issues if i.category == "spec_gap"
+            ]) if not report.passed else 0
+
             self.cycle_history.append({
                 "cycle": cycle,
                 "report": report,
                 "plan": plan,
                 "issues": len(report.issues),
+                "gap_count": gap_count,
                 "passed": report.passed,
             })
 
@@ -307,10 +319,39 @@ class ProjectLoop:
                 self._print_convergence_summary()
                 return True
 
+            # ── EVALUATE: Model ranking escalation ──
+            decision = self.escalation.record_cycle(gap_count)
+
+            if decision.give_up:
+                total_time = time.time() - t0
+                logger.warning(
+                    f"[ProjectLoop] ⛔ Escalation exhausted: {decision.reason}. "
+                    f"Stopping after {cycle} cycles ({total_time:.0f}s)"
+                )
+                self._print_convergence_summary()
+                return False
+
+            if decision.escalate:
+                # Apply new min tier to config for next cycle's dispatcher
+                self.config.setdefault("routing", {})["outer_loop_min_tier"] = decision.min_tier
+                logger.info(
+                    f"[ProjectLoop] ⬆️ Escalating: {decision.reason}"
+                )
+
+            if decision.extend_timeout:
+                self.config.setdefault("routing", {})["outer_loop_timeout_multiplier"] = (
+                    decision.timeout_multiplier
+                )
+                logger.info(
+                    f"[ProjectLoop] ⏱️ Extending timeout: ×{decision.timeout_multiplier:.1f}"
+                )
+
             # Show convergence progress
+            esc_status = self.escalation.get_status()
             logger.info(
-                f"[ProjectLoop] Cycle {cycle}: {len(report.issues)} issues remaining, "
-                f"{len(plan['tasks']) if plan else 0} fix tasks generated"
+                f"[ProjectLoop] Cycle {cycle}: {gap_count} gaps remaining, "
+                f"{len(plan['tasks']) if plan else 0} fix tasks, "
+                f"tier: {esc_status['tier_name']}"
             )
 
         # Max cycles reached
@@ -327,5 +368,13 @@ class ProjectLoop:
         """Print convergence progress across all cycles."""
         logger.info("\n📊 Convergence History:")
         for entry in self.cycle_history:
-            status = "✅" if entry["passed"] else f"❌ {entry['issues']} issues"
+            gaps = entry.get("gap_count", entry["issues"])
+            status = "✅" if entry["passed"] else f"❌ {gaps} gaps"
             logger.info(f"  Cycle {entry['cycle']}: {status}")
+
+        esc = self.escalation.get_status()
+        if esc["gap_history"]:
+            logger.info(
+                f"\n📈 Gap trend: {' → '.join(str(g) for g in esc['gap_history'])}"
+            )
+            logger.info(f"🏆 Final tier: {esc['tier_name']} (tier {esc['current_min_tier']})")
