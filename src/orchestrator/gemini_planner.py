@@ -660,7 +660,7 @@ Output ONLY valid JSON. No explanation, no markdown code blocks.
         return plan
 
     def _parse_json(self, raw_output: str):
-        """Generic JSON parser — strips markdown code blocks."""
+        """Generic JSON parser — strips markdown code blocks and leading text."""
         text = raw_output.strip()
 
         # Remove markdown code block
@@ -675,8 +675,69 @@ Output ONLY valid JSON. No explanation, no markdown code blocks.
 
         try:
             return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # LLM sometimes prepends explanation text before JSON.
+        # Extract the outermost { ... } or [ ... ] block.
+        first_brace = text.find("{")
+        first_bracket = text.find("[")
+        if first_brace == -1 and first_bracket == -1:
+            logger.error(
+                f"[GeminiPlanner] No JSON object/array found in output\n"
+                f"Raw: {text[:500]}"
+            )
+            raise PlannerError("No JSON found in LLM output")
+
+        # Pick whichever comes first
+        if first_bracket == -1 or (first_brace != -1 and first_brace < first_bracket):
+            start_char, end_char = "{", "}"
+            start_idx = first_brace
+        else:
+            start_char, end_char = "[", "]"
+            start_idx = first_bracket
+
+        # Find matching closing bracket by counting depth
+        depth = 0
+        end_idx = -1
+        in_string = False
+        escape_next = False
+        for i in range(start_idx, len(text)):
+            ch = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    end_idx = i
+                    break
+
+        if end_idx == -1:
+            logger.error(
+                f"[GeminiPlanner] Unbalanced JSON in output\n"
+                f"Raw: {text[:500]}"
+            )
+            raise PlannerError("Unbalanced JSON in LLM output")
+
+        extracted = text[start_idx:end_idx + 1]
+        try:
+            return json.loads(extracted)
         except json.JSONDecodeError as e:
-            logger.error(f"[GeminiPlanner] JSON parse failed: {e}\nRaw: {text[:500]}")
+            logger.error(
+                f"[GeminiPlanner] JSON parse failed after extraction: {e}\n"
+                f"Raw: {extracted[:500]}"
+            )
             raise PlannerError(f"Failed to parse JSON: {e}")
 
     @staticmethod
