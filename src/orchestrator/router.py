@@ -69,6 +69,22 @@ def _model_to_agent_type(model: str) -> AgentType:
     return AgentType.CLAUDE_CODE
 
 
+# ── Complexity floor: foundational tasks get bumped to at least M ──
+# keyword (lowercased) → minimum complexity
+_COMPLEXITY_ORDER = {"L": 0, "S": 1, "M": 2, "H": 3}
+
+DEFAULT_COMPLEXITY_FLOOR: dict[str, str] = {
+    "schema": "M",
+    "prisma": "M",
+    "domain entit": "M",
+    "migration": "M",
+    "auth": "M",
+    "hmac": "M",
+    "security": "M",
+    "payment": "H",
+}
+
+
 class ModelRouter:
 
     def __init__(self, config: dict):
@@ -82,10 +98,36 @@ class ModelRouter:
             entry = raw_matrix.get(level, {})
             self.matrix[level] = entry.get("chain", DEFAULT_MATRIX[level])
 
+        # Complexity floor from config, merged with defaults
+        self.complexity_floor: dict[str, str] = {**DEFAULT_COMPLEXITY_FLOOR}
+        self.complexity_floor.update(routing_cfg.get("complexity_floor", {}))
+
         # Keep opus model ref for review
         agents_cfg = config.get("agents", {})
         claude_cfg = agents_cfg.get("claude_code", {})
         self.model_opus = claude_cfg.get("model_opus", "claude-opus-4-6")
+
+    def apply_complexity_floor(self, task: Task) -> str:
+        """Bump task complexity if title/module matches foundational keywords."""
+        original = getattr(task, "complexity", "M")
+        title_lower = (task.title or "").lower()
+        module_lower = (task.module or "").lower()
+        text = title_lower + " " + module_lower
+
+        floor = original
+        for keyword, min_level in self.complexity_floor.items():
+            if keyword in text:
+                if _COMPLEXITY_ORDER.get(min_level, 0) > _COMPLEXITY_ORDER.get(floor, 0):
+                    floor = min_level
+
+        if floor != original:
+            logger.info(
+                f"[Router] Complexity floor: '{task.title}' {original} → {floor} "
+                f"(foundational task)"
+            )
+            task.complexity = floor
+
+        return floor
 
     def get_model_for_attempt(
         self, complexity: str, attempt: int, *, log: bool = True,

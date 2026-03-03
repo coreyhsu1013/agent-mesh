@@ -78,6 +78,10 @@ class Dispatcher:
             logger.info("[Dispatcher] No tasks to execute")
             return
 
+        # Apply complexity floor for foundational tasks
+        for t in tasks:
+            self.router.apply_complexity_floor(t)
+
         self._print_routing_preview(tasks)
 
         # Build completed/failed sets
