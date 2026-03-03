@@ -191,6 +191,11 @@ class ReactLoop:
             )
             act_duration = time.time() - act_start
 
+            if not run_result.success and run_result.error:
+                logger.warning(
+                    f"[ReAct] Runner error for '{task.title}': {run_result.error}"
+                )
+
             # ── OBSERVE ──
             observation = await self._observe(workspace_dir, run_result)
             observation.duration_sec = act_duration
