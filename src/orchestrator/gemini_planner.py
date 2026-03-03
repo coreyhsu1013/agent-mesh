@@ -448,7 +448,15 @@ class GeminiPlanner:
    - "backend": API endpoints, database, service logic, auth, payment, middleware, data models, migrations, seed data
    - "frontend": UI components, pages, layouts, CSS/styling, animations, UX flows, client-side state
    - "fullstack": Cross-cutting tasks that span both frontend and backend (e.g. form + API + DB)
-3. Assign complexity (L/M/H) and identify dependencies
+3. Assign complexity (L/S/M/H) and identify dependencies
+
+## Complexity Guidelines:
+- **L** (Lite): Pure scaffolding, config files, boilerplate — does NOT import types/services/schemas produced by other tasks
+- **S** (Simple): Simple logic but DOES import types/services/schemas from other tasks (e.g. CRUD using shared types, simple API route using a service)
+- **M** (Medium): Requires reasoning — auth logic, business rules, middleware, validation, tests with edge cases
+- **H** (Hard): Architecture decisions, security, payment, cross-module integration, complex state machines
+
+Key distinction between L and S: if the task needs `import {{ SomeType }} from './other-task-output'`, it's at least S, not L.
 
 ## Output Format (JSON only, no markdown):
 
@@ -472,7 +480,7 @@ class GeminiPlanner:
       "title": "Short descriptive title",
       "description": "Brief description (1-2 sentences) of what this task does",
       "category": "backend|frontend|fullstack",
-      "complexity": "L|M|H",
+      "complexity": "L|S|M|H",
       "module": "module_name",
       "dependencies": ["other-task-id"],
       "priority": 1
@@ -592,7 +600,7 @@ Read the following project specification and produce a detailed execution plan a
       "title": "Short descriptive title",
       "description": "Full instructions for the agent. Be specific about what files to create/modify, what functions to implement, what patterns to follow.",
       "agent_type": "",
-      "complexity": "L|M|H",
+      "complexity": "L|S|M|H",
       "category": "backend|frontend|fullstack",
       "module": "foundation",
       "target_files": ["path/to/file.ts"],
@@ -604,9 +612,10 @@ Read the following project specification and produce a detailed execution plan a
 }}
 
 ## Complexity Guidelines:
-- **L** (Low): CRUD, boilerplate, documentation, CSS, i18n, seed data, simple tests
-- **M** (Medium): API endpoints, service logic, components with state, database queries
-- **H** (High): Architecture decisions, security/auth, payment, complex integrations, DB migrations, abstract patterns
+- **L** (Lite): Pure scaffolding, config, boilerplate — does NOT import types/services from other tasks
+- **S** (Simple): Simple logic but imports types/services/schemas from other tasks
+- **M** (Medium): Auth logic, business rules, middleware, validation, tests with edge cases
+- **H** (Hard): Architecture decisions, security/auth, payment, cross-module integration
 
 ## Category Guidelines:
 - **backend**: API, database, service logic, auth, payment, middleware
@@ -625,7 +634,7 @@ Read the following project specification and produce a detailed execution plan a
 4. Dependencies must form a valid DAG (no cycles)
 5. Target files should be specific (not entire directories)
 6. For projects with >15 tasks, split into modules with interface layers
-7. Always assign complexity (L/M/H) and category (backend/frontend/fullstack)
+7. Always assign complexity (L/S/M/H) and category (backend/frontend/fullstack)
 
 Output ONLY valid JSON. No explanation, no markdown code blocks.
 """

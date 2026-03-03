@@ -6,30 +6,35 @@ version: "0.7.1"
 # ── Planner ──
 planner:
   provider: "gemini"
-  classify: "gemini-3-flash-preview"     # intent + complexity classification
-  backend: "deepseek/deepseek-reasoner"  # backend-heavy planning
-  frontend: "xai/grok-3-fast"            # frontend / UI planning
-  fallback: "claude-sonnet-4-6"          # when all else fails
+  classify: "gemini-3-flash-preview"   # Phase 1: task classification
+  backend: "gemini-3-flash-preview"    # Phase 2: backend planning
+  frontend: "claude-opus-4-6"          # Phase 2: frontend/UI planning
+  fallback: "claude-opus-4-6"          # when all else fails
   timeout: 300
 
 # ── Routing Matrix (escalation chains per complexity, smoke-tested) ──
 routing:
   matrix:
-    L:   # Low: CRUD, boilerplate, docs, CSS, tests
+    L:   # Lite: scaffolding, config, boilerplate — no cross-task imports
       chain:
         - "xai/grok-4-fast-non-reasoning"
         - "xai/grok-4-1-fast-non-reasoning"
-        - "deepseek/deepseek-reasoner"
         - "xai/grok-code-fast-1"
         - "claude-sonnet-4-6"
-    M:   # Medium: API endpoints, services, stateful components
+    S:   # Simple: simple logic, imports types/services/schemas from other tasks
+      chain:
+        - "xai/grok-code-fast-1"
+        - "xai/grok-4-1-fast-non-reasoning"
+        - "deepseek/deepseek-reasoner"
+        - "claude-sonnet-4-6"
+    M:   # Medium: auth logic, business rules, middleware, tests
       chain:
         - "xai/grok-4-fast-reasoning"
         - "xai/grok-code-fast-1"
         - "deepseek/deepseek-reasoner"
         - "claude-sonnet-4-6"
         - "claude-opus-4-6"
-    H:   # High: architecture, auth, payment, security
+    H:   # Hard: architecture, security, payment, cross-module integration
       chain:
         - "xai/grok-4-1-fast-reasoning"
         - "claude-sonnet-4-6"

@@ -50,7 +50,7 @@ class Task:
     title: str = ""
     description: str = ""
     agent_type: str = ""               # 空 = 自動路由
-    complexity: str = "M"              # L | M | H
+    complexity: str = "M"              # L | S | M | H
     category: str = ""                 # backend | frontend | fullstack (optional, from planner)
     module: str = "core"
     target_files: list[str] = field(default_factory=list)

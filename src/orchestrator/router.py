@@ -2,7 +2,7 @@
 Agent Mesh v0.7.1 — Model Router (Matrix-based)
 
 從 config.yaml routing.matrix 讀取 escalation chain。
-每個 complexity (L/M/H) 有自己的 model chain。
+每個 complexity (L/S/M/H) 有自己的 model chain。
 attempt 1 → chain[0], attempt 2 → chain[1], ...
 最後一級 retry: timeout_multiplier = 2.0
 """
@@ -35,8 +35,13 @@ DEFAULT_MATRIX: dict[str, list[str]] = {
     "L": [
         "xai/grok-4-fast-non-reasoning",
         "xai/grok-4-1-fast-non-reasoning",
-        "deepseek/deepseek-reasoner",
         "xai/grok-code-fast-1",
+        "claude-sonnet-4-6",
+    ],
+    "S": [
+        "xai/grok-code-fast-1",
+        "xai/grok-4-1-fast-non-reasoning",
+        "deepseek/deepseek-reasoner",
         "claude-sonnet-4-6",
     ],
     "M": [
@@ -73,7 +78,7 @@ class ModelRouter:
 
         # Build matrix from config, fallback to defaults
         self.matrix: dict[str, list[str]] = {}
-        for level in ("L", "M", "H"):
+        for level in ("L", "S", "M", "H"):
             entry = raw_matrix.get(level, {})
             self.matrix[level] = entry.get("chain", DEFAULT_MATRIX[level])
 
