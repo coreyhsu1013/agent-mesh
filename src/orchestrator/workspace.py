@@ -5,11 +5,15 @@ v0.7 核心改變：
   Wave 執行期間 main 不動，所有 slot 互不影響。
   Wave 結束後統一依序 merge，衝突幾乎歸零。
 
+v0.7.2 改進：
+  slot 數量上限 = max_parallel，超額 task 由 worker 依序執行並回收 slot。
+  記憶體用量永遠 <= max_parallel × 300MB。
+
 Flow:
-  Wave Start:  create N slots (one per task) from main
-  Wave Run:    semaphore 控制並行數，完成的 slot 原地等
-  Wave End:    依序 merge slot → main，每個 merge 後可驗證
-  Next Wave:   cleanup 舊 slots，從更新後的 main 建新 slots
+  Wave Start:  create min(task_count, max_parallel) worker slots from main
+  Wave Run:    worker 完成一個 task 後 commit + 回收 slot，填入下一個 task
+  Wave End:    依序 merge task branches → main
+  Next Wave:   cleanup slots + task branches，從更新後的 main 建新 slots
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ WORKSPACE_DIR = ".agent-mesh/workspaces"
 class WorkspacePool:
     """
     Wave-based git worktree pool.
-    每個 Wave 的每個 task 拿到自己的 slot，Wave 結束統一 merge。
+    每個 Wave 建立固定數量 worker slots，task 依序填入；Wave 結束統一 merge。
     """
 
     def __init__(self, repo_dir: str, config: dict):
@@ -35,12 +39,14 @@ class WorkspacePool:
         self.workspace_base = os.path.join(self.repo_dir, WORKSPACE_DIR)
         os.makedirs(self.workspace_base, exist_ok=True)
         self._active_slots: dict[int, str] = {}   # slot_id → ws_dir
+        self._task_branches: list[str] = []        # task branch names for cleanup
 
     # ── Wave Lifecycle ──
 
-    async def setup_wave(self, task_count: int) -> dict[int, str]:
+    async def setup_wave(self, slot_count: int) -> dict[int, str]:
         """
-        Wave 開始：建立 N 個 slot，每個 task 一個。
+        Wave 開始：建立 slot_count 個 worker slots。
+        slot_count 應為 min(task_count, max_parallel)。
         Returns: {slot_id: workspace_dir}
         """
         # Clean up previous wave's slots
@@ -49,39 +55,91 @@ class WorkspacePool:
         await self._ensure_base_branch()
 
         self._active_slots = {}
-        for i in range(task_count):
+        self._task_branches = []
+        for i in range(slot_count):
             ws_dir = await self._create_slot(i)
             self._active_slots[i] = ws_dir
 
-        logger.info(f"[WorkspacePool] Wave setup: {task_count} slots ready")
+        logger.info(f"[WorkspacePool] Wave setup: {slot_count} slots ready")
         return dict(self._active_slots)
 
-    async def merge_wave(self, completed_slots: list[int], task_labels: dict[int, str] | None = None) -> dict[int, bool]:
+    async def prepare_slot_for_task(self, slot_id: int, task_idx: int) -> str:
         """
-        Wave 結束：依序 merge 所有完成的 slot → main。
-        
+        Switch a worker slot to a fresh branch for a new task.
+        Returns the workspace directory.
+        """
+        ws_dir = self._active_slots[slot_id]
+        branch_name = f"agent-mesh/task_{task_idx}"
+
+        # Ensure clean state (discard any leftover uncommitted changes)
+        try:
+            await self._run_git("reset --hard", cwd=ws_dir)
+        except Exception:
+            pass
+
+        # Delete branch if left over from previous run
+        try:
+            await self._run_git(f"branch -D {branch_name}")
+        except Exception:
+            pass
+
+        # Create fresh branch from main and checkout
+        await self._run_git(f"checkout -b {branch_name} main", cwd=ws_dir)
+        self._task_branches.append(branch_name)
+
+        # Remove untracked files from previous task
+        await self._run_git("clean -fd", cwd=ws_dir)
+
+        # Clear any index.lock
+        lock_file = os.path.join(ws_dir, ".git", "index.lock")
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+
+        return ws_dir
+
+    async def commit_slot_task(self, slot_id: int, commit_msg: str):
+        """Commit all changes in a worker slot (call before recycling)."""
+        ws_dir = self._active_slots[slot_id]
+        await self._run_git("add -A", cwd=ws_dir)
+        try:
+            await self._run_git(
+                f'commit --allow-empty -m "{commit_msg}"',
+                cwd=ws_dir,
+            )
+        except Exception:
+            pass
+
+    async def merge_wave(
+        self,
+        completed_task_indices: list[int],
+        task_labels: dict[int, str] | None = None,
+    ) -> dict[int, bool]:
+        """
+        Wave 結束：依序 merge 所有完成的 task branches → main。
+
         Args:
-            completed_slots: list of slot_ids that completed successfully
-            task_labels: optional {slot_id: task_title} for commit messages
-            
-        Returns: {slot_id: merge_success}
+            completed_task_indices: task indices that completed successfully
+            task_labels: optional {task_idx: label} for commit messages
+
+        Returns: {task_idx: merge_success}
         """
         results = {}
         task_labels = task_labels or {}
 
         logger.info(f"\n{'─'*40}")
-        logger.info(f"  🔀 Merge Phase: {len(completed_slots)} slots → main")
+        logger.info(f"  🔀 Merge Phase: {len(completed_task_indices)} tasks → main")
         logger.info(f"{'─'*40}")
 
-        for slot_id in completed_slots:
-            label = task_labels.get(slot_id, f"slot_{slot_id}")
+        for idx in completed_task_indices:
+            branch_name = f"agent-mesh/task_{idx}"
+            label = task_labels.get(idx, f"task_{idx}")
             commit_msg = f"[agent-mesh] {label}"
 
-            success = await self._merge_slot(slot_id, commit_msg)
-            results[slot_id] = success
+            success = await self._merge_branch(branch_name, commit_msg)
+            results[idx] = success
 
             status = "✅" if success else "❌"
-            logger.info(f"  {status} slot_{slot_id}: {label}")
+            logger.info(f"  {status} task_{idx}: {label}")
 
         # Post-merge: scan for conflict markers
         conflicts = await self._scan_conflict_markers()
@@ -98,9 +156,24 @@ class WorkspacePool:
         return results
 
     async def cleanup_wave(self):
-        """Wave 結束後清理所有 slots。"""
+        """Wave 結束後清理所有 worker slots 和 task branches。"""
         await self._cleanup_all_slots()
+
+        # Clean up task branches
+        for branch_name in self._task_branches:
+            try:
+                await self._run_git(f"branch -D {branch_name}")
+            except Exception:
+                pass
+
         self._active_slots = {}
+        self._task_branches = []
+
+        try:
+            await self._run_git("worktree prune")
+        except Exception:
+            pass
+
         logger.debug("[WorkspacePool] Wave cleanup done")
 
     def get_slot_dir(self, slot_id: int) -> str:
@@ -109,23 +182,14 @@ class WorkspacePool:
 
     # ── Merge Logic ──
 
-    async def _merge_slot(self, slot_id: int, commit_msg: str) -> bool:
+    async def _merge_branch(self, branch_name: str, commit_msg: str) -> bool:
         """
-        把單個 slot merge 回 main。
-        Strategy: commit in slot → merge to main (try clean, fallback -X theirs)
+        把 task branch merge 回 main。
+        Changes are already committed on the branch (by commit_slot_task).
+        Strategy: try clean merge, fallback -X theirs.
         """
-        ws_dir = os.path.join(self.workspace_base, f"slot_{slot_id}")
-        branch_name = f"agent-mesh/slot_{slot_id}"
-
         try:
-            # 1) Commit in slot
-            await self._run_git("add -A", cwd=ws_dir)
-            await self._run_git(
-                f'commit --allow-empty -m "{commit_msg}"',
-                cwd=ws_dir
-            )
-
-            # 2) Commit any pending changes on main
+            # 1) Commit any pending changes on main
             try:
                 await self._run_git("add -A", cwd=self.repo_dir)
                 await self._run_git(
@@ -135,7 +199,7 @@ class WorkspacePool:
             except Exception:
                 pass
 
-            # 3) Try clean merge first
+            # 2) Try clean merge first
             try:
                 await self._run_git(
                     f'merge {branch_name} --no-ff -m "Merge {commit_msg}"',
@@ -145,7 +209,7 @@ class WorkspacePool:
             except Exception:
                 pass
 
-            # 4) Clean merge failed — abort and use -X theirs
+            # 3) Clean merge failed — abort and use -X theirs
             try:
                 await self._run_git("merge --abort", cwd=self.repo_dir)
             except Exception:
@@ -161,7 +225,7 @@ class WorkspacePool:
             return True
 
         except Exception as e:
-            logger.error(f"[WorkspacePool] Merge slot_{slot_id} failed: {e}")
+            logger.error(f"[WorkspacePool] Merge {branch_name} failed: {e}")
             # Make sure main is clean for next merge
             try:
                 await self._run_git("merge --abort", cwd=self.repo_dir)

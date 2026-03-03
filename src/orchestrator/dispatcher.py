@@ -3,7 +3,8 @@ Agent Mesh v0.7 — Dispatcher (Wave-based)
 
 v0.7 改進：
 - Wave-based merge: 執行期間 main 不動，Wave 結束統一 merge
-- 每個 task 一個 slot（不回收），Wave 結束才 merge + cleanup
+- Worker pool: slot 數量上限 = max_parallel，完成即回收填入下一個 task
+- 記憶體用量永遠 <= max_parallel × 300MB
 - merge 順序可控，衝突大幅減少
 """
 
@@ -133,53 +134,86 @@ class Dispatcher:
                     completed_ids.add(t.id)
                 continue
 
+            # ═══════════════════════════════════════════
+            # ★ Phase 1: Setup worker slots (capped at max_parallel)
+            # ═══════════════════════════════════════════
+            n_workers = min(len(ready), self.max_parallel)
             logger.info(
                 f"\n{'='*60}\n"
-                f"  Wave {wave_num}: {len(ready)} tasks\n"
+                f"  Wave {wave_num}: {len(ready)} tasks ({n_workers} slots)\n"
                 f"{'='*60}"
             )
 
-            # ═══════════════════════════════════════════
-            # ★ Phase 1: Setup wave slots (one per task)
-            # ═══════════════════════════════════════════
-            slot_map = await self.pool.setup_wave(len(ready))
-            # Assign slot_id to each task
-            task_slot: dict[str, int] = {}  # task.id → slot_id
-            for idx, task in enumerate(ready):
-                task_slot[task.id] = idx
+            await self.pool.setup_wave(n_workers)
 
             # ═══════════════════════════════════════════
-            # ★ Phase 2: Execute all tasks (semaphore limits parallelism)
+            # ★ Phase 2: Worker pool — slot recycling
+            #   Workers pick tasks from queue; each finishes a task,
+            #   commits, then picks the next. At most max_parallel
+            #   worktrees exist at any time.
             # ═══════════════════════════════════════════
-            results = await asyncio.gather(
-                *[
-                    self._execute_task_in_slot(
-                        task=t,
-                        slot_id=task_slot[t.id],
-                        workspace_dir=slot_map[task_slot[t.id]],
-                    )
-                    for t in ready
-                ],
-                return_exceptions=True,
+            task_queue: asyncio.Queue[tuple[int, Task]] = asyncio.Queue()
+            for idx, task in enumerate(ready):
+                task_queue.put_nowait((idx, task))
+
+            results_lock = asyncio.Lock()
+            task_results: dict[int, tuple[Task, object]] = {}
+
+            async def _worker(slot_id: int):
+                while True:
+                    try:
+                        task_idx, task = task_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    result = None
+                    try:
+                        ws_dir = await self.pool.prepare_slot_for_task(
+                            slot_id, task_idx
+                        )
+                        result = await self._execute_task_in_slot(
+                            task=task,
+                            slot_id=slot_id,
+                            workspace_dir=ws_dir,
+                        )
+                    except Exception as exc:
+                        result = exc
+
+                    # Always commit to keep slot clean for recycling
+                    try:
+                        await self.pool.commit_slot_task(
+                            slot_id, f"[agent-mesh] {task.title}"
+                        )
+                    except Exception:
+                        pass
+
+                    async with results_lock:
+                        task_results[task_idx] = (task, result)
+
+            await asyncio.gather(
+                *[_worker(i) for i in range(n_workers)]
             )
 
-            # Collect results
-            completed_slots = []     # slot_ids that succeeded
-            task_labels = {}         # slot_id → task title (for commit msgs)
-            wave_results = {}        # task.id → TaskResult
+            # ── Collect results ──
+            completed_indices: list[int] = []
+            task_labels: dict[int, str] = {}
+            wave_results: dict[str, TaskResult] = {}
 
-            for task, result in zip(ready, results):
-                sid = task_slot[task.id]
+            for task_idx, (task, result) in task_results.items():
                 if isinstance(result, Exception):
-                    logger.error(f"[Dispatcher] '{task.title}' exception: {result}")
+                    logger.error(
+                        f"[Dispatcher] '{task.title}' exception: {result}"
+                    )
                     task.status = TaskStatus.FAILED.value
                     task.error = str(result)
                     self.store.update_task(task)
                     failed_ids.add(task.id)
                 elif result and result.status == "completed":
-                    completed_slots.append(sid)
-                    model_short = (result.final_model or "unknown").split("/")[-1]
-                    task_labels[sid] = f"{model_short}: {task.title}"
+                    completed_indices.append(task_idx)
+                    model_short = (
+                        result.final_model or "unknown"
+                    ).split("/")[-1]
+                    task_labels[task_idx] = f"{model_short}: {task.title}"
                     wave_results[task.id] = result
                 else:
                     task.status = TaskStatus.FAILED.value
@@ -192,35 +226,40 @@ class Dispatcher:
                     )
 
             # ═══════════════════════════════════════════
-            # ★ Phase 3: Merge all completed slots → main
+            # ★ Phase 3: Merge all completed task branches → main
             # ═══════════════════════════════════════════
-            if completed_slots:
-                merge_results = await self.pool.merge_wave(completed_slots, task_labels)
+            if completed_indices:
+                merge_results = await self.pool.merge_wave(
+                    completed_indices, task_labels
+                )
 
-                # Update task status based on merge result
-                for task in ready:
-                    sid = task_slot[task.id]
-                    result = wave_results.get(task.id)
-                    if result and result.status == "completed":
-                        if merge_results.get(sid, False):
-                            task.status = TaskStatus.COMPLETED.value
-                            task.diff = result.final_diff[:5000]
-                            completed_ids.add(task.id)
-                            dur = task.duration_sec
-                            model = result.final_model or "unknown"
-                            logger.info(
-                                f"[Dispatcher] ✅ '{task.title}' "
-                                f"({model.split('/')[-1]}, {result.attempts} att, {dur:.0f}s)"
-                            )
-                        else:
-                            task.status = TaskStatus.FAILED.value
-                            task.error = "Merge failed"
-                            failed_ids.add(task.id)
-                            logger.warning(f"[Dispatcher] ❌ '{task.title}' merge failed")
-                        self.store.update_task(task)
+                for task_idx in completed_indices:
+                    task, _ = task_results[task_idx]
+                    tr = wave_results.get(task.id)
+                    if merge_results.get(task_idx, False):
+                        task.status = TaskStatus.COMPLETED.value
+                        task.diff = tr.final_diff[:5000] if tr else ""
+                        completed_ids.add(task.id)
+                        dur = task.duration_sec
+                        model = (
+                            tr.final_model or "unknown"
+                        ) if tr else "unknown"
+                        logger.info(
+                            f"[Dispatcher] ✅ '{task.title}' "
+                            f"({model.split('/')[-1]}, "
+                            f"{tr.attempts if tr else 0} att, {dur:.0f}s)"
+                        )
+                    else:
+                        task.status = TaskStatus.FAILED.value
+                        task.error = "Merge failed"
+                        failed_ids.add(task.id)
+                        logger.warning(
+                            f"[Dispatcher] ❌ '{task.title}' merge failed"
+                        )
+                    self.store.update_task(task)
 
             # ═══════════════════════════════════════════
-            # ★ Phase 4: Cleanup wave slots
+            # ★ Phase 4: Cleanup worker slots + task branches
             # ═══════════════════════════════════════════
             await self.pool.cleanup_wave()
 
