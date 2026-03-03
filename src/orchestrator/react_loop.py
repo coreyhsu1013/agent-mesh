@@ -147,6 +147,7 @@ class ReactLoop:
         router: Any,         # ModelRouter
         workspace_dir: str,
         shared_context: str = "",
+        start_attempt: int = 1,
     ) -> TaskResult:
         from ..models.task import AgentType
 
@@ -155,7 +156,7 @@ class ReactLoop:
         complexity = getattr(task, "complexity", "M")
         max_attempts = router.get_max_attempts(complexity)
 
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(start_attempt, max_attempts + 1):
             # ★ Query routing matrix for this attempt
             decision = router.get_model_for_attempt(complexity, attempt)
             current_runner = runners.get(decision.agent_type)

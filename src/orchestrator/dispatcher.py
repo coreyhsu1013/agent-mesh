@@ -285,18 +285,19 @@ class Dispatcher:
         self.store.update_task(task)
         start_time = time.time()
 
-        # 1) Preview first model for logging + semaphore
+        # 1) Compute start_attempt (skip Grok for foundational/fix tasks)
         complexity = getattr(task, "complexity", "M")
-        first_decision = self.router.get_model_for_attempt(complexity, 1, log=False)
+        start_attempt = self.router.get_start_attempt(task)
+        first_decision = self.router.get_model_for_attempt(complexity, start_attempt, log=False)
         task.routed_by = "manual" if task.agent_type else "auto"
         task.agent_used = f"{first_decision.agent_type.value}:{first_decision.model_short}"
 
         semaphore = self._get_semaphore(first_decision.agent_type)
         max_att = self.router.get_max_attempts(complexity)
 
-        # Build chain preview for log
+        # Build chain preview for log (from start_attempt onward)
         chain_preview = []
-        for i in range(1, max_att + 1):
+        for i in range(start_attempt, max_att + 1):
             d = self.router.get_model_for_attempt(complexity, i, log=False)
             chain_preview.append(d.model_short)
         chain_str = " → ".join(chain_preview)
@@ -317,6 +318,7 @@ class Dispatcher:
                         router=self.router,
                         workspace_dir=workspace_dir,
                         shared_context=self.shared_context,
+                        start_attempt=start_attempt,
                     )
 
                     task.attempts = result.attempts

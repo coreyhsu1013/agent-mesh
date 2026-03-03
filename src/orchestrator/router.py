@@ -69,13 +69,12 @@ def _model_to_agent_type(model: str) -> AgentType:
     return AgentType.CLAUDE_CODE
 
 
-# ── Complexity floor: foundational tasks get bumped to at least M ──
-# keyword (lowercased) → minimum complexity
+# ── Complexity floor & force-sonnet rules ──
 _COMPLEXITY_ORDER = {"L": 0, "S": 1, "M": 2, "H": 3}
 
 DEFAULT_COMPLEXITY_FLOOR: dict[str, str] = {
-    "schema": "M",
-    "prisma": "M",
+    "schema": "H",
+    "prisma": "H",
     "domain entit": "M",
     "migration": "M",
     "auth": "M",
@@ -83,6 +82,12 @@ DEFAULT_COMPLEXITY_FLOOR: dict[str, str] = {
     "security": "M",
     "payment": "H",
 }
+
+# Tasks matching these keywords skip Grok/DeepSeek, start from Sonnet
+DEFAULT_FORCE_SONNET: list[str] = [
+    "schema", "prisma", "domain entit", "migration",
+    "auth", "hmac", "security", "payment",
+]
 
 
 class ModelRouter:
@@ -101,6 +106,11 @@ class ModelRouter:
         # Complexity floor from config, merged with defaults
         self.complexity_floor: dict[str, str] = {**DEFAULT_COMPLEXITY_FLOOR}
         self.complexity_floor.update(routing_cfg.get("complexity_floor", {}))
+
+        # Force-sonnet keywords: skip Grok/DeepSeek for these tasks
+        self.force_sonnet: list[str] = routing_cfg.get(
+            "force_sonnet", DEFAULT_FORCE_SONNET
+        )
 
         # Keep opus model ref for review
         agents_cfg = config.get("agents", {})
@@ -128,6 +138,46 @@ class ModelRouter:
             task.complexity = floor
 
         return floor
+
+    def get_start_attempt(self, task: Task) -> int:
+        """
+        Determine which attempt to start from.
+        Foundational tasks and fix tasks skip Grok/DeepSeek → start at first Claude model.
+        Returns 1-based attempt index.
+        """
+        title_lower = (task.title or "").lower()
+        module_lower = (task.module or "").lower()
+        task_id = (task.id or "").lower()
+        text = title_lower + " " + module_lower
+
+        should_force = False
+
+        # Rule 1: foundational task keywords → force Sonnet
+        for keyword in self.force_sonnet:
+            if keyword in text:
+                should_force = True
+                break
+
+        # Rule 2: fix tasks (cycle 2+) → force Sonnet
+        if task_id.startswith("fix-"):
+            should_force = True
+
+        if not should_force:
+            return 1
+
+        # Find first Claude model in the chain
+        complexity = getattr(task, "complexity", "M")
+        chain = self.matrix.get(complexity, self.matrix["M"])
+        for idx, model in enumerate(chain):
+            if model.startswith("claude-"):
+                start = idx + 1  # 1-based
+                logger.info(
+                    f"[Router] Force Sonnet: '{task.title}' → skip to attempt {start} "
+                    f"({model})"
+                )
+                return start
+
+        return 1
 
     def get_model_for_attempt(
         self, complexity: str, attempt: int, *, log: bool = True,
