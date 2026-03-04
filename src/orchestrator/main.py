@@ -24,9 +24,60 @@ import sys
 import uuid
 from pathlib import Path
 
+import signal
+
 import yaml
 
 logger = logging.getLogger("agent-mesh")
+
+
+# ── PID Lock (prevent concurrent orchestrator on same repo) ──
+
+def _lock_path(repo_dir: str) -> str:
+    return os.path.join(repo_dir, ".agent-mesh", "orchestrator.lock")
+
+
+def acquire_lock(repo_dir: str) -> None:
+    """Acquire PID lock. Exits if another orchestrator is running on this repo."""
+    lock_file = _lock_path(repo_dir)
+    os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file) as f:
+                old_pid = int(f.read().strip())
+            # Check if PID is still alive
+            os.kill(old_pid, 0)
+            # Still alive → refuse
+            logger.error(
+                f"🔒 Another orchestrator is running on this repo (PID {old_pid}).\n"
+                f"   Lock file: {lock_file}\n"
+                f"   If the process is dead, delete the lock file and retry."
+            )
+            sys.exit(1)
+        except (ValueError, ProcessLookupError, PermissionError):
+            # PID invalid or dead → stale lock, remove it
+            logger.warning(f"[Lock] Removing stale lock (old PID gone)")
+            os.unlink(lock_file)
+
+    # Write our PID
+    with open(lock_file, "w") as f:
+        f.write(str(os.getpid()))
+    logger.info(f"[Lock] Acquired (PID {os.getpid()})")
+
+
+def release_lock(repo_dir: str) -> None:
+    """Release PID lock."""
+    lock_file = _lock_path(repo_dir)
+    try:
+        if os.path.exists(lock_file):
+            with open(lock_file) as f:
+                pid = int(f.read().strip())
+            if pid == os.getpid():
+                os.unlink(lock_file)
+                logger.info("[Lock] Released")
+    except Exception:
+        pass
 
 DEFAULT_CONFIG = {
     "version": "0.7.0",
@@ -448,6 +499,26 @@ Examples:
     if args.no_review:
         config["no_review"] = True
 
+    # Acquire lock (prevent concurrent orchestrator on same repo)
+    acquire_lock(repo_dir)
+
+    # Ensure lock is released on exit (normal, exception, or signal)
+    def _cleanup(*_):
+        release_lock(repo_dir)
+
+    import atexit
+    atexit.register(_cleanup)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda s, f: (_cleanup(), sys.exit(128 + s)))
+
+    try:
+        _run_action(args, config, repo_dir)
+    finally:
+        release_lock(repo_dir)
+
+
+def _run_action(args, config: dict, repo_dir: str):
+    """Route to the appropriate action."""
     # Route to action
     if args.evolve:
         # v1.0: Spec evolution mode
