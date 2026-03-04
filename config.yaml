@@ -115,7 +115,7 @@ reviewer:
 
 # ── Dispatcher ──
 dispatcher:
-  max_parallel: 4
+  max_parallel: 7
   semaphore_claude: 2
   semaphore_deepseek: 3
   retry_delay: 30

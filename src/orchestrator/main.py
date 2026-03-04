@@ -223,7 +223,7 @@ async def run_verify(config: dict, repo_dir: str, spec_path: str | None = None,
 
 async def run_cycles(config: dict, repo_dir: str, spec_path: str,
                      initial_plan: str, max_cycles: int = 5,
-                     max_parallel: int = 3, no_review: bool = True):
+                     max_parallel: int = 7, no_review: bool = True):
     """Run project-level ReAct loop with auto cycles."""
     from ..context.store import ContextStore
     from ..models.task import TaskPlan
@@ -349,7 +349,7 @@ Examples:
             spec_path=os.path.abspath(args.spec),
             initial_plan=os.path.abspath(args.plan),
             max_cycles=args.cycles,
-            max_parallel=args.max_parallel or 3,
+            max_parallel=args.max_parallel or 7,
             no_review=args.no_review,
         ))
 
