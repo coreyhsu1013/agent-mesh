@@ -1,22 +1,17 @@
 """
-Agent Mesh v0.7.5 — Project-level ReAct Loop
+Agent Mesh v0.8 — Project-level ReAct Loop
 
 Outer loop that orchestrates the full cycle:
   Spec → Plan → Execute → Verify → Fix-Plan → Execute → Verify → ... → Done
 
-This wraps the existing dispatcher (inner loop) with a verification
-and fix-plan generation layer.
+Four-layer architecture:
+  Layer 1 (ReAct):     task → escalate → complete           ← 確保跑得完
+  Layer 2 (ProjectLoop): plan → execute → verify → fix      ← 確保跑得好
+  Layer 3 (SpecFeedback): stuck gaps → analyze → spec fix   ← 確保寫得對
+  Layer 4 (Integration): cross-module → contract check      ← 確保用得起來
 
 v0.7.5: Model ranking & outer-loop escalation
-  - Tracks gap count per cycle
-  - If gap reduction < threshold → escalate to higher model tier
-  - At top tier: extend timeout, retry N times before giving up
-
-Expected convergence:
-  Cycle 1: spec.md → 20 tasks (Grok) → execute → 8 gaps (60% done)
-  Cycle 2: fix-plan → 8 tasks (Grok) → execute → 3 gaps (85% done)
-  Cycle 3: fix-plan → 3 tasks (Sonnet↑) → execute → 1 gap  (95% done)
-  Cycle 4: fix-plan → 1 task (Opus↑)  → execute → 0 gaps  → Done ✅
+v0.8:   Layer 3 (spec feedback) + Layer 4 (integration validation)
 """
 from __future__ import annotations
 
@@ -101,9 +96,14 @@ class ProjectLoop:
 
     async def verify_closed_loop(self, cycle: int) -> tuple[VerifyReport, dict | None]:
         """
-        Two-phase closed-loop verification.
-        Phase 1: Regression check — are previous gaps fixed?
-        Phase 2: Bounded scan — any NEW critical gaps? (capped)
+        Multi-layer closed-loop verification.
+        Step 0: Mechanical checks (build, test, lint)
+        Step 1: Regression check — are previous gaps fixed?
+        Step 2: Bounded scan — any NEW critical gaps? (capped)
+        Step 2.5: Layer 3 — Spec feedback for stuck gaps
+        Step 3: Convergence check
+        Step 3.5: Layer 4 — Integration validation
+        Step 4: Generate fix-plan
         """
         verify_cfg = self.config.get("verify", {})
         exclude_modules = verify_cfg.get("exclude_modules", [])
@@ -148,6 +148,32 @@ class ProjectLoop:
         else:
             logger.info("[ClosedLoop] Skipping new gap scan — build failed")
 
+        # Step 2.5: Layer 3 — Spec feedback for stuck gaps
+        layer3_cfg = self.config.get("layer3", {})
+        if layer3_cfg.get("enabled", False) and remaining_gaps:
+            stuck_threshold = layer3_cfg.get("stuck_threshold", 2)
+            stuck_gaps = self._find_stuck_gaps(remaining_gaps, stuck_threshold)
+
+            if stuck_gaps:
+                logger.info(
+                    f"[Layer3] {len(stuck_gaps)} gaps stuck for >= {stuck_threshold} cycles, "
+                    f"analyzing root cause..."
+                )
+                feedback_issues = await self.verifier.run_spec_feedback(
+                    stuck_gaps, self.spec_path, code_tree
+                )
+                spec_questions = []
+                for issue in feedback_issues:
+                    if issue.category == "spec_question":
+                        spec_questions.append(issue)
+                        logger.warning(f"  ❓ SPEC QUESTION: {issue.message}")
+                    else:
+                        new_gap_issues.append(issue)
+
+                # Save spec questions to file for human review
+                if spec_questions:
+                    self._save_spec_questions(cycle, spec_questions)
+
         # Add remaining gaps back to report as VerifyIssues
         # Use module+message key to dedup against new_gap_issues
         seen_keys: set[str] = set()
@@ -184,11 +210,31 @@ class ProjectLoop:
         # Step 3: Convergence check
         total_gaps = all_gap_count
         if total_gaps <= convergence_threshold and report.build_ok:
-            logger.info(
-                f"✅ Converged: {total_gaps} gaps <= threshold {convergence_threshold}"
-            )
-            report.issues = []  # mark as passed
-            return report, None
+            # Step 3.5: Layer 4 — Integration validation (only when spec gaps converged)
+            layer4_cfg = self.config.get("layer4", {})
+            if (layer4_cfg.get("enabled", False)
+                    and cycle >= layer4_cfg.get("run_after_cycle", 2)):
+                logger.info("[Layer4] Spec gaps converged, running integration check...")
+                integration_issues = await self._run_layer4(layer4_cfg, code_tree)
+
+                if integration_issues:
+                    logger.info(
+                        f"[Layer4] {len(integration_issues)} integration issues — "
+                        f"not converged yet"
+                    )
+                    for issue in integration_issues:
+                        report.issues.append(issue)
+                    # Don't mark as passed — need integration fixes
+                else:
+                    logger.info("[Layer4] ✅ Integration check passed")
+                    report.issues = []  # mark as passed
+                    return report, None
+            else:
+                logger.info(
+                    f"✅ Converged: {total_gaps} gaps <= threshold {convergence_threshold}"
+                )
+                report.issues = []  # mark as passed
+                return report, None
 
         # Step 4: Generate fix-plan from ONLY remaining + new (not full rescan)
         if report.passed:
@@ -202,6 +248,86 @@ class ProjectLoop:
             f"[ClosedLoop] Fix-plan generated: {len(plan['tasks'])} tasks → {plan_path}"
         )
         return report, plan
+
+    def _find_stuck_gaps(self, remaining_gaps: list[dict], threshold: int) -> list[dict]:
+        """Find gaps that persisted for >= threshold consecutive cycles."""
+        if len(self.cycle_history) < threshold - 1:
+            return []  # not enough history yet
+
+        stuck = []
+        for gap in remaining_gaps:
+            gap_key = (
+                (gap.get("module") or "").lower() + "|"
+                + (gap.get("message") or "").lower()
+            )
+            appearances = 0
+            for entry in reversed(self.cycle_history):
+                report = entry.get("report")
+                if not report:
+                    break
+                found = any(
+                    (i.module or "").lower() + "|" + i.message.lower() == gap_key
+                    for i in report.issues if i.category == "spec_gap"
+                )
+                if found:
+                    appearances += 1
+                else:
+                    break
+            # +1 for current cycle (remaining_gaps = this cycle's regression result)
+            appearances += 1
+            if appearances >= threshold:
+                gap_copy = dict(gap)
+                gap_copy["stuck_cycles"] = appearances
+                stuck.append(gap_copy)
+        return stuck
+
+    def _save_spec_questions(self, cycle: int, questions: list[VerifyIssue]):
+        """Save spec questions to JSON for human review."""
+        questions_path = os.path.join(
+            self.repo_dir, f".agent-mesh/spec-questions-{cycle}.json"
+        )
+        os.makedirs(os.path.dirname(questions_path), exist_ok=True)
+        data = [
+            {
+                "module": q.module,
+                "message": q.message,
+                "severity": q.severity,
+                "found_by": q.found_by,
+            }
+            for q in questions
+        ]
+        with open(questions_path, 'w') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info(
+            f"[Layer3] Saved {len(questions)} spec questions → {questions_path}"
+        )
+
+    async def _run_layer4(
+        self, layer4_cfg: dict, code_tree: str
+    ) -> list[VerifyIssue]:
+        """Run Layer 4 integration checks."""
+        issues = []
+
+        # Mechanical typecheck (if configured)
+        typecheck_cmd = layer4_cfg.get("typecheck_cmd", "")
+        if typecheck_cmd:
+            typecheck_ok, errors = await self.verifier._run_cmd(typecheck_cmd)
+            if not typecheck_ok:
+                issues.append(VerifyIssue(
+                    category="integration",
+                    severity="HIGH",
+                    message=f"Typecheck failed: {'; '.join(errors[:5])}",
+                    found_by=["layer4"],
+                ))
+
+        # LLM contract check
+        if layer4_cfg.get("api_contract_check", True):
+            contract_issues = await self.verifier.run_integration_check(
+                self.spec_path, code_tree
+            )
+            issues.extend(contract_issues)
+
+        return issues
 
     def _load_prev_gaps(self, cycle: int) -> list[dict]:
         """Load spec_gap issues from the previous cycle's verify report."""

@@ -1,5 +1,5 @@
 """
-Agent Mesh v0.7 — Gap Analyzer
+Agent Mesh v0.8 — Gap Analyzer
 Converts a VerifyReport into a plan.json that can be directly
 executed by the dispatcher.
 
@@ -7,12 +7,13 @@ Flow:
   VerifyReport → group issues by module → split large groups
   → add dependencies (schema first) → output plan.json
 
-Key improvements over v1:
-  - Outputs TaskPlan-compatible format (not raw fix-plan)
-  - Splits large modules (>5 issues) into sub-tasks
-  - Adds proper dependencies (Prisma schema → API routes → tests)
-  - Includes target_files hints based on module structure
-  - Sets complexity based on issue severity
+Phases:
+  0: Mechanical fixes (conflicts, build, test)
+  1: Group spec gaps by module
+  2: Schema-first, then parallel logic tasks
+  3: Lint fixes
+  4: Spec feedback tasks (Layer 3 — spec corrections)
+  5: Integration fix tasks (Layer 4 — cross-module)
 """
 from __future__ import annotations
 
@@ -207,6 +208,50 @@ class GapAnalyzer:
                 module="infrastructure",
                 depends_on=[],
             ))
+
+        # ── Phase 4: Spec feedback tasks (Layer 3) ──
+        spec_feedback_issues = [i for i in report.issues if i.category == "spec_feedback"]
+        if spec_feedback_issues:
+            for idx, issue in enumerate(spec_feedback_issues):
+                task_counter += 1
+                tid = f"spec-fix-{report.cycle}-{task_counter}"
+                all_tasks.append(self._make_task(
+                    id=tid,
+                    title=f"Spec correction: {(issue.message[:60])}",
+                    description=(
+                        f"The spec analysis identified a spec quality issue:\n\n"
+                        f"{issue.message}\n\n"
+                        f"Implement the code change according to the suggested correction above. "
+                        f"The original spec may be ambiguous or contradictory in this area."
+                    ),
+                    complexity="M",
+                    module=issue.module or "spec",
+                    depends_on=all_schema_deps.copy(),
+                    acceptance_criteria="Code matches corrected spec interpretation; build passes",
+                ))
+
+        # ── Phase 5: Integration fix tasks (Layer 4) ──
+        integration_issues = [i for i in report.issues if i.category == "integration"]
+        if integration_issues:
+            # Integration tasks depend on ALL other fix tasks
+            all_prior_ids = [t["id"] for t in all_tasks]
+            for idx, issue in enumerate(integration_issues):
+                task_counter += 1
+                tid = f"integration-fix-{report.cycle}-{task_counter}"
+                all_tasks.append(self._make_task(
+                    id=tid,
+                    title=f"Integration: {(issue.message[:60])}",
+                    description=(
+                        f"Cross-module integration issue:\n\n"
+                        f"{issue.message}\n\n"
+                        f"Fix the integration issue between modules. "
+                        f"Ensure types, API contracts, and imports are consistent."
+                    ),
+                    complexity="H",  # cross-module always hard
+                    module=issue.module or "integration",
+                    depends_on=all_prior_ids.copy(),
+                    acceptance_criteria="Cross-module integration passes; build passes; no type errors",
+                ))
 
         plan = {
             "project_name": f"fix-cycle-{report.cycle}",

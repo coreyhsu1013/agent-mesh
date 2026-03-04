@@ -158,3 +158,21 @@ verify:
   convergence_threshold: 3               # remaining + new <= this → converged
   regression_model: "claude-sonnet-4-6"  # cheaper model for regression check
   scan_model: "claude-opus-4-6"          # stronger model for new gap scan
+
+# ── Layer 3: Spec Feedback (v0.8) ──
+# 偵測卡住的 gap → 分析根因（code bug / spec 模糊 / spec 矛盾）
+layer3:
+  enabled: true
+  stuck_threshold: 2           # gap 連續 N 個 cycle 沒修好 → 觸發 spec feedback
+  model: "claude-opus-4-6"     # 需要強推理分析 spec 品質
+  max_feedback_items: 3        # 每個 cycle 最多幾個 spec 修正建議
+  auto_fix_spec: false         # true = 自動改 spec.md；false = 輸出問題給人回答
+
+# ── Layer 4: Integration Validation (v0.8) ──
+# 跨模組整合驗證：type 匹配、API contract、import 正確性
+layer4:
+  enabled: false               # 預設關閉（需要專案配置 typecheck 指令）
+  typecheck_cmd: ""            # e.g. "npx tsc --noEmit"
+  api_contract_check: true     # LLM 檢查跨模組 API contract
+  model: "claude-sonnet-4-6"   # Sonnet 足夠做 contract checking
+  run_after_cycle: 2           # cycle N 之後才跑（等模組穩定）
