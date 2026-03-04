@@ -1,52 +1,68 @@
 """
-Agent Mesh v0.7.5 — Model Ranking & Outer-Loop Escalation
+Agent Mesh v0.7.6 — Model Ranking & Outer-Loop Escalation
 
-Monitors convergence across project-loop cycles and escalates
-the minimum model tier when gap reduction rate is too slow.
-
-Quality Tiers (low → high):
-  Tier 0: Budget   (Grok)        — default starting point
-  Tier 1: Standard (Sonnet)      — first escalation
-  Tier 2: Premium  (Opus)        — final escalation
+按個別模型排名（不是按公司），從最便宜到最強：
+  Rank 0: grok-4-fast-non-reasoning       （scaffolding）
+  Rank 1: grok-4-1-fast-non-reasoning
+  Rank 2: grok-code-fast-1                （code 專精）
+  Rank 3: grok-4-fast-reasoning           （有推理）
+  Rank 4: grok-4-1-fast-reasoning         （強推理）
+  Rank 5: deepseek-reasoner              （長思考）
+  Rank 6: claude-sonnet-4-6              （高品質）
+  Rank 7: claude-opus-4-6               （最強）
 
 Escalation rules:
-  - Below top tier: 1 failed cycle → escalate one tier up
-  - At top tier (#1): extend timeout, up to N retries before giving up
+  - Below top rank: 1 failed cycle → escalate rank_step ranks up
+  - At top rank: extend timeout, up to N retries before giving up
   - "Failed cycle" = gap reduction < threshold (default 15%)
 """
 
 from __future__ import annotations
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# ── Quality Tiers ──
-# Each tier defines model prefixes. A model belongs to the HIGHEST
-# tier whose prefix matches.
-
-DEFAULT_TIERS = [
-    {"name": "budget",   "prefixes": ["xai/"]},
-    {"name": "standard", "prefixes": ["deepseek/", "claude-sonnet"]},
-    {"name": "premium",  "prefixes": ["claude-opus"]},
+# ── Default Model Ranking (low → high quality) ──
+DEFAULT_RANKS: list[str] = [
+    "xai/grok-4-fast-non-reasoning",       # rank 0
+    "xai/grok-4-1-fast-non-reasoning",     # rank 1
+    "xai/grok-code-fast-1",                # rank 2
+    "xai/grok-4-fast-reasoning",           # rank 3
+    "xai/grok-4-1-fast-reasoning",         # rank 4
+    "deepseek/deepseek-reasoner",          # rank 5
+    "claude-sonnet-4-6",                   # rank 6
+    "claude-opus-4-6",                     # rank 7
 ]
 
 
-def get_model_tier(model: str, tiers: list[dict] | None = None) -> int:
-    """Return the tier index (0-based) for a given model string."""
-    tiers = tiers or DEFAULT_TIERS
-    for tier_idx in range(len(tiers) - 1, -1, -1):
-        for prefix in tiers[tier_idx]["prefixes"]:
-            if model.startswith(prefix):
-                return tier_idx
-    return 0  # unknown → budget
+def get_model_rank(model: str, ranks: list[str] | None = None) -> int:
+    """Return the rank (0-based) for a given model string.
+    Higher rank = stronger model. Unknown models → 0."""
+    ranks = ranks or DEFAULT_RANKS
+    try:
+        return ranks.index(model)
+    except ValueError:
+        # Partial match fallback
+        for idx, ranked_model in enumerate(ranks):
+            if model in ranked_model or ranked_model in model:
+                return idx
+        return 0
+
+
+def get_rank_label(rank: int, ranks: list[str] | None = None) -> str:
+    """Return short model name for a rank index."""
+    ranks = ranks or DEFAULT_RANKS
+    if 0 <= rank < len(ranks):
+        return ranks[rank].split("/")[-1]
+    return "unknown"
 
 
 @dataclass
 class EscalationDecision:
     """Result of evaluating a cycle's convergence."""
     escalate: bool = False
-    min_tier: int = 0
+    min_rank: int = 0
     extend_timeout: bool = False
     timeout_multiplier: float = 1.0
     give_up: bool = False
@@ -63,12 +79,10 @@ class OuterLoopEscalation:
         # After each verify cycle:
         decision = esc.record_cycle(gap_count)
         if decision.escalate:
-            # Apply min_tier to next cycle's routing
-            config["routing"]["outer_loop_min_tier"] = decision.min_tier
+            config["routing"]["outer_loop_min_rank"] = decision.min_rank
         if decision.extend_timeout:
             config["routing"]["outer_loop_timeout_multiplier"] = decision.timeout_multiplier
         if decision.give_up:
-            # Stop cycling
             break
     """
 
@@ -76,35 +90,34 @@ class OuterLoopEscalation:
         ranking_cfg = config.get("model_ranking", {})
         esc_cfg = ranking_cfg.get("escalation", {})
 
-        self.tiers = ranking_cfg.get("tiers", DEFAULT_TIERS)
-        self.max_tier = len(self.tiers) - 1
+        self.ranks: list[str] = ranking_cfg.get("ranks", DEFAULT_RANKS)
+        self.max_rank = len(self.ranks) - 1
 
         # Escalation thresholds
         self.gap_reduction_threshold = esc_cfg.get("gap_reduction_threshold", 0.15)
-        self.max_retries_at_top = esc_cfg.get("max_retries_at_top_tier", 3)
+        self.rank_step = esc_cfg.get("rank_step", 2)  # jump N ranks per escalation
+        self.max_retries_at_top = esc_cfg.get("max_retries_at_top", 3)
         self.timeout_extension = esc_cfg.get("timeout_extension", 1.5)
 
         # State
-        self.current_min_tier: int = 0
-        self.failures_at_top_tier: int = 0
+        self.current_min_rank: int = 0
+        self.failures_at_top: int = 0
         self.gap_history: list[int] = []
 
     def record_cycle(self, gap_count: int) -> EscalationDecision:
         """
         Record this cycle's gap count and return escalation decision.
-
-        Call this after each verify cycle with the total gap count.
-        Returns an EscalationDecision indicating what to do next.
         """
         self.gap_history.append(gap_count)
 
         # First cycle — no comparison yet
         if len(self.gap_history) < 2:
+            label = get_rank_label(self.current_min_rank, self.ranks)
             logger.info(
                 f"[Ranking] Cycle 1 baseline: {gap_count} gaps "
-                f"(tier {self.current_min_tier}: {self.tiers[self.current_min_tier]['name']})"
+                f"(min rank {self.current_min_rank}: {label})"
             )
-            return EscalationDecision(min_tier=self.current_min_tier)
+            return EscalationDecision(min_rank=self.current_min_rank)
 
         prev = self.gap_history[-2]
         curr = self.gap_history[-1]
@@ -118,56 +131,58 @@ class OuterLoopEscalation:
 
         # Good progress? No escalation needed
         if reduction_rate >= self.gap_reduction_threshold:
-            self.failures_at_top_tier = 0
+            self.failures_at_top = 0
+            label = get_rank_label(self.current_min_rank, self.ranks)
             logger.info(
-                f"[Ranking] ✅ Good convergence, staying at tier "
-                f"{self.current_min_tier} ({self.tiers[self.current_min_tier]['name']})"
+                f"[Ranking] ✅ Good convergence, staying at "
+                f"rank {self.current_min_rank} ({label})"
             )
-            return EscalationDecision(min_tier=self.current_min_tier)
+            return EscalationDecision(min_rank=self.current_min_rank)
 
         # Not enough progress — escalation logic
-        if self.current_min_tier < self.max_tier:
-            # Below top tier → escalate one tier up immediately
-            self.current_min_tier += 1
-            self.failures_at_top_tier = 0
-            tier_name = self.tiers[self.current_min_tier]["name"]
+        if self.current_min_rank < self.max_rank:
+            # Below top rank → escalate by rank_step
+            new_rank = min(self.current_min_rank + self.rank_step, self.max_rank)
+            self.current_min_rank = new_rank
+            self.failures_at_top = 0
+            label = get_rank_label(new_rank, self.ranks)
             reason = (
                 f"Gap reduction {reduction_rate:.0%} < "
                 f"{self.gap_reduction_threshold:.0%}, "
-                f"escalating to tier {self.current_min_tier} ({tier_name})"
+                f"escalating to rank {new_rank} ({label})"
             )
             logger.info(f"[Ranking] ⬆️ {reason}")
             return EscalationDecision(
                 escalate=True,
-                min_tier=self.current_min_tier,
+                min_rank=new_rank,
                 reason=reason,
             )
         else:
-            # At top tier — extend timeout, count failures
-            self.failures_at_top_tier += 1
-            tier_name = self.tiers[self.current_min_tier]["name"]
+            # At top rank — extend timeout, count failures
+            self.failures_at_top += 1
+            label = get_rank_label(self.current_min_rank, self.ranks)
 
-            if self.failures_at_top_tier >= self.max_retries_at_top:
+            if self.failures_at_top >= self.max_retries_at_top:
                 reason = (
-                    f"Top tier ({tier_name}) failed "
-                    f"{self.failures_at_top_tier} consecutive cycles"
+                    f"Top rank ({label}) failed "
+                    f"{self.failures_at_top} consecutive cycles"
                 )
                 logger.warning(f"[Ranking] ⛔ {reason}")
                 return EscalationDecision(
-                    min_tier=self.current_min_tier,
+                    min_rank=self.current_min_rank,
                     give_up=True,
                     reason=reason,
                 )
 
-            multiplier = self.timeout_extension ** self.failures_at_top_tier
+            multiplier = self.timeout_extension ** self.failures_at_top
             reason = (
-                f"Top tier ({tier_name}) retry "
-                f"{self.failures_at_top_tier}/{self.max_retries_at_top}, "
+                f"Top rank ({label}) retry "
+                f"{self.failures_at_top}/{self.max_retries_at_top}, "
                 f"timeout ×{multiplier:.1f}"
             )
             logger.info(f"[Ranking] 🔄 {reason}")
             return EscalationDecision(
-                min_tier=self.current_min_tier,
+                min_rank=self.current_min_rank,
                 extend_timeout=True,
                 timeout_multiplier=multiplier,
                 reason=reason,
@@ -175,9 +190,10 @@ class OuterLoopEscalation:
 
     def get_status(self) -> dict:
         """Return current escalation state for logging."""
+        label = get_rank_label(self.current_min_rank, self.ranks)
         return {
-            "current_min_tier": self.current_min_tier,
-            "tier_name": self.tiers[self.current_min_tier]["name"],
-            "failures_at_top_tier": self.failures_at_top_tier,
+            "current_min_rank": self.current_min_rank,
+            "rank_label": label,
+            "failures_at_top": self.failures_at_top,
             "gap_history": self.gap_history,
         }

@@ -332,8 +332,8 @@ class ProjectLoop:
                 return False
 
             if decision.escalate:
-                # Apply new min tier to config for next cycle's dispatcher
-                self.config.setdefault("routing", {})["outer_loop_min_tier"] = decision.min_tier
+                # Apply new min rank to config for next cycle's dispatcher
+                self.config.setdefault("routing", {})["outer_loop_min_rank"] = decision.min_rank
                 logger.info(
                     f"[ProjectLoop] ⬆️ Escalating: {decision.reason}"
                 )
@@ -351,7 +351,7 @@ class ProjectLoop:
             logger.info(
                 f"[ProjectLoop] Cycle {cycle}: {gap_count} gaps remaining, "
                 f"{len(plan['tasks']) if plan else 0} fix tasks, "
-                f"tier: {esc_status['tier_name']}"
+                f"min rank: {esc_status['current_min_rank']} ({esc_status['rank_label']})"
             )
 
         # Max cycles reached
@@ -377,4 +377,6 @@ class ProjectLoop:
             logger.info(
                 f"\n📈 Gap trend: {' → '.join(str(g) for g in esc['gap_history'])}"
             )
-            logger.info(f"🏆 Final tier: {esc['tier_name']} (tier {esc['current_min_tier']})")
+            logger.info(
+                f"🏆 Final min rank: {esc['current_min_rank']} ({esc['rank_label']})"
+            )

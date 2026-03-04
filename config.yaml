@@ -127,19 +127,23 @@ dispatcher:
 # DeepSeek:      ~10% (fallback / specific tasks)
 # Gemini:        ~20% (planning + verify)
 
-# ── Model Ranking & Outer-Loop Escalation (v0.7.5) ──
+# ── Model Ranking & Outer-Loop Escalation (v0.7.6) ──
+# 按個別模型排名，rank 越高品質越好、越貴
 model_ranking:
-  tiers:
-    - name: "budget"
-      prefixes: ["xai/"]
-    - name: "standard"
-      prefixes: ["deepseek/", "claude-sonnet"]
-    - name: "premium"
-      prefixes: ["claude-opus"]
+  ranks:
+    - "xai/grok-4-fast-non-reasoning"       # rank 0 — scaffolding
+    - "xai/grok-4-1-fast-non-reasoning"     # rank 1
+    - "xai/grok-code-fast-1"                # rank 2 — code 專精
+    - "xai/grok-4-fast-reasoning"           # rank 3 — 有推理
+    - "xai/grok-4-1-fast-reasoning"         # rank 4 — 強推理
+    - "deepseek/deepseek-reasoner"          # rank 5 — 長思考
+    - "claude-sonnet-4-6"                   # rank 6 — 高品質
+    - "claude-opus-4-6"                     # rank 7 — 最強
   escalation:
     gap_reduction_threshold: 0.15    # escalate if gaps reduce < 15%
-    max_retries_at_top_tier: 3       # #1 (Opus) gets 3 tries before give up
-    timeout_extension: 1.5           # multiply timeout each retry at top tier
+    rank_step: 2                     # each escalation jumps 2 ranks
+    max_retries_at_top: 3            # Opus gets 3 tries before give up
+    timeout_extension: 1.5           # multiply timeout each retry at top
 
 # ── Verify (v0.7) ──
 verify:

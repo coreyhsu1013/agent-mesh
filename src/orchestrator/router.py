@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 
 from ..models.task import Task, AgentType
-from .model_ranking import get_model_tier
+from .model_ranking import get_model_rank
 
 logger = logging.getLogger(__name__)
 
@@ -120,8 +120,8 @@ class ModelRouter:
         claude_cfg = agents_cfg.get("claude_code", {})
         self.model_opus = claude_cfg.get("model_opus", "claude-opus-4-6")
 
-        # ★ Outer-loop escalation: minimum model tier (set by ProjectLoop)
-        self.outer_loop_min_tier: int = routing_cfg.get("outer_loop_min_tier", 0)
+        # ★ Outer-loop escalation: minimum model rank (set by ProjectLoop)
+        self.outer_loop_min_rank: int = routing_cfg.get("outer_loop_min_rank", 0)
         self.outer_loop_timeout_mul: float = routing_cfg.get(
             "outer_loop_timeout_multiplier", 1.0
         )
@@ -190,15 +190,15 @@ class ModelRouter:
                     )
                     break
 
-        # Rule 3: outer-loop escalation — enforce min tier for ALL tasks
-        if self.outer_loop_min_tier > 0:
+        # Rule 3: outer-loop escalation — enforce min rank for ALL tasks
+        if self.outer_loop_min_rank > 0:
             for idx, model in enumerate(chain):
-                if get_model_tier(model) >= self.outer_loop_min_tier:
+                if get_model_rank(model) >= self.outer_loop_min_rank:
                     candidate = idx + 1  # 1-based
                     if candidate > start:
                         start = candidate
                         logger.info(
-                            f"[Router] Outer-loop tier {self.outer_loop_min_tier}: "
+                            f"[Router] Outer-loop rank {self.outer_loop_min_rank}: "
                             f"'{task.title}' → attempt {candidate} ({model})"
                         )
                     break
