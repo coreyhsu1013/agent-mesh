@@ -179,6 +179,8 @@ layer3:
 #   backup: true
 #   exclude: [".git", ".agent-mesh", "node_modules", "__pycache__", ".env", "*.pyc", "uploads", ".next"]
 #   health_check_url: "https://www.masialonline.com/api/v1/health"
+#   model_chain: ["xai/grok-code-fast-1", "deepseek/deepseek-reasoner", "claude-sonnet-4-6"]
+#   max_retries: 10                # 不放棄：Grok→DeepSeek→Sonnet→繼續Sonnet直到修好
 
 # ── Design Pipeline (v1.0) ──
 # Spec evolution: delta analysis → chunking → implementation per chunk
