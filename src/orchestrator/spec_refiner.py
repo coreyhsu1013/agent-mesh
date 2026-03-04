@@ -120,10 +120,20 @@ class SpecRefiner:
         Includes: relevant data models, API endpoints, acceptance criteria.
         Adds context about what already exists (from previous chunks).
         """
-        change_ids = [c.change_id for c in chunk.changes]
-        change_summaries = "\n".join(
-            f"- {c.change_id}: {c.title} ({c.change_type})" for c in chunk.changes
-        )
+        # chunk.changes may not be populated yet (only _change_ids from LLM)
+        # Use _change_ids to look up from all_changes
+        change_ids = getattr(chunk, '_change_ids', [c.change_id for c in chunk.changes])
+        change_map = {c.change_id: c for c in all_changes}
+        relevant_changes = [change_map[cid] for cid in change_ids if cid in change_map]
+
+        if not relevant_changes:
+            # Fallback: use chunk title for context
+            change_summaries = f"- {chunk.chunk_id}: {chunk.title}"
+        else:
+            change_summaries = "\n".join(
+                f"- {c.change_id}: {c.title} ({c.change_type}) — {c.description[:100]}"
+                for c in relevant_changes
+            )
 
         prompt = f"""You are a technical writer extracting a self-contained partial specification.
 
