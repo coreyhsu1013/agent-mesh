@@ -302,6 +302,15 @@ async def run_evolve(config: dict, repo_dir: str, old_spec: str, new_spec: str,
     return success
 
 
+async def run_deploy(config: dict, repo_dir: str):
+    """Deploy project to target host."""
+    from .deployer import Deployer
+
+    deployer = Deployer(config, repo_dir)
+    result = await deployer.deploy()
+    return result.success
+
+
 async def run_cycles(config: dict, repo_dir: str, spec_path: str,
                      initial_plan: str, max_cycles: int = 5,
                      max_parallel: int | None = None, no_review: bool = True):
@@ -418,6 +427,7 @@ Examples:
     parser.add_argument("--evolve", action="store_true", help="Design Pipeline: spec evolution mode")
     parser.add_argument("--spec-old", help="Path to old spec (baseline) for --evolve")
     parser.add_argument("--spec-new", help="Path to new spec (target) for --evolve")
+    parser.add_argument("--deploy", action="store_true", help="Deploy to target host after completion")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
@@ -450,7 +460,7 @@ Examples:
         if not os.path.exists(os.path.abspath(args.spec_new)):
             logger.error(f"New spec not found: {args.spec_new}")
             sys.exit(1)
-        asyncio.run(run_evolve(
+        success = asyncio.run(run_evolve(
             config, repo_dir,
             old_spec=os.path.abspath(args.spec_old),
             new_spec=os.path.abspath(args.spec_new),
@@ -458,6 +468,12 @@ Examples:
             max_parallel=args.max_parallel,
             no_review=args.no_review,
         ))
+        if args.deploy and success:
+            asyncio.run(run_deploy(config, repo_dir))
+
+    elif args.deploy:
+        # v1.0: Standalone deploy mode
+        asyncio.run(run_deploy(config, repo_dir))
 
     elif args.verify:
         # v0.7: Verify mode

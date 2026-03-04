@@ -168,6 +168,18 @@ layer3:
   max_feedback_items: 3        # 每個 cycle 最多幾個 spec 修正建議
   auto_fix_spec: false         # true = 自動改 spec.md；false = 輸出問題給人回答
 
+# ── Deploy (v1.0) ──
+# rsync + SSH deploy to target host
+# deploy:
+#   host: "www.masialonline.com"
+#   user: "erp"
+#   password: "@Afatech2026"
+#   remote_dir: "/home/erp/afatech"
+#   port: 22
+#   backup: true
+#   exclude: [".git", ".agent-mesh", "node_modules", "__pycache__", ".env", "*.pyc", "uploads", ".next"]
+#   health_check_url: "https://www.masialonline.com/api/v1/health"
+
 # ── Design Pipeline (v1.0) ──
 # Spec evolution: delta analysis → chunking → implementation per chunk
 design:
