@@ -271,6 +271,37 @@ async def run_verify(config: dict, repo_dir: str, spec_path: str | None = None,
     return report
 
 
+async def run_evolve(config: dict, repo_dir: str, old_spec: str, new_spec: str,
+                     max_cycles: int = 3, max_parallel: int | None = None,
+                     no_review: bool = True):
+    """Run Design Pipeline: spec evolution mode (v1.0)."""
+    from .design_loop import DesignLoop
+
+    if max_parallel is None:
+        max_parallel = config.get("dispatcher", {}).get("max_parallel", 4)
+
+    logger.info(f"\n🏗️ Agent Mesh v{config.get('version', '1.0.0')} — Spec Evolution Mode")
+    logger.info(f"📁 Repo: {repo_dir}")
+    logger.info(f"📋 Old spec: {old_spec}")
+    logger.info(f"📋 New spec: {new_spec}")
+
+    loop = DesignLoop(config, repo_dir)
+    success = await loop.run(
+        old_spec_path=old_spec,
+        new_spec_path=new_spec,
+        max_inner_cycles=max_cycles,
+        max_parallel=max_parallel,
+        no_review=no_review,
+    )
+
+    if success:
+        logger.info("\n✅ Spec evolution completed successfully")
+    else:
+        logger.warning("\n⚠️ Spec evolution completed with issues")
+
+    return success
+
+
 async def run_cycles(config: dict, repo_dir: str, spec_path: str,
                      initial_plan: str, max_cycles: int = 5,
                      max_parallel: int | None = None, no_review: bool = True):
@@ -383,6 +414,10 @@ Examples:
     parser.add_argument("--verify", action="store_true", help="Run verification checks")
     parser.add_argument("--fix-plan", action="store_true", help="Generate fix-plan from verify")
     parser.add_argument("--cycles", type=int, help="Auto-cycle mode: max number of cycles")
+    # v1.0 flags
+    parser.add_argument("--evolve", action="store_true", help="Design Pipeline: spec evolution mode")
+    parser.add_argument("--spec-old", help="Path to old spec (baseline) for --evolve")
+    parser.add_argument("--spec-new", help="Path to new spec (target) for --evolve")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
@@ -404,7 +439,27 @@ Examples:
         config["no_review"] = True
 
     # Route to action
-    if args.verify:
+    if args.evolve:
+        # v1.0: Spec evolution mode
+        if not args.spec_old or not args.spec_new:
+            logger.error("--spec-old and --spec-new required for --evolve mode")
+            sys.exit(1)
+        if not os.path.exists(os.path.abspath(args.spec_old)):
+            logger.error(f"Old spec not found: {args.spec_old}")
+            sys.exit(1)
+        if not os.path.exists(os.path.abspath(args.spec_new)):
+            logger.error(f"New spec not found: {args.spec_new}")
+            sys.exit(1)
+        asyncio.run(run_evolve(
+            config, repo_dir,
+            old_spec=os.path.abspath(args.spec_old),
+            new_spec=os.path.abspath(args.spec_new),
+            max_cycles=args.cycles or 3,
+            max_parallel=args.max_parallel,
+            no_review=args.no_review,
+        ))
+
+    elif args.verify:
         # v0.7: Verify mode
         spec_path = os.path.abspath(args.spec) if args.spec else None
         asyncio.run(run_verify(config, repo_dir, spec_path, fix_plan=args.fix_plan))
