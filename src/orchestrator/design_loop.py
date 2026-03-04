@@ -117,21 +117,26 @@ class DesignLoop:
             logger.info(f"  🔄 Design Iteration {design_iter}/{self.max_design_iterations}")
             logger.info(f"{'='*60}")
 
-            # ── Step 3: Plan chunks ──
-            logger.info("\n📦 Step 3: Planning implementation chunks...")
-            chunks = await self.refiner.plan_chunks(changes, new_spec)
-            self.refiner.map_changes_to_chunks(chunks, changes)
-
-            # Save chunks
+            # ── Step 3: Plan chunks (cached if design-chunks-iter{N}.json exists) ──
             chunks_path = os.path.join(
                 self.mesh_dir, f"design-chunks-iter{design_iter}.json"
             )
-            with open(chunks_path, 'w') as f:
-                json.dump([c.to_dict() for c in chunks], f, indent=2, ensure_ascii=False)
-            # Also save as latest
-            with open(os.path.join(self.mesh_dir, "design-chunks.json"), 'w') as f:
-                json.dump([c.to_dict() for c in chunks], f, indent=2, ensure_ascii=False)
-            logger.info(f"[DesignLoop] {len(chunks)} chunks → {chunks_path}")
+            if os.path.exists(chunks_path):
+                logger.info(f"\n📦 Step 3: Loading cached chunks → {chunks_path}")
+                with open(chunks_path) as f:
+                    chunks = [DesignChunk.from_dict(c) for c in json.load(f)]
+                logger.info(f"[DesignLoop] Loaded {len(chunks)} cached chunks")
+            else:
+                logger.info("\n📦 Step 3: Planning implementation chunks...")
+                chunks = await self.refiner.plan_chunks(changes, new_spec)
+                self.refiner.map_changes_to_chunks(chunks, changes)
+
+                with open(chunks_path, 'w') as f:
+                    json.dump([c.to_dict() for c in chunks], f, indent=2, ensure_ascii=False)
+                # Also save as latest
+                with open(os.path.join(self.mesh_dir, "design-chunks.json"), 'w') as f:
+                    json.dump([c.to_dict() for c in chunks], f, indent=2, ensure_ascii=False)
+                logger.info(f"[DesignLoop] {len(chunks)} chunks → {chunks_path}")
 
             # ── Step 4: Execute chunks sequentially ──
             all_success = await self._execute_chunks(
@@ -274,28 +279,31 @@ class DesignLoop:
         from .dispatcher import Dispatcher
         from .project_loop import ProjectLoop
 
-        # Write partial spec
+        # Write partial spec (skip if already exists and content matches)
         spec_path = os.path.join(self.mesh_dir, f"{chunk.chunk_id}-spec.md")
         with open(spec_path, 'w') as f:
             f.write(chunk.partial_spec)
         logger.info(f"[DesignLoop] Wrote partial spec: {spec_path}")
 
-        # Plan from partial spec
-        logger.info(f"[DesignLoop] Planning from partial spec...")
-        planner = Planner(self.config, self.repo_dir)
-        try:
-            plan = await planner.plan(spec_path)
-        except Exception as e:
-            logger.error(f"[DesignLoop] Planning failed for {chunk.chunk_id}: {e}")
-            return {"success": False, "error": f"Planning failed: {e}"}
-
-        if plan is None or not plan.tasks:
-            logger.warning(f"[DesignLoop] Empty plan for {chunk.chunk_id}")
-            return {"success": False, "error": "Empty plan generated"}
-
-        # Save plan
+        # Plan from partial spec (cached if plan.json exists)
         plan_path = os.path.join(self.mesh_dir, f"{chunk.chunk_id}-plan.json")
-        Planner.save_plan(plan, plan_path)
+        if os.path.exists(plan_path):
+            logger.info(f"[DesignLoop] Loading cached plan → {plan_path}")
+            plan = Planner.load_plan(plan_path)
+        else:
+            logger.info(f"[DesignLoop] Planning from partial spec...")
+            planner = Planner(self.config, self.repo_dir)
+            try:
+                plan = await planner.plan(spec_path)
+            except Exception as e:
+                logger.error(f"[DesignLoop] Planning failed for {chunk.chunk_id}: {e}")
+                return {"success": False, "error": f"Planning failed: {e}"}
+
+            if plan is None or not plan.tasks:
+                logger.warning(f"[DesignLoop] Empty plan for {chunk.chunk_id}")
+                return {"success": False, "error": "Empty plan generated"}
+
+            Planner.save_plan(plan, plan_path)
         logger.info(
             f"[DesignLoop] Plan: {len(plan.tasks)} tasks → {plan_path}"
         )
