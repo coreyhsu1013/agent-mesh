@@ -279,10 +279,21 @@ class DesignLoop:
         from .dispatcher import Dispatcher
         from .project_loop import ProjectLoop
 
-        # Write partial spec (skip if already exists and content matches)
+        # Get repo structure so planner generates correct file paths
+        from .spec_analyzer import get_code_tree
+        code_tree = await get_code_tree(self.repo_dir, char_limit=20_000)
+
+        # Write partial spec with repo structure appended
         spec_path = os.path.join(self.mesh_dir, f"{chunk.chunk_id}-spec.md")
+        spec_with_context = (
+            chunk.partial_spec
+            + f"\n\n## CURRENT PROJECT STRUCTURE\n"
+            f"IMPORTANT: Use the ACTUAL file paths below. "
+            f"Do NOT invent paths like src/ or db/ — match existing structure.\n\n"
+            f"{code_tree}\n"
+        )
         with open(spec_path, 'w') as f:
-            f.write(chunk.partial_spec)
+            f.write(spec_with_context)
         logger.info(f"[DesignLoop] Wrote partial spec: {spec_path}")
 
         # Plan from partial spec (cached if plan.json exists)

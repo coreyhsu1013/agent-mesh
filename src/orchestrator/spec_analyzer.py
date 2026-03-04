@@ -218,44 +218,7 @@ Each object:
                 pass
 
     async def _get_code_tree(self, repo_dir: str) -> str:
-        """Get a summary of the code tree (file listing + key file contents)."""
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                'find . -name "*.ts" -o -name "*.tsx" -o -name "*.prisma" -o -name "*.sol" -o -name "*.py" '
-                '| grep -v node_modules | grep -v .agent-mesh | grep -v typechain | grep -v __pycache__ | sort',
-                cwd=repo_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            file_list = stdout.decode().strip()
-
-            result_parts = [f"=== File Tree ===\n{file_list}\n"]
-            total_chars = len(file_list)
-            char_limit = 80_000
-
-            for filepath in file_list.split('\n'):
-                filepath = filepath.strip()
-                if not filepath:
-                    continue
-                if any(kw in filepath for kw in [
-                    '/services/', '/routes/', '/schemas/', '/workers/',
-                    'schema.prisma', '/models/', '/middleware/',
-                ]):
-                    full_path = os.path.join(repo_dir, filepath)
-                    try:
-                        with open(full_path, 'r') as f:
-                            content = f.read()
-                        if total_chars + len(content) > char_limit:
-                            break
-                        result_parts.append(f"\n=== {filepath} ===\n{content}")
-                        total_chars += len(content)
-                    except Exception:
-                        continue
-
-            return '\n'.join(result_parts)
-        except Exception as e:
-            return f"Error getting code tree: {e}"
+        return await get_code_tree(repo_dir)
 
     def _parse_changes(self, raw: str) -> list[DesignChange]:
         """Parse JSON array of changes from LLM output."""
@@ -291,6 +254,49 @@ Each object:
                     )
 
         return changes
+
+
+async def get_code_tree(repo_dir: str, char_limit: int = 80_000) -> str:
+    """Get a summary of the code tree (file listing + key file contents).
+
+    Module-level function for reuse by DesignLoop and SpecAnalyzer.
+    """
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            'find . -name "*.ts" -o -name "*.tsx" -o -name "*.prisma" -o -name "*.sol" -o -name "*.py" '
+            '| grep -v node_modules | grep -v .agent-mesh | grep -v typechain | grep -v __pycache__ | sort',
+            cwd=repo_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        file_list = stdout.decode().strip()
+
+        result_parts = [f"=== File Tree ===\n{file_list}\n"]
+        total_chars = len(file_list)
+
+        for filepath in file_list.split('\n'):
+            filepath = filepath.strip()
+            if not filepath:
+                continue
+            if any(kw in filepath for kw in [
+                '/services/', '/routes/', '/schemas/', '/workers/',
+                'schema.prisma', '/models/', '/middleware/',
+            ]):
+                full_path = os.path.join(repo_dir, filepath)
+                try:
+                    with open(full_path, 'r') as f:
+                        content = f.read()
+                    if total_chars + len(content) > char_limit:
+                        break
+                    result_parts.append(f"\n=== {filepath} ===\n{content}")
+                    total_chars += len(content)
+                except Exception:
+                    continue
+
+        return '\n'.join(result_parts)
+    except Exception as e:
+        return f"Error getting code tree: {e}"
 
 
 def _parse_json_array(raw: str) -> list:
