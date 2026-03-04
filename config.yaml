@@ -15,31 +15,28 @@ planner:
 # ── Routing Matrix (escalation chains per complexity, smoke-tested) ──
 routing:
   matrix:
-    L:   # Lite: scaffolding, config, boilerplate — no cross-task imports
+    L:   # Lite: scaffolding, config, boilerplate
       chain:
-        - "xai/grok-4-fast-non-reasoning"
-        - "xai/grok-4-1-fast-non-reasoning"
-        - "xai/grok-code-fast-1"
+        - "xai/grok-4-1-fast-reasoning"
+        - "deepseek/deepseek-reasoner"
         - "claude-sonnet-4-6"
-    S:   # Simple: simple logic, imports types/services/schemas from other tasks
+    S:   # Simple: simple logic, imports types/services/schemas
       chain:
-        - "xai/grok-code-fast-1"
-        - "xai/grok-4-1-fast-non-reasoning"
+        - "xai/grok-4-1-fast-reasoning"
         - "deepseek/deepseek-reasoner"
         - "claude-sonnet-4-6"
     M:   # Medium: auth logic, business rules, middleware, tests
       chain:
-        - "xai/grok-4-fast-reasoning"
-        - "xai/grok-code-fast-1"
+        - "xai/grok-4-1-fast-reasoning"
         - "deepseek/deepseek-reasoner"
         - "claude-sonnet-4-6"
         - "claude-opus-4-6"
     H:   # Hard: architecture, security, payment, cross-module integration
       chain:
         - "xai/grok-4-1-fast-reasoning"
+        - "deepseek/deepseek-reasoner"
         - "claude-sonnet-4-6"
         - "claude-opus-4-6"
-        - "claude-opus-4-6"              # retry with 2× timeout
 
 # ── Timeouts per runner type (seconds) ──
 timeouts:
