@@ -337,14 +337,14 @@ class DesignLoop:
 
         class _ChunkDispatcher:
             """Adapts Dispatcher for chunk execution."""
-            def __init__(self_, plan_path: str, mp: int, nr: bool):
+            def __init__(self_, plan_path: str, max_parallel: int = 4, no_review: bool = True):
                 nonlocal total_cost
                 with open(plan_path) as f:
                     plan_data = json.load(f)
                 self_.plan = TaskPlan.from_dict(plan_data)
                 self_.run_id = store.save_plan(self_.plan)
-                cfg = {**self.config, "no_review": nr}
-                cfg.setdefault("dispatcher", {})["max_parallel"] = mp
+                cfg = {**self.config, "no_review": no_review}
+                cfg.setdefault("dispatcher", {})["max_parallel"] = max_parallel
                 self_.dispatcher = Dispatcher(
                     cfg, self.repo_dir, store,
                     experience_store=exp_store,
