@@ -95,8 +95,9 @@ DEFAULT_FORCE_SONNET: list[str] = [
 
 class ModelRouter:
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, advisor=None):
         self.config = config
+        self.advisor = advisor  # ExperienceAdvisor | None — v0.9
         routing_cfg = config.get("routing", {})
         raw_matrix = routing_cfg.get("matrix", {})
 
@@ -211,10 +212,26 @@ class ModelRouter:
         """
         查表返回第 attempt 次該用哪個 model。
         attempt 從 1 開始。最後一級 retry: timeout_multiplier = 2.0。
+        v0.9: advisor can cause model skipping.
         """
         chain = self.matrix.get(complexity, self.matrix["M"])
         idx = min(attempt - 1, len(chain) - 1)
         model = chain[idx]
+
+        # v0.9: skip models flagged by experience advisor
+        if self.advisor and log:
+            skip_models = self.advisor.get_skip_models(complexity)
+            if skip_models:
+                original_model = model
+                while model in skip_models and idx < len(chain) - 1:
+                    idx += 1
+                    model = chain[idx]
+                if model != original_model:
+                    logger.info(
+                        f"[Router] Advisor skip: {original_model} → {model} "
+                        f"(historical poor performance)"
+                    )
+
         agent_type = _model_to_agent_type(model)
 
         # Last slot in chain + not first attempt → 2× timeout

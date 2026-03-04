@@ -159,6 +159,41 @@ async def run_plan_only(config: dict, spec_path: str, repo_dir: str):
             logger.info(f"    • {t}")
 
 
+def _init_experience(config: dict, repo_dir: str):
+    """Initialize experience tracking components (v0.9)."""
+    from .experience_store import ExperienceStore
+    from .project_classifier import ProjectClassifier
+    from .experience_advisor import ExperienceAdvisor
+
+    exp_store = ExperienceStore()
+    classifier = ProjectClassifier()
+    project_name = os.path.basename(repo_dir)
+
+    # Classify project (check cache first)
+    profile = exp_store.get_project_profile(project_name)
+    if profile and profile.get("project_type"):
+        project_type = profile["project_type"]
+        logger.info(f"[Experience] Cached profile: {project_name} → {project_type}")
+    else:
+        result = classifier.classify(repo_dir)
+        project_type = result["project_type"]
+        exp_store.update_project_profile(
+            project_name,
+            project_type=project_type,
+            repo_path=repo_dir,
+            language=result["language"],
+            framework=result["framework"],
+        )
+        logger.info(
+            f"[Experience] New profile: {project_name} → "
+            f"type={project_type}, lang={result['language']}, "
+            f"framework={result['framework']}"
+        )
+
+    advisor = ExperienceAdvisor(exp_store, project_type)
+    return exp_store, project_name, project_type, advisor
+
+
 async def run_execute(config: dict, plan_path: str, repo_dir: str,
                       modules: list[str] | None = None,
                       waves: list[int] | None = None,
@@ -173,7 +208,7 @@ async def run_execute(config: dict, plan_path: str, repo_dir: str,
         plan_data = json.load(f)
     plan = TaskPlan.from_dict(plan_data)
 
-    logger.info(f"\n🚀 Agent Mesh v{config.get('version', '0.7.0')}")
+    logger.info(f"\n🚀 Agent Mesh v{config.get('version', '0.9.0')}")
     logger.info(f"📋 Executing: {plan_path} ({len(plan.tasks)} tasks)")
     logger.info(f"📁 Repo: {repo_dir}")
     if resume:
@@ -183,8 +218,18 @@ async def run_execute(config: dict, plan_path: str, repo_dir: str,
     store = ContextStore(repo_dir)
     run_id = store.save_plan(plan)
 
+    # v0.9: experience tracking
+    exp_store, project_name, project_type, advisor = _init_experience(config, repo_dir)
+
     # Execute
-    dispatcher = Dispatcher(config, repo_dir, store)
+    dispatcher = Dispatcher(
+        config, repo_dir, store,
+        experience_store=exp_store,
+        project_name=project_name,
+        project_type=project_type,
+    )
+    dispatcher.router.advisor = advisor
+
     await dispatcher.execute_plan(
         plan=plan,
         run_id=run_id,
@@ -193,7 +238,12 @@ async def run_execute(config: dict, plan_path: str, repo_dir: str,
         resume=resume,
     )
 
+    # Update project cost
+    if exp_store and dispatcher.wave_cost_usd > 0:
+        exp_store.add_project_cost(project_name, dispatcher.wave_cost_usd)
+
     store.close()
+    exp_store.close()
 
 
 async def run_verify(config: dict, repo_dir: str, spec_path: str | None = None,
@@ -234,30 +284,43 @@ async def run_cycles(config: dict, repo_dir: str, spec_path: str,
     if max_parallel is None:
         max_parallel = config.get("dispatcher", {}).get("max_parallel", 4)
 
-    logger.info(f"\n🔄 Agent Mesh v{config.get('version', '0.7.0')} — Auto Cycle Mode")
+    logger.info(f"\n🔄 Agent Mesh v{config.get('version', '0.9.0')} — Auto Cycle Mode")
     logger.info(f"📁 Repo: {repo_dir}")
     logger.info(f"📋 Spec: {spec_path}")
     logger.info(f"🔄 Max cycles: {max_cycles}, max_parallel: {max_parallel}")
 
     store = ContextStore(repo_dir)
 
+    # v0.9: experience tracking
+    exp_store, project_name, project_type, advisor = _init_experience(config, repo_dir)
+    total_cost = 0.0
+
     class _DispatcherWrapper:
         """Adapts Dispatcher to the factory interface expected by run_auto."""
         def __init__(self, plan_path: str, max_parallel: int, no_review: bool):
+            nonlocal total_cost
             with open(plan_path) as f:
                 plan_data = json.load(f)
             self.plan = TaskPlan.from_dict(plan_data)
             self.run_id = store.save_plan(self.plan)
             cfg = {**config, "no_review": no_review}
             cfg.setdefault("dispatcher", {})["max_parallel"] = max_parallel
-            self.dispatcher = Dispatcher(cfg, repo_dir, store)
+            self.dispatcher = Dispatcher(
+                cfg, repo_dir, store,
+                experience_store=exp_store,
+                project_name=project_name,
+                project_type=project_type,
+            )
+            self.dispatcher.router.advisor = advisor
 
         async def run(self):
+            nonlocal total_cost
             await self.dispatcher.execute_plan(
                 plan=self.plan,
                 run_id=self.run_id,
                 resume=True,  # skip already-completed tasks across cycles
             )
+            total_cost += self.dispatcher.wave_cost_usd
             return "done"
 
     loop = ProjectLoop(config, repo_dir, spec_path)
@@ -270,7 +333,13 @@ async def run_cycles(config: dict, repo_dir: str, spec_path: str,
         no_review=no_review,
     )
 
+    # v0.9: update project cost
+    if exp_store and total_cost > 0:
+        exp_store.add_project_cost(project_name, total_cost)
+        logger.info(f"[Experience] Total cost for {project_name}: ${total_cost:.4f}")
+
     store.close()
+    exp_store.close()
     return success
 
 

@@ -117,6 +117,9 @@ class TaskResult:
     history: Optional[LoopHistory] = None
     total_duration_sec: float = 0.0
     final_model: str = ""    # ★ 最終成功的 model label
+    # v0.9: cost tracking
+    cost_results: list = field(default_factory=list)  # list[CostResult]
+    total_cost_usd: float = 0.0
 
 
 class AgentRunner(Protocol):
@@ -152,6 +155,7 @@ class ReactLoop:
         from ..models.task import AgentType
 
         history = LoopHistory()
+        cost_results: list = []  # list[CostResult] — v0.9
         start_time = time.time()
         complexity = getattr(task, "complexity", "M")
         max_attempts = router.get_max_attempts(complexity)
@@ -192,6 +196,10 @@ class ReactLoop:
             )
             act_duration = time.time() - act_start
 
+            # ── COST ── (v0.9: track per-attempt cost)
+            if hasattr(run_result, "cost") and run_result.cost:
+                cost_results.append(run_result.cost)
+
             if not run_result.success and run_result.error:
                 logger.warning(
                     f"[ReAct] Runner error for '{task.title}': {run_result.error}"
@@ -215,21 +223,27 @@ class ReactLoop:
 
             # ── EVALUATE ──
             if observation.success:
+                total_cost = sum(c.estimated_usd for c in cost_results if hasattr(c, 'estimated_usd'))
                 return TaskResult(
                     task_id=task.id, status="completed", attempts=attempt,
                     final_diff=observation.diff, history=history,
                     total_duration_sec=time.time() - start_time,
                     final_model=decision.model,
+                    cost_results=cost_results,
+                    total_cost_usd=total_cost,
                 )
 
             if attempt == max_attempts:
                 logger.warning(f"[ReAct] Task '{task.title}' — Max attempts reached")
+                total_cost = sum(c.estimated_usd for c in cost_results if hasattr(c, 'estimated_usd'))
                 return TaskResult(
                     task_id=task.id, status="failed", attempts=attempt,
                     error=observation.error or "Max attempts reached",
                     final_diff=observation.diff, history=history,
                     total_duration_sec=time.time() - start_time,
                     final_model=decision.model,
+                    cost_results=cost_results,
+                    total_cost_usd=total_cost,
                 )
 
             delay = self.retry_delay_base * attempt

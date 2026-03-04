@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -22,13 +23,16 @@ from .router import ModelRouter
 from .react_loop import ReactLoop, TaskResult
 from .reviewer import Reviewer
 from .workspace import WorkspacePool
+from .cost_tracker import CostTracker
 
 logger = logging.getLogger(__name__)
 
 
 class Dispatcher:
 
-    def __init__(self, config: dict, repo_dir: str, store: ContextStore):
+    def __init__(self, config: dict, repo_dir: str, store: ContextStore,
+                 experience_store=None, project_name: str = "",
+                 project_type: str = ""):
         self.config = config
         self.repo_dir = repo_dir
         self.store = store
@@ -53,6 +57,13 @@ class Dispatcher:
 
         self.shared_context = ""
         self.no_review = config.get("no_review", False)
+
+        # v0.9: cost tracking + experience
+        self.cost_tracker = CostTracker()
+        self.experience_store = experience_store  # ExperienceStore | None
+        self.project_name = project_name or os.path.basename(repo_dir)
+        self.project_type = project_type
+        self.wave_cost_usd = 0.0  # accumulates per wave
 
     async def execute_plan(
         self,
@@ -263,6 +274,27 @@ class Dispatcher:
                     self.store.update_task(task)
 
             # ═══════════════════════════════════════════
+            # ★ Phase 3.5: Wave cost summary (v0.9)
+            # ═══════════════════════════════════════════
+            wave_cost = 0.0
+            for task_idx, (task, result) in task_results.items():
+                if isinstance(result, TaskResult) and result.total_cost_usd > 0:
+                    wave_cost += result.total_cost_usd
+            self.wave_cost_usd += wave_cost
+            if wave_cost > 0:
+                logger.info(
+                    f"[Cost] Wave {wave_num} total: ${wave_cost:.4f} "
+                    f"(cumulative: ${self.wave_cost_usd:.4f})"
+                )
+
+            # v0.9: refresh experience stats after each wave
+            if self.experience_store:
+                try:
+                    self.experience_store.refresh_model_stats()
+                except Exception:
+                    pass
+
+            # ═══════════════════════════════════════════
             # ★ Phase 4: Cleanup worker slots + task branches
             # ═══════════════════════════════════════════
             await self.pool.cleanup_wave()
@@ -328,6 +360,61 @@ class Dispatcher:
                     if result.final_model:
                         model_short = result.final_model.split("/")[-1]
                         task.agent_used = f"{'escalated:' if result.attempts > 1 else ''}{model_short}"
+
+                    # v0.9: estimate cost if not already tracked
+                    if not result.cost_results and result.final_model:
+                        # Fallback: estimate from task output
+                        stdout_len = sum(
+                            len(a.get("diff_summary", ""))
+                            for a in (result.history.attempts if result.history else [])
+                        )
+                        est = self.cost_tracker.estimate_from_chars(
+                            "x" * max(stdout_len, 500), result.final_model
+                        )
+                        result.cost_results = [est]
+                        result.total_cost_usd = est.estimated_usd
+
+                    # v0.9: log cost
+                    if result.total_cost_usd > 0:
+                        logger.info(
+                            f"[Cost] {task.id}: ${result.total_cost_usd:.4f} "
+                            f"({len(result.cost_results)} attempt(s), "
+                            f"{result.final_model or 'unknown'})"
+                        )
+
+                    # v0.9: record to experience store
+                    if self.experience_store and result.final_model:
+                        try:
+                            last_cost = result.cost_results[-1] if result.cost_results else None
+                            error_type = None
+                            if result.error:
+                                if "timeout" in result.error.lower():
+                                    error_type = "timeout"
+                                elif "build" in result.error.lower():
+                                    error_type = "build_fail"
+                                elif "test" in result.error.lower():
+                                    error_type = "test_fail"
+                                elif "review" in result.error.lower():
+                                    error_type = "review_reject"
+                                else:
+                                    error_type = "other"
+                            self.experience_store.record_task_run(
+                                project_name=self.project_name,
+                                project_type=self.project_type,
+                                task_id=task.id,
+                                task_title=task.title,
+                                complexity=complexity,
+                                category=getattr(task, "category", ""),
+                                module=getattr(task, "module", ""),
+                                model_used=result.final_model,
+                                attempt_number=result.attempts,
+                                success=result.status == "completed",
+                                duration_sec=task.duration_sec,
+                                cost=last_cost,
+                                error_type=error_type,
+                            )
+                        except Exception as e:
+                            logger.debug(f"[Experience] Record failed: {e}")
 
                     # 3) Review (optional, no merge here)
                     if result.status == "completed" and not self.no_review:
@@ -398,9 +485,12 @@ class Dispatcher:
         if completed > 0:
             first_pct = react["first_attempt_success"] / completed * 100
             retry_pct = react["required_retry"] / completed * 100
+            cost_str = f"${self.wave_cost_usd:.4f}" if self.wave_cost_usd > 0 else "N/A"
             logger.info(f"""
   🔄 ReAct Loop:
     First attempt: {react['first_attempt_success']} ({first_pct:.0f}%)
     Retry needed:  {react['required_retry']} ({retry_pct:.0f}%)
     Avg attempts:  {react['avg_attempts']}
+
+  💰 Cost: {cost_str}
 {'='*60}""")

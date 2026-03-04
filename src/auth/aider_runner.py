@@ -23,11 +23,12 @@ logger = logging.getLogger(__name__)
 class RunResult:
     """Agent 執行結果。"""
     def __init__(self, success: bool, stdout: str = "", stderr: str = "",
-                 error: Optional[str] = None):
+                 error: Optional[str] = None, cost=None):
         self.success = success
         self.stdout = stdout
         self.stderr = stderr
         self.error = error
+        self.cost = cost  # CostResult | None — set by dispatcher after execution
 
 
 # ══════════════════════════════════════════════════════════
