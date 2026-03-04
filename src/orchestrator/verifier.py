@@ -276,7 +276,7 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
 
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --model {model} --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {model} --output-format text',
                 cwd=self.repo_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -400,7 +400,7 @@ If no new gaps, return: []
 
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --model {model} --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {model} --output-format text',
                 cwd=self.repo_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -503,7 +503,7 @@ Each item:
 
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --model {model} --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {model} --output-format text',
                 cwd=self.repo_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -627,7 +627,7 @@ If no integration issues, return: []
 
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --model {model} --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {model} --output-format text',
                 cwd=self.repo_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -893,7 +893,7 @@ If everything is implemented correctly, return an empty array: []
 
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --model claude-opus-4-6 --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model claude-opus-4-6 --output-format text',
                 cwd=self.repo_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

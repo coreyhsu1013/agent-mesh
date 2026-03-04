@@ -409,7 +409,7 @@ Respond ONLY with JSON. No other text.
         try:
             if model.startswith("claude") or model.startswith("claude-"):
                 # Claude CLI
-                cmd = f'cat {prompt_file} | claude -p --model {model} --output-format text'
+                cmd = f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {model} --output-format text'
             else:
                 # Non-Claude models: use claude CLI with --model flag
                 # (aider doesn't support one-shot prompts well, but claude CLI
@@ -467,7 +467,7 @@ Respond ONLY with JSON. No other text.
             logger.warning(
                 f"[Deployer] Unknown model {model}, falling back to claude-sonnet-4-6"
             )
-            return f'cat {prompt_file} | claude -p --model claude-sonnet-4-6 --output-format text'
+            return f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model claude-sonnet-4-6 --output-format text'
 
         # Python one-liner using openai-compatible API
         return (

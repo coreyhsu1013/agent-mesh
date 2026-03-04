@@ -306,7 +306,7 @@ If no chunks need adjustment, return an empty array: []
 
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --model {self.model} --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {self.model} --output-format text',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

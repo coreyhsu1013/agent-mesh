@@ -374,6 +374,7 @@ class GeminiPlanner:
             use_model = model or self.model_fallback
             cmd = (
                 f"cat {prompt_file} | claude -p "
+                f"--dangerously-skip-permissions "
                 f"--model {use_model} "
                 f"--output-format text"
             )
