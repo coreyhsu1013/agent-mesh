@@ -57,6 +57,7 @@ class DesignLoop:
     ) -> bool:
         """
         Main entry: Design Pipeline → Implementation Pipeline → Validation.
+        Recursive: final validation gaps → re-analyze → new chunks → re-implement.
 
         Returns True if all chunks completed successfully.
         """
@@ -73,6 +74,7 @@ class DesignLoop:
         logger.info(f"  🏗️ Design Pipeline — Spec Evolution")
         logger.info(f"  Old: {old_spec_path}")
         logger.info(f"  New: {new_spec_path}")
+        logger.info(f"  Max design iterations: {self.max_design_iterations}")
         logger.info(f"{'='*60}")
 
         # ── Step 1: Analyze delta ──
@@ -100,19 +102,95 @@ class DesignLoop:
                 + ", ".join(c.change_id for c in blocked)
             )
 
-        # ── Step 3: Plan chunks ──
-        logger.info("\n📦 Step 3: Planning implementation chunks...")
-        chunks = await self.refiner.plan_chunks(changes, new_spec)
-        self.refiner.map_changes_to_chunks(chunks, changes)
+        # ── Outer recursion loop ──
+        for design_iter in range(1, self.max_design_iterations + 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"  🔄 Design Iteration {design_iter}/{self.max_design_iterations}")
+            logger.info(f"{'='*60}")
 
-        # Save chunks
-        chunks_path = os.path.join(self.mesh_dir, "design-chunks.json")
-        with open(chunks_path, 'w') as f:
-            json.dump([c.to_dict() for c in chunks], f, indent=2, ensure_ascii=False)
-        logger.info(f"[DesignLoop] {len(chunks)} chunks → {chunks_path}")
+            # ── Step 3: Plan chunks ──
+            logger.info("\n📦 Step 3: Planning implementation chunks...")
+            chunks = await self.refiner.plan_chunks(changes, new_spec)
+            self.refiner.map_changes_to_chunks(chunks, changes)
 
-        # ── Step 4: Execute chunks sequentially ──
-        logger.info(f"\n🚀 Step 4: Executing {len(chunks)} chunks...")
+            # Save chunks
+            chunks_path = os.path.join(
+                self.mesh_dir, f"design-chunks-iter{design_iter}.json"
+            )
+            with open(chunks_path, 'w') as f:
+                json.dump([c.to_dict() for c in chunks], f, indent=2, ensure_ascii=False)
+            # Also save as latest
+            with open(os.path.join(self.mesh_dir, "design-chunks.json"), 'w') as f:
+                json.dump([c.to_dict() for c in chunks], f, indent=2, ensure_ascii=False)
+            logger.info(f"[DesignLoop] {len(chunks)} chunks → {chunks_path}")
+
+            # ── Step 4: Execute chunks sequentially ──
+            all_success = await self._execute_chunks(
+                chunks, new_spec, max_inner_cycles, max_parallel, no_review
+            )
+
+            # ── Step 5: Final validation ──
+            logger.info("\n🔍 Step 5: Final validation against full spec...")
+            final = await self._final_validation(new_spec_path, design_iter)
+
+            if final.get("passed"):
+                total_time = time.time() - t0
+                logger.info(f"\n{'='*60}")
+                logger.info(
+                    f"  ✅ Design Pipeline Complete! "
+                    f"(iter {design_iter}, {total_time:.0f}s)"
+                )
+                logger.info(f"{'='*60}")
+                return True
+
+            # ── Recursion: gaps found → convert to new changes → re-chunk ──
+            gap_count = final.get("gap_count", 0)
+            if design_iter >= self.max_design_iterations:
+                logger.warning(
+                    f"[DesignLoop] Max design iterations ({self.max_design_iterations}) "
+                    f"reached with {gap_count} gaps remaining"
+                )
+                break
+
+            logger.info(
+                f"\n🔄 Final validation found {gap_count} gaps — "
+                f"recursing into design iteration {design_iter + 1}..."
+            )
+
+            # Convert remaining gaps into new DesignChanges
+            changes = await self._gaps_to_changes(
+                final.get("issues_detail", []), new_spec
+            )
+            if not changes:
+                logger.warning(
+                    "[DesignLoop] Could not convert gaps to changes, stopping"
+                )
+                break
+
+            # Clear progress for new iteration (old chunks are done)
+            self._clear_progress()
+
+            logger.info(
+                f"[DesignLoop] {len(changes)} new changes from gaps, "
+                f"re-entering chunking..."
+            )
+
+        total_time = time.time() - t0
+        logger.warning(
+            f"[DesignLoop] ⚠️ Design Pipeline finished with remaining gaps. "
+            f"Total time: {total_time:.0f}s"
+        )
+        return False
+
+    async def _execute_chunks(
+        self,
+        chunks: list[DesignChunk],
+        new_spec: str,
+        max_inner_cycles: int,
+        max_parallel: int,
+        no_review: bool,
+    ) -> bool:
+        """Execute all chunks sequentially with drift feedback between chunks."""
         all_success = True
 
         for i, chunk in enumerate(chunks):
@@ -149,13 +227,12 @@ class DesignLoop:
                     "validation": validation,
                 })
 
-                # Adjust remaining chunks if needed
+                # Adjust remaining chunks if design drift detected
                 remaining = [c for c in chunks if c.status == "pending"]
                 if remaining and (validation.get("design_issues") or validation.get("drift_notes")):
-                    chunks_list = await self.refiner.adjust_remaining_chunks(
+                    await self.refiner.adjust_remaining_chunks(
                         chunk, validation, remaining, new_spec
                     )
-                    # Update chunks in place (remaining is already a reference)
             else:
                 chunk.status = "needs_redesign"
                 self._save_progress(chunk.chunk_id, "needs_redesign", result)
@@ -165,29 +242,7 @@ class DesignLoop:
                     f"{result.get('error', 'unknown')}"
                 )
 
-        # ── Step 5: Final validation ──
-        if all_success:
-            logger.info("\n🔍 Step 5: Final validation against full spec...")
-            final = await self._final_validation(new_spec_path)
-            if final.get("passed"):
-                total_time = time.time() - t0
-                logger.info(f"\n{'='*60}")
-                logger.info(f"  ✅ Design Pipeline Complete! ({total_time:.0f}s)")
-                logger.info(f"{'='*60}")
-                return True
-            else:
-                logger.warning(
-                    f"[DesignLoop] Final validation found {final.get('gap_count', '?')} gaps"
-                )
-                return False
-
-        total_time = time.time() - t0
-        logger.warning(
-            f"[DesignLoop] ⚠️ Design Pipeline incomplete. "
-            f"{sum(1 for c in chunks if c.status == 'completed')}/{len(chunks)} chunks done. "
-            f"Total time: {total_time:.0f}s"
-        )
-        return False
+        return all_success
 
     async def _run_chunk(
         self,
@@ -359,18 +414,23 @@ class DesignLoop:
 
         return {"design_issues": [], "drift_notes": ""}
 
-    async def _final_validation(self, new_spec_path: str) -> dict:
+    async def _final_validation(
+        self, new_spec_path: str, design_iter: int = 1
+    ) -> dict:
         """
         After all chunks done, run full verify against original v2.0 spec.
         Catches any gaps that fell through chunk boundaries.
+        Returns issues_detail for recursion into new design iteration.
         """
         from .verifier import Verifier
 
         verifier = Verifier(self.repo_dir, self.config)
-        report = await verifier.run(cycle=999, spec_path=new_spec_path)
+        report = await verifier.run(cycle=900 + design_iter, spec_path=new_spec_path)
 
         # Save final report
-        report_path = os.path.join(self.mesh_dir, "design-final-report.json")
+        report_path = os.path.join(
+            self.mesh_dir, f"design-final-report-iter{design_iter}.json"
+        )
         with open(report_path, 'w') as f:
             json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
 
@@ -381,7 +441,66 @@ class DesignLoop:
             "passed": report.passed,
             "gap_count": report.spec_gap_count,
             "issues": len(report.issues),
+            "issues_detail": [i.to_dict() for i in report.issues],
         }
+
+    async def _gaps_to_changes(
+        self, issues: list[dict], new_spec: str
+    ) -> list[DesignChange]:
+        """
+        Convert final validation gaps into DesignChanges for the next
+        design iteration. Uses Opus to understand what each gap means
+        and produce actionable changes.
+        """
+        if not issues:
+            return []
+
+        issues_text = json.dumps(issues[:30], indent=2, ensure_ascii=False)
+        code_tree = await self.analyzer._get_code_tree(self.repo_dir)
+
+        prompt = f"""You are a senior software architect. The implementation has gaps compared to the spec.
+Convert these gaps into actionable design changes.
+
+## Output Format
+Respond ONLY with a JSON array. No other text.
+Each change object:
+{{
+  "change_id": "fix-gap-kebab-case-id",
+  "change_type": "NEW_API" | "ALTER_SCHEMA" | "MODIFY_BEHAVIOR" | "NEW_FRONTEND" | "NEW_MODULE",
+  "module": "affected module",
+  "title": "what needs to be done",
+  "description": "detailed description",
+  "dependencies": [],
+  "affected_tables": [],
+  "affected_endpoints": [],
+  "estimated_complexity": "L" | "S" | "M" | "H",
+  "spec_section": "relevant spec excerpt"
+}}
+
+## GAPS FOUND
+{issues_text}
+
+## SPEC (target)
+{new_spec[:20000]}
+
+## CURRENT CODEBASE
+{code_tree[:30000]}
+"""
+        raw = await self.analyzer._call_claude(prompt, self.repo_dir)
+        changes = self.analyzer._parse_changes(raw)
+        logger.info(
+            f"[DesignLoop] Converted {len(issues)} gaps → {len(changes)} new changes"
+        )
+        return changes
+
+    def _clear_progress(self):
+        """Clear progress file for a fresh design iteration."""
+        progress_path = os.path.join(self.mesh_dir, "design-progress.json")
+        if os.path.exists(progress_path):
+            os.rename(
+                progress_path,
+                progress_path.replace(".json", f"-{int(time.time())}.json"),
+            )
 
     def _save_progress(self, chunk_id: str, status: str, result: dict):
         """Save to .agent-mesh/design-progress.json for resume."""
