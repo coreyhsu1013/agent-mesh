@@ -77,23 +77,32 @@ class DesignLoop:
         logger.info(f"  Max design iterations: {self.max_design_iterations}")
         logger.info(f"{'='*60}")
 
-        # ── Step 1: Analyze delta ──
-        logger.info("\n📊 Step 1: Analyzing spec delta...")
-        changes = await self.analyzer.analyze_delta(old_spec, new_spec, self.repo_dir)
-
-        if not changes:
-            logger.info("[DesignLoop] No changes detected between specs")
-            return True
-
-        # Save changes
+        # ── Step 1: Analyze delta (cached if design-changes.json exists) ──
         changes_path = os.path.join(self.mesh_dir, "design-changes.json")
-        with open(changes_path, 'w') as f:
-            json.dump([c.to_dict() for c in changes], f, indent=2, ensure_ascii=False)
-        logger.info(f"[DesignLoop] {len(changes)} changes → {changes_path}")
+        if os.path.exists(changes_path):
+            logger.info(f"\n📊 Step 1: Loading cached delta → {changes_path}")
+            with open(changes_path) as f:
+                changes = [DesignChange.from_dict(c) for c in json.load(f)]
+            logger.info(f"[DesignLoop] Loaded {len(changes)} cached changes")
+        else:
+            logger.info("\n📊 Step 1: Analyzing spec delta...")
+            changes = await self.analyzer.analyze_delta(old_spec, new_spec, self.repo_dir)
 
-        # ── Step 2: Feasibility review ──
-        logger.info("\n🔍 Step 2: Reviewing feasibility...")
-        changes = await self.analyzer.review_feasibility(changes, self.repo_dir)
+            if not changes:
+                logger.info("[DesignLoop] No changes detected between specs")
+                return True
+
+            with open(changes_path, 'w') as f:
+                json.dump([c.to_dict() for c in changes], f, indent=2, ensure_ascii=False)
+            logger.info(f"[DesignLoop] {len(changes)} changes → {changes_path}")
+
+            # ── Step 2: Feasibility review ──
+            logger.info("\n🔍 Step 2: Reviewing feasibility...")
+            changes = await self.analyzer.review_feasibility(changes, self.repo_dir)
+
+            # Save reviewed changes back
+            with open(changes_path, 'w') as f:
+                json.dump([c.to_dict() for c in changes], f, indent=2, ensure_ascii=False)
 
         blocked = [c for c in changes if c.feasibility_notes.startswith("⚠️ BLOCKED")]
         if blocked:
