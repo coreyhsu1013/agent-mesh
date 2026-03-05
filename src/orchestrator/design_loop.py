@@ -238,6 +238,20 @@ class DesignLoop:
         """Execute all chunks sequentially with drift feedback between chunks."""
         all_success = True
 
+        # Clean progress: remove entries not in current chunk list
+        current_ids = {c.chunk_id for c in chunks}
+        progress = self._load_progress()
+        stale = [k for k in progress if k not in current_ids]
+        if stale:
+            for k in stale:
+                del progress[k]
+            progress_path = os.path.join(self.mesh_dir, "design-progress.json")
+            with open(progress_path, 'w') as f:
+                json.dump(progress, f, indent=2, ensure_ascii=False)
+            logger.info(
+                f"[DesignLoop] Cleaned {len(stale)} stale progress entries: {stale}"
+            )
+
         for i, chunk in enumerate(chunks):
             logger.info(f"\n{'─'*50}")
             logger.info(
