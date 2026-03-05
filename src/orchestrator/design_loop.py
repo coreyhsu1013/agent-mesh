@@ -307,6 +307,7 @@ class DesignLoop:
         from ..context.store import ContextStore
         from ..models.task import TaskPlan
         from .planner import Planner
+        from .change_converter import convert_changes_to_plan
         from .dispatcher import Dispatcher
         from .project_loop import ProjectLoop
 
@@ -327,25 +328,33 @@ class DesignLoop:
             f.write(spec_with_context)
         logger.info(f"[DesignLoop] Wrote partial spec: {spec_path}")
 
-        # Plan from partial spec (cached if plan.json exists)
+        # Convert changes directly to tasks (cached if plan.json exists)
         plan_path = os.path.join(self.mesh_dir, f"{chunk.chunk_id}-plan.json")
         if os.path.exists(plan_path):
             logger.info(f"[DesignLoop] Loading cached plan → {plan_path}")
             plan = Planner.load_plan(plan_path)
         else:
-            logger.info(f"[DesignLoop] Planning from partial spec...")
-            planner = Planner(self.config, self.repo_dir)
-            try:
-                plan = await planner.plan(spec_path)
-            except Exception as e:
-                logger.error(f"[DesignLoop] Planning failed for {chunk.chunk_id}: {e}")
-                return {"success": False, "error": f"Planning failed: {e}"}
+            logger.info(
+                f"[DesignLoop] Converting {len(chunk.changes)} changes → tasks..."
+            )
+            project_name = os.path.basename(self.repo_dir)
+            plan_dict = convert_changes_to_plan(
+                changes=chunk.changes,
+                project_name=project_name,
+                shared_context={"chunk": chunk.chunk_id, "title": chunk.title},
+                chunk_title=chunk.title,
+            )
 
-            if plan is None or not plan.tasks:
-                logger.warning(f"[DesignLoop] Empty plan for {chunk.chunk_id}")
-                return {"success": False, "error": "Empty plan generated"}
+            if not plan_dict.get("tasks"):
+                logger.warning(f"[DesignLoop] No tasks for {chunk.chunk_id}")
+                return {"success": False, "error": "No tasks from changes"}
 
-            Planner.save_plan(plan, plan_path)
+            plan = TaskPlan.from_dict(plan_dict)
+
+            # Save as plan.json for resume
+            with open(plan_path, 'w') as f:
+                json.dump(plan_dict, f, indent=2, ensure_ascii=False)
+            logger.info(f"[DesignLoop] Saved plan → {plan_path}")
         logger.info(
             f"[DesignLoop] Plan: {len(plan.tasks)} tasks → {plan_path}"
         )

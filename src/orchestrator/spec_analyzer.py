@@ -20,18 +20,20 @@ logger = logging.getLogger("agent-mesh")
 
 @dataclass
 class DesignChange:
-    """A single change identified in spec delta."""
-    change_id: str                          # e.g. "new-module-contract"
+    """A single implementation-level task identified in spec delta."""
+    change_id: str                          # e.g. "create-user-entity"
     change_type: str                        # NEW_MODULE | ALTER_SCHEMA | NEW_API | MODIFY_BEHAVIOR | NEW_FRONTEND
     module: str                             # affected module name
-    title: str                              # human-readable
-    description: str                        # detailed change description
+    title: str                              # concise task title
+    description: str                        # detailed implementation instructions
     dependencies: list[str] = field(default_factory=list)    # other change_ids this depends on
     affected_tables: list[str] = field(default_factory=list)
     affected_endpoints: list[str] = field(default_factory=list)
     estimated_complexity: str = "M"         # L/S/M/H
     spec_section: str = ""                  # relevant spec section text
     feasibility_notes: str = ""             # filled by review_feasibility
+    target_files: list[str] = field(default_factory=list)    # suggested file paths
+    category: str = ""                      # backend | frontend | fullstack
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +48,8 @@ class DesignChange:
             "estimated_complexity": self.estimated_complexity,
             "spec_section": self.spec_section,
             "feasibility_notes": self.feasibility_notes,
+            "target_files": self.target_files,
+            "category": self.category,
         }
 
     @staticmethod
@@ -62,6 +66,8 @@ class DesignChange:
             estimated_complexity=d.get("estimated_complexity", "M"),
             spec_section=d.get("spec_section", ""),
             feasibility_notes=d.get("feasibility_notes", ""),
+            target_files=d.get("target_files", []),
+            category=d.get("category", ""),
         )
 
 
@@ -108,40 +114,56 @@ class SpecAnalyzer:
         return reviewed
 
     def _build_delta_prompt(self, old_spec: str, new_spec: str, code_tree: str) -> str:
-        return f"""You are a senior software architect analyzing spec changes.
+        return f"""You are a senior software architect planning implementation tasks.
 
 ## Task
-Compare the OLD spec (v1) against the NEW spec (v2) and identify ALL changes.
-Also consider the current codebase state to understand what already exists.
+Compare the OLD spec (v1) against the NEW spec (v2) and produce a list of
+IMPLEMENTATION TASKS. Each task = one coding unit that an AI agent can complete
+in 5-10 minutes. Also consider the current codebase to understand what exists.
+
+## Granularity Rules (CRITICAL)
+- Do NOT produce high-level changes like "Add auth module" — too vague for a coding agent.
+- Break down into concrete implementation tasks:
+  ✅ "Create User and Session database entities"
+  ✅ "Create auth service (login, register, verify)"
+  ✅ "Create auth API routes (/login, /register, /me)"
+  ✅ "Create JWT auth middleware"
+  ❌ "Implement authentication system" — too big
+- Each task = 1 file or small group of closely related files
+- Schema/entity changes MUST be separate tasks from service/route logic
+- Frontend pages should be separate from their API dependencies
+- Config/scaffolding tasks should be separate from business logic
 
 ## Output Format
 Respond ONLY with a JSON array. No other text.
-Each change object:
+Each task object:
 {{
-  "change_id": "kebab-case-id",
+  "change_id": "kebab-case-task-id",
   "change_type": "NEW_MODULE" | "ALTER_SCHEMA" | "NEW_API" | "MODIFY_BEHAVIOR" | "NEW_FRONTEND",
   "module": "affected module name",
-  "title": "human-readable title",
-  "description": "detailed description of what changed",
+  "title": "concise task title (what to build)",
+  "description": "Detailed implementation instructions: what files to create/modify, what functions/classes to implement, what patterns to follow. Be specific enough that a coding agent can execute without reading the full spec.",
   "dependencies": ["other-change-ids-this-depends-on"],
   "affected_tables": ["table names touched"],
   "affected_endpoints": ["API endpoints touched"],
   "estimated_complexity": "L" | "S" | "M" | "H",
-  "spec_section": "brief excerpt of relevant new spec section"
+  "spec_section": "relevant spec excerpt with enough detail to implement this task",
+  "target_files": ["specific file paths to create or modify"],
+  "category": "backend" | "frontend" | "fullstack"
 }}
 
 ## Change Type Guide
-- NEW_MODULE: entirely new module/feature not in old spec
-- ALTER_SCHEMA: database table create/alter/drop
-- NEW_API: new API endpoints
+- ALTER_SCHEMA: database table/entity create/alter/drop
+- NEW_MODULE: new service/module scaffolding
+- NEW_API: new API endpoints (routes + controllers)
 - MODIFY_BEHAVIOR: changed business logic in existing features
 - NEW_FRONTEND: new UI pages/components
 
 ## Complexity Guide
-- L: scaffolding, config, simple CRUD
-- S: simple logic, single file changes
-- M: business rules, auth, multi-file changes
-- H: architecture, security, cross-module integration
+- L: scaffolding, config, boilerplate — does NOT import types/services from other tasks
+- S: simple logic but DOES import types/services/schemas from other tasks
+- M: business rules, auth, validation with edge cases, multi-file changes
+- H: architecture, security, cross-module integration, payment
 
 ## OLD SPEC (v1)
 {old_spec}
