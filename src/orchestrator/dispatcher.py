@@ -33,7 +33,8 @@ class Dispatcher:
 
     def __init__(self, config: dict, repo_dir: str, store: ContextStore,
                  experience_store=None, project_name: str = "",
-                 project_type: str = ""):
+                 project_type: str = "",
+                 target_branch: str = "main"):
         self.config = config
         self.repo_dir = repo_dir
         self.store = store
@@ -41,7 +42,7 @@ class Dispatcher:
         self.router = ModelRouter(config)
         self.react_loop = ReactLoop(config)
         self.reviewer = Reviewer(config, repo_dir)
-        self.pool = WorkspacePool(repo_dir, config)
+        self.pool = WorkspacePool(repo_dir, config, target_branch)
 
         aider = AiderRunner(config)
         self.runners = {

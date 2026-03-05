@@ -315,27 +315,53 @@ class DesignLoop:
                     all_success = False
             else:
                 # Multiple independent chunks — run in parallel
+                # Each chunk works on its own branch to avoid race conditions
                 logger.info(f"\n{'='*50}")
                 logger.info(
                     f"  🚀 Parallel wave {wave_num}: "
-                    f"{len(ready_chunks)} chunks"
+                    f"{len(ready_chunks)} chunks (isolated branches)"
                 )
                 for c in ready_chunks:
                     logger.info(f"    • {c.chunk_id}: {c.title}")
                 logger.info(f"{'='*50}")
 
+                # Create chunk branches from main
+                chunk_branches: dict[str, str] = {}
+                for chunk in ready_chunks:
+                    branch = f"agent-mesh/chunk-{chunk.chunk_id}"
+                    try:
+                        await self._run_git(f"branch -D {branch}")
+                    except Exception:
+                        pass
+                    await self._run_git(
+                        f"branch {branch} main"
+                    )
+                    chunk_branches[chunk.chunk_id] = branch
+
+                # Run chunks in parallel, each on its own branch
                 results = await asyncio.gather(
                     *[
                         self._execute_single_chunk(
                             chunk, chunks, new_spec,
                             max_inner_cycles, max_parallel, no_review,
+                            target_branch=chunk_branches[chunk.chunk_id],
                         )
                         for chunk in ready_chunks
                     ],
                     return_exceptions=True,
                 )
 
+                # Merge successful chunk branches → main (sequential)
+                from .workspace import WorkspacePool
+                pool = WorkspacePool(
+                    self.repo_dir, self.config
+                )
+                build_cmd = self.config.get(
+                    "verify", {}
+                ).get("build_cmd", "")
+
                 for chunk, result in zip(ready_chunks, results):
+                    branch = chunk_branches[chunk.chunk_id]
                     if isinstance(result, Exception):
                         logger.error(
                             f"[DesignLoop] ❌ {chunk.chunk_id} "
@@ -343,9 +369,39 @@ class DesignLoop:
                         )
                         all_success = False
                     elif result:
-                        completed_chunks.add(chunk.chunk_id)
+                        # Merge chunk branch → main
+                        logger.info(
+                            f"[DesignLoop] Merging {branch} → main"
+                        )
+                        ok = await pool._merge_branch(
+                            branch,
+                            f"[agent-mesh] chunk: {chunk.chunk_id}",
+                        )
+                        if ok:
+                            # Build check after chunk merge
+                            build_ok, build_out = \
+                                await pool.run_build_check(build_cmd)
+                            if not build_ok:
+                                logger.warning(
+                                    f"[DesignLoop] Build broke after "
+                                    f"merging {chunk.chunk_id}, "
+                                    f"will be fixed in next cycle"
+                                )
+                            completed_chunks.add(chunk.chunk_id)
+                        else:
+                            logger.error(
+                                f"[DesignLoop] ❌ Merge {branch} "
+                                f"→ main failed"
+                            )
+                            all_success = False
                     else:
                         all_success = False
+
+                    # Cleanup chunk branch
+                    try:
+                        await self._run_git(f"branch -D {branch}")
+                    except Exception:
+                        pass
 
                 # Drift adjustment after parallel wave
                 remaining = [c for c in chunks if c.status == "pending"]
@@ -371,13 +427,15 @@ class DesignLoop:
         max_inner_cycles: int,
         max_parallel: int,
         no_review: bool,
+        target_branch: str = "main",
     ) -> bool:
         """Execute one chunk and handle progress/validation."""
         chunk.status = "in_progress"
         self._save_progress(chunk.chunk_id, "in_progress", {})
 
         result = await self._run_chunk(
-            chunk, max_inner_cycles, max_parallel, no_review
+            chunk, max_inner_cycles, max_parallel, no_review,
+            target_branch=target_branch,
         )
 
         validation = await self._validate_chunk(chunk, result)
@@ -416,6 +474,7 @@ class DesignLoop:
         max_inner_cycles: int,
         max_parallel: int,
         no_review: bool,
+        target_branch: str = "main",
     ) -> dict:
         """
         Execute one chunk through the Implementation Pipeline.
@@ -522,6 +581,7 @@ class DesignLoop:
                     experience_store=exp_store,
                     project_name=project_name,
                     project_type=project_type,
+                    target_branch=target_branch,
                 )
                 if advisor:
                     self_.dispatcher.router.advisor = advisor
@@ -929,3 +989,18 @@ Each change object:
             except Exception:
                 return {}
         return {}
+
+    async def _run_git(self, cmd: str):
+        """Run a git command in the repo directory."""
+        proc = await asyncio.create_subprocess_shell(
+            f"git {cmd}",
+            cwd=self.repo_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = stderr.decode().strip() or stdout.decode().strip()
+            raise RuntimeError(f"git {cmd}: {err}")
+        return stdout.decode().strip()

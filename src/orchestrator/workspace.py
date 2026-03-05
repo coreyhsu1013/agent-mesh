@@ -33,9 +33,11 @@ class WorkspacePool:
     每個 Wave 建立固定數量 worker slots，task 依序填入；Wave 結束統一 merge。
     """
 
-    def __init__(self, repo_dir: str, config: dict):
+    def __init__(self, repo_dir: str, config: dict,
+                 target_branch: str = "main"):
         self.repo_dir = os.path.abspath(repo_dir)
         self.config = config
+        self.target_branch = target_branch  # v1.2: configurable merge target
         self.workspace_base = os.path.join(self.repo_dir, WORKSPACE_DIR)
         os.makedirs(self.workspace_base, exist_ok=True)
         self._active_slots: dict[int, str] = {}   # slot_id → ws_dir
@@ -84,7 +86,9 @@ class WorkspacePool:
             pass
 
         # Create fresh branch from main and checkout
-        await self._run_git(f"checkout -b {branch_name} main", cwd=ws_dir)
+        await self._run_git(
+            f"checkout -b {branch_name} {self.target_branch}", cwd=ws_dir
+        )
         self._task_branches.append(branch_name)
 
         # Remove untracked files from previous task
@@ -292,7 +296,9 @@ class WorkspacePool:
             pass
 
         # Create fresh worktree from main
-        await self._run_git(f"worktree add {ws_dir} -b {branch_name} main")
+        await self._run_git(
+            f"worktree add {ws_dir} -b {branch_name} {self.target_branch}"
+        )
 
         # Clear any index.lock
         lock_file = os.path.join(ws_dir, ".git", "index.lock")
@@ -350,10 +356,14 @@ class WorkspacePool:
 
     async def _ensure_base_branch(self):
         try:
-            await self._run_git("rev-parse --verify main")
+            await self._run_git(
+                f"rev-parse --verify {self.target_branch}"
+            )
         except Exception:
             try:
-                await self._run_git("checkout -b main")
+                await self._run_git(
+                    f"checkout -b {self.target_branch}"
+                )
             except Exception:
                 pass
 
