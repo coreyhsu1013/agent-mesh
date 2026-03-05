@@ -96,7 +96,7 @@ heartbeat:
 
 # ── ReAct Loop ──
 react:
-  max_attempts: 3
+  max_attempts: 5
   run_tests: true
   run_build: true
   run_lint: false
