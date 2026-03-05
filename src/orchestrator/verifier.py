@@ -1,15 +1,16 @@
 """
-Agent Mesh v0.7 — Verifier
+Agent Mesh v1.2 — Verifier
 Runs mechanical checks (conflict scan, build, test, lint) and
-LLM-powered spec diff (Gemini + Opus dual verification).
+LLM-powered spec diff (single model, configurable).
 
 Verify steps (ordered by cost):
   1. Conflict markers scan        — 0 tokens, instant
   2. Build (tsc / hardhat compile) — 0 tokens, seconds
   3. Lint                          — 0 tokens, seconds
   4. Test                          — 0 tokens, seconds
-  5. Spec diff (Gemini + Opus)     — $$ tokens, minutes
-  6. AC checklist (Gemini + Opus)  — $$ tokens, minutes
+  5. Spec diff (single model)     — $$ tokens, minutes
+
+v1.2: Single model verify (was dual Gemini+Opus), code tree cache, spec cache.
 """
 from __future__ import annotations
 
@@ -113,6 +114,11 @@ class Verifier:
         self.lint_cmd = verify_cfg.get("lint_cmd", "pnpm lint")
         self.skip_lint = verify_cfg.get("skip_lint", True)  # many projects don't have lint
         self.skip_test = verify_cfg.get("skip_test", False)
+
+        # v1.2: Caches (avoid redundant I/O and LLM calls within a cycle)
+        self._code_tree_cache: str | None = None
+        self._code_tree_ts: float = 0
+        self._spec_cache: dict[str, str] = {}  # path → content
 
     async def run(self, cycle: int = 1, spec_path: str | None = None) -> VerifyReport:
         """Run all verification steps and return report."""
@@ -339,12 +345,8 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
         verify_cfg = self.config.get("verify", {})
         model = verify_cfg.get("scan_model", "claude-opus-4-6")
 
-        # Read spec
-        try:
-            with open(spec_path, 'r') as f:
-                spec_content = f.read()
-        except Exception as e:
-            logger.warning(f"[Verifier] Cannot read spec for bounded scan: {e}")
+        spec_content = self._read_spec(spec_path)
+        if not spec_content:
             return []
 
         exclude_str = ", ".join(exclude_modules) if exclude_modules else "none"
@@ -449,15 +451,9 @@ If no new gaps, return: []
         model = layer3_cfg.get("model", "claude-opus-4-6")
         max_items = layer3_cfg.get("max_feedback_items", 3)
 
-        # Read spec
-        spec_content = ""
-        if spec_path:
-            try:
-                with open(spec_path, 'r') as f:
-                    spec_content = f.read()
-            except Exception as e:
-                logger.warning(f"[Layer3] Cannot read spec: {e}")
-                return []
+        spec_content = self._read_spec(spec_path) if spec_path else ""
+        if not spec_content:
+            return []
 
         # Build stuck gaps section
         gap_lines = []
@@ -578,14 +574,7 @@ Each item:
         layer4_cfg = self.config.get("layer4", {})
         model = layer4_cfg.get("model", "claude-sonnet-4-6")
 
-        # Read spec
-        spec_content = ""
-        if spec_path:
-            try:
-                with open(spec_path, 'r') as f:
-                    spec_content = f.read()
-            except Exception:
-                pass
+        spec_content = self._read_spec(spec_path) if spec_path else ""
 
         prompt = f"""You are checking CROSS-MODULE INTEGRATION issues.
 Focus on connections BETWEEN modules, not within a single module.
@@ -763,43 +752,43 @@ If no integration issues, return: []
     async def _spec_diff(self, spec_path: str) -> list[VerifyIssue]:
         """
         LLM-powered spec diff: compare spec vs actual code.
-        Uses dual-model verification (Gemini + Opus) for thorough coverage.
-        Returns list of spec gap issues.
+        v1.2: Single model (was dual Gemini+Opus). Configurable via scan_model.
         """
-        # Read spec
-        try:
-            with open(spec_path, 'r') as f:
-                spec_content = f.read()
-        except Exception as e:
-            logger.warning(f"[Verifier] Cannot read spec: {e}")
+        spec_content = self._read_spec(spec_path)
+        if not spec_content:
             return []
 
-        # Get code tree summary
         code_tree = await self._get_code_tree()
-
-        # Build prompt
         prompt = self._build_spec_diff_prompt(spec_content, code_tree)
 
-        # Run dual model verification in parallel
-        gemini_task = self._run_gemini_verify(prompt)
-        opus_task = self._run_opus_verify(prompt)
+        verify_cfg = self.config.get("verify", {})
+        model = verify_cfg.get("scan_model", "claude-opus-4-6")
+        return await self._run_claude_verify(prompt, model)
 
-        gemini_issues, opus_issues = await asyncio.gather(
-            gemini_task, opus_task, return_exceptions=True
-        )
-
-        # Handle errors
-        if isinstance(gemini_issues, Exception):
-            logger.warning(f"[Verifier] Gemini verify failed: {gemini_issues}")
-            gemini_issues = []
-        if isinstance(opus_issues, Exception):
-            logger.warning(f"[Verifier] Opus verify failed: {opus_issues}")
-            opus_issues = []
-
-        # Merge: union of all gaps
-        return self._merge_gap_reports(gemini_issues, opus_issues)
+    def _read_spec(self, spec_path: str) -> str:
+        """Read spec file with instance cache (avoids re-reading within a cycle)."""
+        if spec_path in self._spec_cache:
+            return self._spec_cache[spec_path]
+        try:
+            with open(spec_path, 'r') as f:
+                content = f.read()
+            self._spec_cache[spec_path] = content
+            return content
+        except Exception as e:
+            logger.warning(f"[Verifier] Cannot read spec: {e}")
+            return ""
 
     async def _get_code_tree(self) -> str:
+        """Get a summary of the code tree (cached for 300s within a cycle)."""
+        if self._code_tree_cache and (time.time() - self._code_tree_ts) < 300:
+            return self._code_tree_cache
+
+        result = await self._get_code_tree_uncached()
+        self._code_tree_cache = result
+        self._code_tree_ts = time.time()
+        return result
+
+    async def _get_code_tree_uncached(self) -> str:
         """Get a summary of the code tree (file listing + key file contents)."""
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -867,33 +856,17 @@ If everything is implemented correctly, return an empty array: []
 {code_tree}
 """
 
-    async def _run_gemini_verify(self, prompt: str) -> list[VerifyIssue]:
-        """Run spec diff with Gemini CLI."""
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                f'echo {_shell_escape(prompt)} | gemini -p',
-                cwd=self.repo_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=600
-            )
-            return self._parse_gap_json(stdout.decode(), source="gemini")
-        except Exception as e:
-            logger.warning(f"[Verifier] Gemini spec diff failed: {e}")
-            return []
-
-    async def _run_opus_verify(self, prompt: str) -> list[VerifyIssue]:
-        """Run spec diff with Claude Opus CLI."""
+    async def _run_claude_verify(self, prompt: str, model: str = "claude-opus-4-6") -> list[VerifyIssue]:
+        """Run spec diff with Claude CLI (configurable model). v1.2: replaces dual Gemini+Opus."""
         import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
             f.write(prompt)
             prompt_file = f.name
 
+        source = model.split("-")[1] if "-" in model else model
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model claude-opus-4-6 --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {model} --output-format text',
                 cwd=self.repo_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -901,9 +874,9 @@ If everything is implemented correctly, return an empty array: []
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=900
             )
-            return self._parse_gap_json(stdout.decode(), source="opus")
+            return self._parse_gap_json(stdout.decode(), source=source)
         except Exception as e:
-            logger.warning(f"[Verifier] Opus spec diff failed: {e}")
+            logger.warning(f"[Verifier] Claude verify failed ({model}): {e}")
             return []
         finally:
             try:
@@ -951,32 +924,8 @@ If everything is implemented correctly, return an empty array: []
             ))
         return issues
 
-    def _merge_gap_reports(
-        self,
-        gemini_issues: list[VerifyIssue],
-        opus_issues: list[VerifyIssue],
-    ) -> list[VerifyIssue]:
-        """Merge gap reports: union of all gaps, mark duplicates found by both."""
-        merged: dict[str, VerifyIssue] = {}
-
-        for issue in gemini_issues:
-            key = (issue.module or "") + "|" + issue.message
-            merged[key] = issue
-
-        for issue in opus_issues:
-            key = (issue.module or "") + "|" + issue.message
-            if key in merged:
-                # Both found it — high confidence
-                merged[key].found_by = ["gemini", "opus"]
-                # Upgrade severity if both found it
-                if merged[key].severity == "MEDIUM":
-                    merged[key].severity = "HIGH"
-            else:
-                merged[key] = issue
-
-        return list(merged.values())
-
-
-def _shell_escape(s: str) -> str:
-    """Escape string for shell use."""
-    return "'" + s.replace("'", "'\\''") + "'"
+    def invalidate_caches(self):
+        """Clear all caches (call between cycles if needed)."""
+        self._code_tree_cache = None
+        self._code_tree_ts = 0
+        self._spec_cache.clear()

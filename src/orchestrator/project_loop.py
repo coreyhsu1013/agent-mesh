@@ -53,6 +53,8 @@ class ProjectLoop:
         self.gap_analyzer = GapAnalyzer(config)
         self.escalation = OuterLoopEscalation(config)
         self.cycle_history: list[dict] = []
+        # v1.2: Layer 3 per-gap cache (avoid re-analyzing same gap)
+        self._spec_feedback_cache: dict[str, str] = {}  # gap_key → root_cause
 
     async def verify(self, cycle: int = 1) -> VerifyReport:
         """Run verification only."""
@@ -148,20 +150,39 @@ class ProjectLoop:
         else:
             logger.info("[ClosedLoop] Skipping new gap scan — build failed")
 
-        # Step 2.5: Layer 3 — Spec feedback for stuck gaps
+        # Step 2.5: Layer 3 — Spec feedback for stuck gaps (v1.2: per-gap cache)
         layer3_cfg = self.config.get("layer3", {})
         if layer3_cfg.get("enabled", False) and remaining_gaps:
             stuck_threshold = layer3_cfg.get("stuck_threshold", 2)
             stuck_gaps = self._find_stuck_gaps(remaining_gaps, stuck_threshold)
 
-            if stuck_gaps:
+            # v1.2: filter out gaps already analyzed as CODE_BUG (won't help)
+            uncached_stuck = [
+                g for g in stuck_gaps
+                if self._gap_key(g) not in self._spec_feedback_cache
+            ]
+            cached_count = len(stuck_gaps) - len(uncached_stuck)
+            if cached_count > 0:
                 logger.info(
-                    f"[Layer3] {len(stuck_gaps)} gaps stuck for >= {stuck_threshold} cycles, "
+                    f"[Layer3] {cached_count} stuck gaps already analyzed (cached), "
+                    f"{len(uncached_stuck)} new to analyze"
+                )
+
+            if uncached_stuck:
+                logger.info(
+                    f"[Layer3] {len(uncached_stuck)} gaps stuck for >= {stuck_threshold} cycles, "
                     f"analyzing root cause..."
                 )
                 feedback_issues = await self.verifier.run_spec_feedback(
-                    stuck_gaps, self.spec_path, code_tree
+                    uncached_stuck, self.spec_path, code_tree
                 )
+                # Cache results: gaps not in feedback_issues are CODE_BUG
+                for g in uncached_stuck:
+                    self._spec_feedback_cache[self._gap_key(g)] = "CODE_BUG"
+                for issue in feedback_issues:
+                    # Spec issues get different cache status
+                    key = (issue.module or "").lower() + "|" + issue.message.lower()
+                    self._spec_feedback_cache[key] = issue.category
                 spec_questions = []
                 for issue in feedback_issues:
                     if issue.category == "spec_question":
@@ -248,6 +269,11 @@ class ProjectLoop:
             f"[ClosedLoop] Fix-plan generated: {len(plan['tasks'])} tasks → {plan_path}"
         )
         return report, plan
+
+    @staticmethod
+    def _gap_key(gap: dict) -> str:
+        """Stable key for gap dedup and caching."""
+        return (gap.get("module") or "").lower() + "|" + (gap.get("message") or "").lower()
 
     def _find_stuck_gaps(self, remaining_gaps: list[dict], threshold: int) -> list[dict]:
         """Find gaps that persisted for >= threshold consecutive cycles."""
@@ -362,16 +388,20 @@ class ProjectLoop:
         initial_plan_path: str | None = None,
         max_parallel: int = 3,
         no_review: bool = True,
+        skip_initial_verify: bool = False,
     ):
         """
         Auto mode: run cycles until convergence or max_cycles.
-        
+
         Args:
             max_cycles: Maximum number of cycles before giving up
             dispatcher_factory: Callable that creates a Dispatcher for execution
             initial_plan_path: Path to initial plan.json (cycle 1)
             max_parallel: Max parallel workers
             no_review: Skip manual review
+            skip_initial_verify: v1.2 — skip full verify on cycle 1 when plan
+                is pre-generated (e.g. from design pipeline). Uses closed-loop
+                bounded scan instead of expensive open-ended spec diff.
         """
         t0 = time.time()
 
@@ -415,12 +445,16 @@ class ProjectLoop:
                 logger.info("[ProjectLoop] ⏭ No dispatcher — verify only mode")
 
             # ── OBSERVE: Verify the result ──
-            # Cycle 1: full open-ended scan (baseline)
-            # Cycle 2+: closed-loop (regression + bounded scan)
-            if cycle >= 2:
+            # v1.2: skip_initial_verify → use closed-loop even for cycle 1
+            # (saves ~1 expensive open-ended LLM scan when plan is pre-generated)
+            # Cycle 2+: always closed-loop (regression + bounded scan)
+            if cycle >= 2 or (cycle == 1 and skip_initial_verify):
                 report, plan = await self.verify_closed_loop(cycle)
             else:
                 report, plan = await self.verify_and_plan(cycle)
+
+            # v1.2: invalidate verifier caches between cycles
+            self.verifier.invalidate_caches()
 
             # Record cycle
             gap_count = len([

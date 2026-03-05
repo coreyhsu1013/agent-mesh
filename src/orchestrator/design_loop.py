@@ -605,6 +605,7 @@ class DesignLoop:
                 initial_plan_path=plan_path,
                 max_parallel=max_parallel,
                 no_review=no_review,
+                skip_initial_verify=True,  # v1.2: plan from design → skip full verify
             )
         except Exception as e:
             logger.error(f"[DesignLoop] Execution error for {chunk.chunk_id}: {e}")

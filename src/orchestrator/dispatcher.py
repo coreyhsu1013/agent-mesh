@@ -558,6 +558,7 @@ class Dispatcher:
         SONNET_ATTEMPTS = 2
         BASE_TIMEOUT = 300
         total_fix_cost = 0.0
+        prev_error_sig = ""  # v1.2: track for no-progress early exit
 
         # ── Context strings (stable across attempts) ──
         files_ctx = ""
@@ -687,7 +688,22 @@ class Dispatcher:
                 )
                 return True
 
-            # ── EVALUATE: still failing, loop with updated error ──
+            # ── EVALUATE: still failing, check for progress ──
+            # v1.2: extract error signature for no-progress detection
+            error_lines = sorted(set(
+                line.strip() for line in build_output.split('\n')
+                if any(kw in line.lower() for kw in ['error', 'cannot find', 'failed'])
+            ))
+            error_sig = "\n".join(error_lines[:20])
+
+            if attempt >= 3 and error_sig == prev_error_sig:
+                logger.warning(
+                    f"[BuildFix] No progress: same errors after attempt "
+                    f"{attempt}, stopping early"
+                )
+                break
+            prev_error_sig = error_sig
+
             logger.warning(
                 f"[BuildFix] Attempt {attempt} failed [{model_label}], "
                 f"continuing..."
