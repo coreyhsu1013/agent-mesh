@@ -143,6 +143,37 @@ class DesignLoop:
                 chunks, new_spec, max_inner_cycles, max_parallel, no_review
             )
 
+            # ── Step 4.5: Residual gap sweep ──
+            residual_gaps = await self._collect_residual_gaps()
+            if residual_gaps:
+                logger.info(
+                    f"\n🧹 Step 4.5: Sweeping {len(residual_gaps)} residual gaps..."
+                )
+                real_gaps = await self._filter_false_positives(residual_gaps, new_spec)
+                filtered_count = len(residual_gaps) - len(real_gaps)
+                logger.info(
+                    f"[DesignLoop] {len(real_gaps)} real gaps "
+                    f"(filtered {filtered_count} false positives)"
+                )
+
+                if real_gaps:
+                    fix_result = await self._run_residual_fix(
+                        real_gaps, new_spec_path, max_parallel, no_review
+                    )
+                    remaining = fix_result.get("remaining", [])
+                    if remaining:
+                        remaining_path = os.path.join(
+                            self.mesh_dir, "remaining-gaps.json"
+                        )
+                        with open(remaining_path, 'w') as f:
+                            json.dump(
+                                remaining, f, indent=2, ensure_ascii=False
+                            )
+                        logger.info(
+                            f"[DesignLoop] ⚠️ {len(remaining)} gaps "
+                            f"couldn't be fixed → {remaining_path}"
+                        )
+
             # ── Step 5: Final validation ──
             logger.info("\n🔍 Step 5: Final validation against full spec...")
             final = await self._final_validation(new_spec_path, design_iter)
@@ -396,6 +427,13 @@ class DesignLoop:
                 exp_store.add_project_cost(project_name, total_cost)
             exp_store.close()
 
+        # Collect gap details from last cycle
+        final_issues = []
+        if loop.cycle_history:
+            last_report = loop.cycle_history[-1].get("report")
+            if last_report and hasattr(last_report, "issues"):
+                final_issues = [i.to_dict() for i in last_report.issues]
+
         return {
             "success": success,
             "tasks": len(plan.tasks) if plan else 0,
@@ -405,6 +443,7 @@ class DesignLoop:
                 loop.cycle_history[-1].get("gap_count", 0)
                 if loop.cycle_history else 0
             ),
+            "final_issues": final_issues,
         }
 
     async def _validate_chunk(
@@ -441,6 +480,214 @@ class DesignLoop:
             }
 
         return {"design_issues": [], "drift_notes": ""}
+
+    async def _collect_residual_gaps(self) -> list[dict]:
+        """Collect all remaining gaps from completed chunks."""
+        progress = self._load_progress()
+        all_issues = []
+        for chunk_id, info in progress.items():
+            if info.get("status") in ("completed", "needs_redesign"):
+                issues = info.get("result", {}).get("final_issues", [])
+                for issue in issues:
+                    issue = dict(issue)  # copy to avoid mutation
+                    issue["source_chunk"] = chunk_id
+                    all_issues.append(issue)
+        return all_issues
+
+    async def _filter_false_positives(
+        self, issues: list[dict], spec_content: str
+    ) -> list[dict]:
+        """Use LLM to quickly filter out false positive gaps.
+
+        False positives happen when:
+        - Verifier can't see actual implementation (file path mismatch)
+        - Spec wording is vague, code implements it differently
+        - Build passes but spec_gap scanner is too strict
+        """
+        if not issues:
+            return []
+
+        from .spec_analyzer import get_code_tree
+
+        code_tree = await get_code_tree(self.repo_dir, char_limit=40_000)
+        issues_json = json.dumps(issues[:50], indent=2, ensure_ascii=False)
+
+        prompt = f"""You are a senior QA engineer reviewing spec gap reports.
+Some of these gaps may be FALSE POSITIVES — the code actually implements the feature
+but the automated scanner missed it (different file path, different naming, etc).
+
+## Task
+For each gap below, check the codebase and determine:
+- TRUE: the gap is real, the feature is genuinely missing or broken
+- FALSE: the feature exists in code, the scanner was wrong
+
+## Output Format
+Respond ONLY with a JSON array. No other text.
+Each object:
+{{
+  "index": 0,
+  "verdict": "TRUE" | "FALSE",
+  "reason": "brief explanation"
+}}
+
+## GAPS TO CHECK
+{issues_json}
+
+## CODEBASE
+{code_tree}
+"""
+        design_cfg = self.config.get("design", {})
+        model = design_cfg.get("refiner_model", "claude-sonnet-4-6")
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions '
+                f'--model {model} --output-format text',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=600)
+            raw = stdout.decode().strip()
+        except Exception as e:
+            logger.warning(f"[DesignLoop] False positive filter failed: {e}, keeping all gaps")
+            return issues
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except Exception:
+                pass
+
+        # Parse verdicts
+        from .spec_analyzer import _parse_json_array
+        verdicts = _parse_json_array(raw)
+        verdict_map = {}
+        for v in verdicts:
+            if isinstance(v, dict) and "index" in v:
+                verdict_map[v["index"]] = v.get("verdict", "TRUE")
+
+        real_gaps = []
+        for i, issue in enumerate(issues):
+            verdict = verdict_map.get(i, "TRUE")
+            if verdict == "TRUE":
+                real_gaps.append(issue)
+            else:
+                logger.debug(
+                    f"[DesignLoop] Filtered false positive: {issue.get('message', '')[:80]}"
+                )
+
+        return real_gaps
+
+    async def _run_residual_fix(
+        self,
+        issues: list[dict],
+        spec_path: str,
+        max_parallel: int,
+        no_review: bool,
+    ) -> dict:
+        """Run a single fix pass on all residual gaps from all chunks.
+
+        Returns: { "fixed": int, "remaining": list[dict] }
+        """
+        from ..context.store import ContextStore
+        from ..models.task import TaskPlan
+        from .dispatcher import Dispatcher
+        from .gap_analyzer import GapAnalyzer
+        from .verifier import VerifyReport, VerifyIssue
+
+        # Convert issue dicts back to VerifyIssue objects
+        verify_issues = []
+        for issue_dict in issues:
+            verify_issues.append(VerifyIssue(
+                category=issue_dict.get("category", "spec_gap"),
+                severity=issue_dict.get("severity", "MEDIUM"),
+                message=issue_dict.get("message", ""),
+                file=issue_dict.get("file"),
+                module=issue_dict.get("module"),
+            ))
+
+        # Create a synthetic VerifyReport
+        report = VerifyReport(
+            cycle=999,
+            issues=verify_issues,
+            build_ok=True,  # build already passes
+            test_ok=True,
+            lint_ok=True,
+            spec_gap_count=len(verify_issues),
+            duration_s=0,
+        )
+
+        # Generate fix plan
+        gap_analyzer = GapAnalyzer(self.config)
+        plan_dict = gap_analyzer.generate_fix_plan(report, cycle=999)
+
+        if not plan_dict or not plan_dict.get("tasks"):
+            logger.warning("[DesignLoop] No fix tasks generated from residual gaps")
+            return {"fixed": 0, "remaining": issues}
+
+        # Save fix plan
+        plan_path = os.path.join(self.mesh_dir, "residual-fix-plan.json")
+        gap_analyzer.save_fix_plan(plan_dict, plan_path)
+        logger.info(
+            f"[DesignLoop] Residual fix plan: {len(plan_dict['tasks'])} tasks → {plan_path}"
+        )
+
+        # Force minimum rank to Sonnet (skip Grok for residual fixes)
+        fix_config = {**self.config}
+        fix_config.setdefault("routing", {})["outer_loop_min_rank"] = 6  # Sonnet rank
+        fix_config.setdefault("dispatcher", {})["max_parallel"] = max_parallel
+        fix_config["no_review"] = no_review
+
+        # Execute
+        store = ContextStore(self.repo_dir)
+        plan = TaskPlan.from_dict(plan_dict)
+        run_id = store.save_plan(plan)
+
+        dispatcher = Dispatcher(fix_config, self.repo_dir, store)
+        try:
+            await dispatcher.execute_plan(plan=plan, run_id=run_id, resume=False)
+        except Exception as e:
+            logger.error(f"[DesignLoop] Residual fix execution error: {e}")
+
+        total_cost = dispatcher.wave_cost_usd
+        store.close()
+
+        # Quick verify to see what's left
+        from .verifier import Verifier
+        verifier = Verifier(self.repo_dir, self.config)
+        post_report = await verifier.run_mechanical()
+
+        # Check which original gaps are still present
+        # (simplified: if build still passes, remaining = spec gaps only)
+        remaining = []
+        if post_report.build_ok:
+            # Re-run bounded scan against spec for remaining gaps
+            try:
+                remaining_issues = await verifier.run_bounded_scan(
+                    spec_path=spec_path,
+                    prev_issues=[VerifyIssue(**i) if isinstance(i, dict) else i for i in verify_issues],
+                    max_gaps=50,
+                )
+                remaining = [i.to_dict() if hasattr(i, 'to_dict') else i for i in remaining_issues]
+            except Exception as e:
+                logger.warning(f"[DesignLoop] Post-fix scan failed: {e}")
+                remaining = issues  # assume all still remain
+
+        fixed_count = len(issues) - len(remaining)
+        logger.info(
+            f"[DesignLoop] Residual fix: {fixed_count} fixed, "
+            f"{len(remaining)} remaining (cost: ${total_cost:.4f})"
+        )
+
+        return {
+            "fixed": fixed_count,
+            "remaining": remaining,
+            "cost_usd": total_cost,
+        }
 
     async def _final_validation(
         self, new_spec_path: str, design_iter: int = 1

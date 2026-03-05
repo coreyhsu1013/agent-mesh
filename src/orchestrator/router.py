@@ -175,18 +175,19 @@ class ModelRouter:
                 should_force = True
                 break
 
-        # Rule 2: fix tasks (cycle 2+) → force Sonnet
+        # Rule 2: fix tasks (cycle 2+) → skip Grok, start from DeepSeek+
         if task_id.startswith("fix-"):
             should_force = True
 
         if should_force:
+            # Find first non-Grok model (DeepSeek or Claude)
             for idx, model in enumerate(chain):
-                if model.startswith("claude-"):
+                if model.startswith("deepseek/") or model.startswith("claude-"):
                     candidate = idx + 1  # 1-based
                     if candidate > start:
                         start = candidate
                     logger.info(
-                        f"[Router] Force Sonnet: '{task.title}' → attempt {candidate} "
+                        f"[Router] Force skip Grok: '{task.title}' → attempt {candidate} "
                         f"({model})"
                     )
                     break
