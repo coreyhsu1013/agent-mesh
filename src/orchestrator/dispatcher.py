@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from typing import Optional
 
@@ -241,12 +242,109 @@ class Dispatcher:
                     )
 
             # ═══════════════════════════════════════════
-            # ★ Phase 3: Merge all completed task branches → main
+            # ★ Phase 3: Sequential merge + build check
+            #   Merge one task → build → fix if needed → next
             # ═══════════════════════════════════════════
             if completed_indices:
-                merge_results = await self.pool.merge_wave(
-                    completed_indices, task_labels
+                build_cmd = self.config.get("verify", {}).get("build_cmd", "")
+                merge_results: dict[int, bool] = {}
+
+                logger.info(f"\n{'─'*40}")
+                logger.info(f"  🔀 Merge+Build: {len(completed_indices)} tasks → main")
+                logger.info(f"{'─'*40}")
+
+                # Sort merge order: foundation files first (schema,
+                # types, entities), then services, then routes/pages.
+                # This reduces build errors from missing dependencies.
+                def _merge_priority(idx: int) -> int:
+                    task, _ = task_results[idx]
+                    files = getattr(task, 'target_files', []) or []
+                    files_str = ' '.join(files).lower()
+                    if any(k in files_str for k in [
+                        'schema', 'prisma', 'entity', 'entities',
+                        'types', 'type.ts', 'enum', 'model',
+                    ]):
+                        return 0  # merge first
+                    if any(k in files_str for k in [
+                        'service', 'utils', 'helper', 'lib',
+                        'middleware', 'config',
+                    ]):
+                        return 1
+                    if any(k in files_str for k in [
+                        'route', 'controller', 'api', 'handler',
+                    ]):
+                        return 2
+                    if any(k in files_str for k in [
+                        'page', 'component', 'view', 'screen',
+                        'frontend', '.tsx', '.jsx',
+                    ]):
+                        return 3
+                    return 2  # default: middle
+                sorted_indices = sorted(
+                    completed_indices, key=_merge_priority
                 )
+
+                for idx in sorted_indices:
+                    label = task_labels.get(idx, f"task_{idx}")
+                    commit_msg = f"[agent-mesh] {label}"
+
+                    # 3a. Merge single branch
+                    success = await self.pool.merge_single(idx, commit_msg)
+                    if not success:
+                        merge_results[idx] = False
+                        logger.warning(f"  ❌ task_{idx}: {label} (merge failed)")
+                        continue
+
+                    # 3b. Capture merge context for potential fix
+                    try:
+                        merged_diff = await self.pool._run_git(
+                            "diff HEAD~1 HEAD", cwd=self.repo_dir
+                        )
+                    except Exception:
+                        merged_diff = ""
+                    changed_files = []
+                    for line in merged_diff.split('\n'):
+                        if line.startswith('diff --git'):
+                            parts = line.split(' b/')
+                            if len(parts) > 1:
+                                changed_files.append(parts[1])
+
+                    # 3c. Build check after merge
+                    build_ok, build_output = await self.pool.run_build_check(build_cmd)
+                    if build_ok:
+                        merge_results[idx] = True
+                        logger.info(f"  ✅ task_{idx}: {label}")
+                        continue
+
+                    # 3d. Build broke — fix with context + ReAct loop
+                    logger.warning(
+                        f"  ⚠️ task_{idx}: {label} — build broke, fixing..."
+                    )
+                    fixed = await self._fix_build_on_main(
+                        build_output=build_output,
+                        task_title=label,
+                        build_cmd=build_cmd,
+                        merged_diff=merged_diff,
+                        changed_files=changed_files,
+                    )
+                    merge_results[idx] = True  # merge itself succeeded
+                    if fixed:
+                        logger.info(f"  🔧 task_{idx}: {label} (build fixed)")
+                    else:
+                        logger.warning(
+                            f"  ⚠️ task_{idx}: {label} (build still broken, fixes rolled back)"
+                        )
+
+                # Post-merge: scan for conflict markers
+                conflicts = await self.pool._scan_conflict_markers()
+                if conflicts:
+                    logger.warning(
+                        f"[Dispatcher] ⚠️ {len(conflicts)} files with conflict markers"
+                    )
+
+                merged_count = sum(1 for v in merge_results.values() if v)
+                failed_count = sum(1 for v in merge_results.values() if not v)
+                logger.info(f"\n  Merge result: {merged_count} ✅ / {failed_count} ❌")
 
                 for task_idx in completed_indices:
                     task, _ = task_results[task_idx]
@@ -439,6 +537,167 @@ class Dispatcher:
             self.store.update_task(task)
             logger.error(f"[Dispatcher] Exception '{task.title}': {e}")
             raise
+
+    async def _fix_build_on_main(
+        self, build_output: str, task_title: str,
+        build_cmd: str = "",
+        merged_diff: str = "", changed_files: list[str] | None = None,
+    ) -> bool:
+        """
+        Fix build errors on main after merge — keep trying until fixed.
+
+        Escalation: Sonnet (att 1-2) → Opus (att 3+)
+        Timeout:    300s base, ×1.5 each attempt, cap 1800s
+        No rollback: each attempt builds on previous fixes.
+        """
+        if not build_cmd:
+            build_cmd = "pnpm build"
+
+        MAX_ATTEMPTS = 10
+        SONNET_ATTEMPTS = 2
+        BASE_TIMEOUT = 300
+        total_fix_cost = 0.0
+
+        # ── Context strings (stable across attempts) ──
+        files_ctx = ""
+        if changed_files:
+            files_ctx = (
+                "## Files Changed in This Merge\n"
+                + "\n".join(f"- {f}" for f in changed_files[:30])
+                + "\n\n"
+            )
+        diff_ctx = ""
+        if merged_diff:
+            diff_ctx = (
+                f"## Merged Diff (partial)\n```\n"
+                f"{merged_diff[:3000]}\n```\n\n"
+            )
+
+        # ── ReAct loop: fix → build → evaluate → escalate ──
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            # Escalate model
+            if attempt <= SONNET_ATTEMPTS:
+                model = "claude-sonnet-4-6"
+                model_label = "Sonnet"
+            else:
+                model = "claude-opus-4-6"
+                model_label = "Opus"
+
+            # Increase timeout: 300 → 450 → 675 → 600(Opus) → 900 → ...
+            timeout = int(BASE_TIMEOUT * (1.5 ** (attempt - 1)))
+            timeout = min(timeout, 1800)
+
+            prompt = (
+                f"The build broke after merging task \"{task_title}\".\n\n"
+                f"## Build Error\n```\n{build_output[:4000]}\n```\n\n"
+                f"{files_ctx}"
+                f"{diff_ctx}"
+            )
+            if attempt > 1:
+                prompt += (
+                    f"## ⚠️ This is fix attempt #{attempt}. "
+                    f"Previous {attempt-1} attempt(s) FAILED.\n"
+                    f"The build error above is the CURRENT error after "
+                    f"all previous fixes. Try a DIFFERENT approach.\n\n"
+                )
+            prompt += (
+                "## Instructions\n"
+                "1. Read the error messages carefully\n"
+                "2. Fix the build errors (likely type errors, missing "
+                "imports, or interface mismatches)\n"
+                "3. Make minimal changes — only fix what's broken\n"
+                "4. Do NOT add new features or refactor\n"
+            )
+
+            logger.info(
+                f"[BuildFix] Attempt {attempt}/{MAX_ATTEMPTS} "
+                f"[{model_label}, {timeout}s]"
+            )
+
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.md', delete=False
+            ) as f:
+                f.write(prompt)
+                prompt_file = f.name
+
+            # ── ACT ──
+            stdout_text = ""
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    f'cat {prompt_file} | claude -p '
+                    f'--dangerously-skip-permissions '
+                    f'--model {model} --output-format text',
+                    cwd=self.repo_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_bytes, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+                stdout_text = stdout_bytes.decode(
+                    errors="replace"
+                )[:5000] if stdout_bytes else ""
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[BuildFix] Attempt {attempt} timed out ({timeout}s)"
+                )
+                continue
+            except Exception as e:
+                logger.warning(
+                    f"[BuildFix] Attempt {attempt} error: {e}"
+                )
+                continue
+            finally:
+                try:
+                    os.unlink(prompt_file)
+                except Exception:
+                    pass
+
+            # ── COST ──
+            est = self.cost_tracker.estimate_from_chars(
+                prompt + stdout_text, model, source="build_fix"
+            )
+            total_fix_cost += est.estimated_usd
+            logger.info(
+                f"[BuildFix] Attempt {attempt} cost: "
+                f"${est.estimated_usd:.4f} [{model_label}]"
+            )
+
+            # Commit fixes
+            try:
+                await self.pool._run_git("add -A", cwd=self.repo_dir)
+                await self.pool._run_git(
+                    f'commit -m "[agent-mesh] build fix #{attempt} '
+                    f'({model_label}): {task_title}"',
+                    cwd=self.repo_dir,
+                )
+            except Exception:
+                pass
+
+            # ── OBSERVE ──
+            build_ok, build_output = await self.pool.run_build_check(
+                build_cmd
+            )
+            if build_ok:
+                self.wave_cost_usd += total_fix_cost
+                logger.info(
+                    f"[BuildFix] ✅ Fixed on attempt {attempt} "
+                    f"[{model_label}] (fix cost: ${total_fix_cost:.4f})"
+                )
+                return True
+
+            # ── EVALUATE: still failing, loop with updated error ──
+            logger.warning(
+                f"[BuildFix] Attempt {attempt} failed [{model_label}], "
+                f"continuing..."
+            )
+
+        self.wave_cost_usd += total_fix_cost
+        logger.error(
+            f"[BuildFix] ❌ Failed after {MAX_ATTEMPTS} attempts "
+            f"for '{task_title}' (fix cost: ${total_fix_cost:.4f})"
+        )
+        return False
 
     def _get_semaphore(self, agent_type: AgentType) -> asyncio.Semaphore:
         if agent_type == AgentType.CLAUDE_CODE:

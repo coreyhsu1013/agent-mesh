@@ -101,6 +101,7 @@ react:
   run_build: true
   run_lint: false
   retry_delay_base: 5
+  skip_worktree_build: true   # v1.2: 跳過 worktree build，merge 後才 build
 
 # ── Reviewer ──
 reviewer:

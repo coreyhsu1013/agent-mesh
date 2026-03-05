@@ -235,7 +235,12 @@ class DesignLoop:
         max_parallel: int,
         no_review: bool,
     ) -> bool:
-        """Execute all chunks sequentially with drift feedback between chunks."""
+        """
+        Execute chunks with parallelism for independent chunks.
+
+        v1.2: Chunks with same wave_order and no cross-dependency run
+        concurrently. Drift adjustment happens after each wave completes.
+        """
         all_success = True
 
         # Clean progress: remove entries not in current chunk list
@@ -252,56 +257,158 @@ class DesignLoop:
                 f"[DesignLoop] Cleaned {len(stale)} stale progress entries: {stale}"
             )
 
-        for i, chunk in enumerate(chunks):
-            logger.info(f"\n{'─'*50}")
-            logger.info(
-                f"  📦 Chunk {i+1}/{len(chunks)}: {chunk.chunk_id} — {chunk.title}"
-            )
-            logger.info(f"  Wave: {chunk.wave_order}, Changes: {len(chunk.changes)}")
-            logger.info(f"{'─'*50}")
+        # Group chunks by wave_order for parallel execution
+        waves: dict[int, list[DesignChunk]] = {}
+        for chunk in chunks:
+            waves.setdefault(chunk.wave_order, []).append(chunk)
 
-            # Load progress (for resume)
-            progress = self._load_progress()
-            if progress.get(chunk.chunk_id, {}).get("status") == "completed":
-                logger.info(f"[DesignLoop] ⏭ Chunk {chunk.chunk_id} already completed, skipping")
+        completed_chunks: set[str] = set()
+
+        for wave_num in sorted(waves.keys()):
+            wave_chunks = waves[wave_num]
+
+            # Filter: only run chunks whose dependencies are met
+            ready_chunks = []
+            for chunk in wave_chunks:
+                progress = self._load_progress()
+                if progress.get(chunk.chunk_id, {}).get("status") == "completed":
+                    completed_chunks.add(chunk.chunk_id)
+                    logger.info(
+                        f"[DesignLoop] ⏭ {chunk.chunk_id} already completed"
+                    )
+                    continue
+                unmet = [
+                    d for d in chunk.depends_on_chunks
+                    if d not in completed_chunks
+                ]
+                if unmet:
+                    logger.warning(
+                        f"[DesignLoop] ⏭ {chunk.chunk_id} skipped "
+                        f"(unmet deps: {unmet})"
+                    )
+                    continue
+                ready_chunks.append(chunk)
+
+            if not ready_chunks:
                 continue
 
-            chunk.status = "in_progress"
-            self._save_progress(chunk.chunk_id, "in_progress", {})
+            if len(ready_chunks) == 1:
+                # Single chunk — run directly (no parallel overhead)
+                chunk = ready_chunks[0]
+                logger.info(f"\n{'─'*50}")
+                logger.info(
+                    f"  📦 Chunk: {chunk.chunk_id} — {chunk.title}"
+                )
+                logger.info(
+                    f"  Wave: {chunk.wave_order}, "
+                    f"Changes: {len(chunk.changes)}"
+                )
+                logger.info(f"{'─'*50}")
 
-            # Execute chunk
-            result = await self._run_chunk(
-                chunk, max_inner_cycles, max_parallel, no_review
-            )
-
-            # Validate chunk
-            validation = await self._validate_chunk(chunk, result)
-
-            if result.get("success"):
-                chunk.status = "completed"
-                self._save_progress(chunk.chunk_id, "completed", result)
-                self.chunk_history.append({
-                    "chunk_id": chunk.chunk_id,
-                    "result": result,
-                    "validation": validation,
-                })
-
-                # Adjust remaining chunks if design drift detected
-                remaining = [c for c in chunks if c.status == "pending"]
-                if remaining and (validation.get("design_issues") or validation.get("drift_notes")):
-                    await self.refiner.adjust_remaining_chunks(
-                        chunk, validation, remaining, new_spec
-                    )
+                success = await self._execute_single_chunk(
+                    chunk, chunks, new_spec,
+                    max_inner_cycles, max_parallel, no_review,
+                )
+                if success:
+                    completed_chunks.add(chunk.chunk_id)
+                else:
+                    all_success = False
             else:
-                chunk.status = "needs_redesign"
-                self._save_progress(chunk.chunk_id, "needs_redesign", result)
-                all_success = False
-                logger.warning(
-                    f"[DesignLoop] ❌ Chunk {chunk.chunk_id} failed: "
-                    f"{result.get('error', 'unknown')}"
+                # Multiple independent chunks — run in parallel
+                logger.info(f"\n{'='*50}")
+                logger.info(
+                    f"  🚀 Parallel wave {wave_num}: "
+                    f"{len(ready_chunks)} chunks"
+                )
+                for c in ready_chunks:
+                    logger.info(f"    • {c.chunk_id}: {c.title}")
+                logger.info(f"{'='*50}")
+
+                results = await asyncio.gather(
+                    *[
+                        self._execute_single_chunk(
+                            chunk, chunks, new_spec,
+                            max_inner_cycles, max_parallel, no_review,
+                        )
+                        for chunk in ready_chunks
+                    ],
+                    return_exceptions=True,
                 )
 
+                for chunk, result in zip(ready_chunks, results):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            f"[DesignLoop] ❌ {chunk.chunk_id} "
+                            f"exception: {result}"
+                        )
+                        all_success = False
+                    elif result:
+                        completed_chunks.add(chunk.chunk_id)
+                    else:
+                        all_success = False
+
+                # Drift adjustment after parallel wave
+                remaining = [c for c in chunks if c.status == "pending"]
+                if remaining:
+                    for chunk in ready_chunks:
+                        if chunk.chunk_id in completed_chunks:
+                            validation = self.chunk_history[-1].get(
+                                "validation", {}
+                            ) if self.chunk_history else {}
+                            if validation.get("design_issues") or \
+                               validation.get("drift_notes"):
+                                await self.refiner.adjust_remaining_chunks(
+                                    chunk, validation, remaining, new_spec
+                                )
+
         return all_success
+
+    async def _execute_single_chunk(
+        self,
+        chunk: DesignChunk,
+        all_chunks: list[DesignChunk],
+        new_spec: str,
+        max_inner_cycles: int,
+        max_parallel: int,
+        no_review: bool,
+    ) -> bool:
+        """Execute one chunk and handle progress/validation."""
+        chunk.status = "in_progress"
+        self._save_progress(chunk.chunk_id, "in_progress", {})
+
+        result = await self._run_chunk(
+            chunk, max_inner_cycles, max_parallel, no_review
+        )
+
+        validation = await self._validate_chunk(chunk, result)
+
+        if result.get("success"):
+            chunk.status = "completed"
+            self._save_progress(chunk.chunk_id, "completed", result)
+            self.chunk_history.append({
+                "chunk_id": chunk.chunk_id,
+                "result": result,
+                "validation": validation,
+            })
+
+            # Drift adjustment (only for sequential chunks)
+            remaining = [c for c in all_chunks if c.status == "pending"]
+            if remaining and (
+                validation.get("design_issues")
+                or validation.get("drift_notes")
+            ):
+                await self.refiner.adjust_remaining_chunks(
+                    chunk, validation, remaining, new_spec
+                )
+            return True
+        else:
+            chunk.status = "needs_redesign"
+            self._save_progress(chunk.chunk_id, "needs_redesign", result)
+            logger.warning(
+                f"[DesignLoop] ❌ Chunk {chunk.chunk_id} failed: "
+                f"{result.get('error', 'unknown')}"
+            )
+            return False
 
     async def _run_chunk(
         self,

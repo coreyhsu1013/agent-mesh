@@ -142,6 +142,10 @@ class ReactLoop:
         self.run_build = react_cfg.get("run_build", True)
         self.run_lint = react_cfg.get("run_lint", False)
         self.retry_delay_base = react_cfg.get("retry_delay_base", 5)
+        # v1.2: skip build in worktree — real build at merge time
+        self.skip_worktree_build = react_cfg.get(
+            "skip_worktree_build", False
+        )
 
     async def execute_task(
         self,
@@ -302,9 +306,10 @@ class ReactLoop:
             f"cd {workspace_dir} && git diff HEAD 2>/dev/null || git diff 2>/dev/null || echo ''"
         )
 
-        # 2) Build
+        # 2) Build (skip in worktree if configured — real build at merge)
         build_output = ""
-        if self.run_build:
+        is_worktree = "/.agent-mesh/workspaces/" in workspace_dir
+        if self.run_build and not (self.skip_worktree_build and is_worktree):
             build_output = await self._run_cmd(
                 f"cd {workspace_dir} && "
                 f"(pnpm run build 2>&1 || npm run build 2>&1 || "

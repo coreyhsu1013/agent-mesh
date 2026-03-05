@@ -155,6 +155,35 @@ class WorkspacePool:
 
         return results
 
+    async def merge_single(self, task_idx: int, commit_msg: str) -> bool:
+        """Merge a single task branch → main. Returns success."""
+        branch_name = f"agent-mesh/task_{task_idx}"
+        return await self._merge_branch(branch_name, commit_msg)
+
+    async def run_build_check(self, build_cmd: str = "") -> tuple[bool, str]:
+        """Run build on main repo. Returns (success, output)."""
+        if not build_cmd:
+            build_cmd = (
+                "pnpm run build 2>&1 || npm run build 2>&1 || "
+                "npx tsc --noEmit 2>&1 || echo 'NO_BUILD_SCRIPT'"
+            )
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                build_cmd,
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+            output = stdout.decode(errors="replace") if stdout else ""
+            if "NO_BUILD_SCRIPT" in output:
+                return True, output[:5000]
+            return proc.returncode == 0, output[:5000]
+        except asyncio.TimeoutError:
+            return False, "BUILD TIMEOUT (180s)"
+        except Exception as e:
+            return False, f"BUILD CMD ERROR: {e}"
+
     async def cleanup_wave(self):
         """Wave 結束後清理所有 worker slots 和 task branches。"""
         await self._cleanup_all_slots()

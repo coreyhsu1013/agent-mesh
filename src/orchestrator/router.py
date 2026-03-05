@@ -192,7 +192,17 @@ class ModelRouter:
                     )
                     break
 
-        # Rule 3: outer-loop escalation — enforce min rank for ALL tasks
+        # Rule 3: experience advisor — skip historically poor models
+        if self.advisor and not should_force:
+            suggested = self.advisor.suggest_start_attempt(complexity, chain)
+            if suggested > start:
+                start = suggested
+                logger.info(
+                    f"[Router] Experience skip: '{task.title}' → "
+                    f"attempt {start} (historical data)"
+                )
+
+        # Rule 4: outer-loop escalation — enforce min rank for ALL tasks
         if self.outer_loop_min_rank > 0:
             for idx, model in enumerate(chain):
                 if get_model_rank(model) >= self.outer_loop_min_rank:
