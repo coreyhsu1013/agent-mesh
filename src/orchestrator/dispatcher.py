@@ -289,14 +289,22 @@ class Dispatcher:
                     label = task_labels.get(idx, f"task_{idx}")
                     commit_msg = f"[agent-mesh] {label}"
 
-                    # 3a. Merge single branch
+                    # 3a. Save checkpoint before merge (for rollback)
+                    try:
+                        pre_merge_head = await self.pool._run_git(
+                            "rev-parse HEAD", cwd=self.repo_dir
+                        )
+                    except Exception:
+                        pre_merge_head = ""
+
+                    # 3b. Merge single branch
                     success = await self.pool.merge_single(idx, commit_msg)
                     if not success:
                         merge_results[idx] = False
                         logger.warning(f"  ❌ task_{idx}: {label} (merge failed)")
                         continue
 
-                    # 3b. Capture merge context for potential fix
+                    # 3c. Capture merge context for potential fix
                     try:
                         merged_diff = await self.pool._run_git(
                             "diff HEAD~1 HEAD", cwd=self.repo_dir
@@ -310,14 +318,14 @@ class Dispatcher:
                             if len(parts) > 1:
                                 changed_files.append(parts[1])
 
-                    # 3c. Build check after merge
+                    # 3d. Build check after merge
                     build_ok, build_output = await self.pool.run_build_check(build_cmd)
                     if build_ok:
                         merge_results[idx] = True
                         logger.info(f"  ✅ task_{idx}: {label}")
                         continue
 
-                    # 3d. Build broke — fix with context + ReAct loop
+                    # 3e. Build broke — fix with context + ReAct loop
                     logger.warning(
                         f"  ⚠️ task_{idx}: {label} — build broke, fixing..."
                     )
@@ -328,13 +336,26 @@ class Dispatcher:
                         merged_diff=merged_diff,
                         changed_files=changed_files,
                     )
-                    merge_results[idx] = True  # merge itself succeeded
                     if fixed:
+                        merge_results[idx] = True
                         logger.info(f"  🔧 task_{idx}: {label} (build fixed)")
                     else:
-                        logger.warning(
-                            f"  ⚠️ task_{idx}: {label} (build still broken, fixes rolled back)"
-                        )
+                        # 3f. Rollback: reset main to pre-merge state
+                        if pre_merge_head:
+                            logger.warning(
+                                f"  ↩️ task_{idx}: {label} — rolling back merge "
+                                f"(reset to {pre_merge_head[:8]})"
+                            )
+                            try:
+                                await self.pool._run_git(
+                                    f"reset --hard {pre_merge_head}",
+                                    cwd=self.repo_dir,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    f"  ❌ Rollback failed: {e}"
+                                )
+                        merge_results[idx] = False
 
                 # Post-merge: scan for conflict markers
                 conflicts = await self.pool._scan_conflict_markers()
