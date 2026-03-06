@@ -24,6 +24,7 @@ from typing import Any
 from .verifier import Verifier, VerifyReport, VerifyIssue
 from .gap_analyzer import GapAnalyzer
 from .model_ranking import OuterLoopEscalation
+from .retrospective import RetrospectiveAnalyzer
 
 logger = logging.getLogger("agent-mesh")
 
@@ -52,9 +53,41 @@ class ProjectLoop:
         self.verifier = Verifier(repo_dir, config)
         self.gap_analyzer = GapAnalyzer(config)
         self.escalation = OuterLoopEscalation(config)
+        self.retrospective = RetrospectiveAnalyzer(config, repo_dir)
         self.cycle_history: list[dict] = []
         # v1.2: Layer 3 per-gap cache (avoid re-analyzing same gap)
         self._spec_feedback_cache: dict[str, str] = {}  # gap_key → root_cause
+        # v1.2: event log for monitoring
+        self._events_path = os.path.join(repo_dir, ".agent-mesh", "events.log")
+        self._discord_webhook = config.get("notifications", {}).get("discord_webhook", "")
+
+    def _emit_event(self, event: str):
+        """Append a timestamped event to events.log + Discord webhook."""
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        try:
+            with open(self._events_path, 'a') as f:
+                f.write(f"[{ts}] {event}\n")
+        except Exception:
+            pass
+        if self._discord_webhook:
+            self._discord_send(f"[{ts}] {event}")
+
+    def _discord_send(self, message: str):
+        """Fire-and-forget Discord webhook notification."""
+        import threading
+        def _send():
+            try:
+                import subprocess, json as _json
+                payload = _json.dumps({"content": message})
+                subprocess.run(
+                    ["curl", "-s", "-H", "Content-Type: application/json",
+                     "-d", payload, self._discord_webhook],
+                    timeout=10, capture_output=True,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_send, daemon=True).start()
 
     async def verify(self, cycle: int = 1) -> VerifyReport:
         """Run verification only."""
@@ -228,6 +261,75 @@ class ProjectLoop:
 
         logger.info(f"\n{report.summary()}")
 
+        # Step 2.75: Retrospective — when gaps are diverging
+        retro_cfg = self.config.get("retrospective", {})
+        if retro_cfg.get("enabled", True) and self._is_diverging(all_gap_count):
+            logger.info(
+                f"[Retro] Gaps diverging (cycle history: "
+                f"{[e.get('gap_count', 0) for e in self.cycle_history]}), "
+                f"running retrospective analysis..."
+            )
+            retro = await self.retrospective.analyze(
+                remaining_gaps + [
+                    {"message": i.message, "module": i.module, "file": i.file}
+                    for i in new_gap_issues
+                ],
+                self.spec_path,
+                code_tree,
+                self.cycle_history,
+            )
+
+            if retro.diagnoses:
+                # Handle SPEC_ISSUE: amend spec
+                if retro.spec_amendments:
+                    self._amend_spec(retro.spec_amendments)
+                    logger.info(
+                        f"[Retro] Amended spec with {len(retro.spec_amendments)} fixes"
+                    )
+
+                # Handle UNFIXABLE: remove from report
+                unfixable_msgs = {
+                    d.gap_message.lower()
+                    for d in retro.diagnoses
+                    if d.root_cause == "UNFIXABLE" and d.gap_message
+                }
+                if unfixable_msgs:
+                    before = len(report.issues)
+                    report.issues = [
+                        i for i in report.issues
+                        if i.message.lower() not in unfixable_msgs
+                    ]
+                    removed = before - len(report.issues)
+                    if removed:
+                        logger.warning(
+                            f"[Retro] Removed {removed} unfixable gaps"
+                        )
+                        all_gap_count = len([
+                            i for i in report.issues
+                            if i.category == "spec_gap"
+                        ])
+                        report.spec_gap_count = all_gap_count
+
+                # Handle FIXABLE: enrich description with root cause
+                for diagnosis in retro.diagnoses:
+                    if diagnosis.root_cause == "FIXABLE" and diagnosis.fix_strategy:
+                        for issue in report.issues:
+                            if (issue.message.lower()
+                                    == diagnosis.gap_message.lower()):
+                                issue.message = (
+                                    f"{issue.message}\n"
+                                    f"[ROOT CAUSE] {diagnosis.analysis}\n"
+                                    f"[FIX STRATEGY] {diagnosis.fix_strategy}"
+                                )
+                                break
+
+                self._emit_event(
+                    f"RETRO cycle={cycle} "
+                    f"fixable={retro.fixable_count} "
+                    f"spec_issue={retro.spec_issue_count} "
+                    f"unfixable={retro.unfixable_count}"
+                )
+
         # Step 3: Convergence check
         total_gaps = all_gap_count
         if total_gaps <= convergence_threshold and report.build_ok:
@@ -328,6 +430,26 @@ class ProjectLoop:
             f"[Layer3] Saved {len(questions)} spec questions → {questions_path}"
         )
 
+    def _is_diverging(self, current_gap_count: int) -> bool:
+        """Check if gaps are getting worse instead of converging."""
+        if not self.cycle_history:
+            return False
+        prev = self.cycle_history[-1].get("gap_count", 0)
+        return current_gap_count >= prev and current_gap_count > 0
+
+    def _amend_spec(self, amendments: list[str]):
+        """Append clarifications to the spec file."""
+        if not self.spec_path or not amendments:
+            return
+        try:
+            with open(self.spec_path, 'a') as f:
+                f.write("\n\n## AUTO-AMENDMENTS (from retrospective analysis)\n")
+                for amendment in amendments:
+                    f.write(f"- {amendment}\n")
+            logger.info(f"[Retro] Amended spec: {self.spec_path}")
+        except Exception as e:
+            logger.warning(f"[Retro] Failed to amend spec: {e}")
+
     async def _run_layer4(
         self, layer4_cfg: dict, code_tree: str
     ) -> list[VerifyIssue]:
@@ -406,6 +528,13 @@ class ProjectLoop:
         t0 = time.time()
 
         for cycle in range(1, max_cycles + 1):
+            # v1.2: graceful shutdown check
+            stop_file = os.path.join(self.repo_dir, ".agent-mesh", "STOP")
+            if os.path.exists(stop_file):
+                self._emit_event("STOP 🛑 graceful shutdown requested")
+                logger.info("[ProjectLoop] 🛑 Stop signal detected, finishing gracefully")
+                return False
+
             logger.info(f"\n{'='*60}")
             logger.info(f"  🔄 Project ReAct — Cycle {cycle}/{max_cycles}")
             logger.info(f"{'='*60}")
@@ -439,6 +568,9 @@ class ProjectLoop:
                     max_parallel=max_parallel,
                     no_review=no_review,
                 )
+                # v1.2: cycle escalation — cycle 2 → Sonnet, cycle 3+ → Opus
+                if cycle >= 2 and hasattr(dispatcher, 'router'):
+                    dispatcher.router.fix_cycle = cycle
                 exec_result = await dispatcher.run()
                 logger.info(f"[ProjectLoop] Execution complete: {exec_result}")
             else:
@@ -470,6 +602,11 @@ class ProjectLoop:
                 "passed": report.passed,
             })
 
+            # v1.2: emit event for monitoring
+            fix_count = len(plan['tasks']) if plan else 0
+            status = "✅ PASSED" if report.passed else f"❌ {gap_count} gaps, {fix_count} fix tasks"
+            self._emit_event(f"VERIFY cycle={cycle} build={'✅' if report.build_ok else '❌'} {status}")
+
             # ── Check termination ──
             if report.passed:
                 total_time = time.time() - t0
@@ -477,6 +614,7 @@ class ProjectLoop:
                 logger.info(f"  ✅ Project Complete! (cycle {cycle}, {total_time:.0f}s)")
                 logger.info(f"{'='*60}")
                 self._print_convergence_summary()
+                self._emit_event(f"CHUNK_DONE ✅ passed after {cycle} cycles ({total_time:.0f}s)")
                 return True
 
             # ── EVALUATE: Model ranking escalation ──
@@ -489,6 +627,7 @@ class ProjectLoop:
                     f"Stopping after {cycle} cycles ({total_time:.0f}s)"
                 )
                 self._print_convergence_summary()
+                self._emit_event(f"CHUNK_DONE ❌ gave up after {cycle} cycles ({total_time:.0f}s) — {gap_count} gaps remain")
                 return False
 
             if decision.escalate:
@@ -516,12 +655,14 @@ class ProjectLoop:
 
         # Max cycles reached
         total_time = time.time() - t0
+        remaining = len(self.cycle_history[-1]['report'].issues) if self.cycle_history else 0
         logger.warning(
             f"[ProjectLoop] ⚠️ Max cycles ({max_cycles}) reached. "
-            f"{len(self.cycle_history[-1]['report'].issues)} issues remain. "
+            f"{remaining} issues remain. "
             f"Total time: {total_time:.0f}s"
         )
         self._print_convergence_summary()
+        self._emit_event(f"CHUNK_DONE ⚠️ max cycles ({max_cycles}) reached, {remaining} gaps remain ({total_time:.0f}s)")
         return False
 
     def _print_convergence_summary(self):

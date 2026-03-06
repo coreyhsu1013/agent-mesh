@@ -34,10 +34,12 @@ class WorkspacePool:
     """
 
     def __init__(self, repo_dir: str, config: dict,
-                 target_branch: str = "main"):
+                 target_branch: str = "main",
+                 slot_prefix: str = "slot"):
         self.repo_dir = os.path.abspath(repo_dir)
         self.config = config
         self.target_branch = target_branch  # v1.2: configurable merge target
+        self.slot_prefix = slot_prefix      # v1.2: namespace for parallel chunks
         self.workspace_base = os.path.join(self.repo_dir, WORKSPACE_DIR)
         os.makedirs(self.workspace_base, exist_ok=True)
         self._active_slots: dict[int, str] = {}   # slot_id → ws_dir
@@ -71,7 +73,7 @@ class WorkspacePool:
         Returns the workspace directory.
         """
         ws_dir = self._active_slots[slot_id]
-        branch_name = f"agent-mesh/task_{task_idx}"
+        branch_name = f"agent-mesh/{self.slot_prefix}_task_{task_idx}"
 
         # Ensure clean state (discard any leftover uncommitted changes)
         try:
@@ -135,7 +137,7 @@ class WorkspacePool:
         logger.info(f"{'─'*40}")
 
         for idx in completed_task_indices:
-            branch_name = f"agent-mesh/task_{idx}"
+            branch_name = f"agent-mesh/{self.slot_prefix}_task_{idx}"
             label = task_labels.get(idx, f"task_{idx}")
             commit_msg = f"[agent-mesh] {label}"
 
@@ -161,7 +163,7 @@ class WorkspacePool:
 
     async def merge_single(self, task_idx: int, commit_msg: str) -> bool:
         """Merge a single task branch → main. Returns success."""
-        branch_name = f"agent-mesh/task_{task_idx}"
+        branch_name = f"agent-mesh/{self.slot_prefix}_task_{task_idx}"
         return await self._merge_branch(branch_name, commit_msg)
 
     async def run_build_check(self, build_cmd: str = "") -> tuple[bool, str]:
@@ -273,8 +275,8 @@ class WorkspacePool:
 
     async def _create_slot(self, slot_id: int) -> str:
         """Create a worktree slot from current main."""
-        ws_dir = os.path.join(self.workspace_base, f"slot_{slot_id}")
-        branch_name = f"agent-mesh/slot_{slot_id}"
+        ws_dir = os.path.join(self.workspace_base, f"{self.slot_prefix}_{slot_id}")
+        branch_name = f"agent-mesh/{self.slot_prefix}_{slot_id}"
 
         # Remove existing
         if os.path.exists(ws_dir):
@@ -313,8 +315,9 @@ class WorkspacePool:
         if not os.path.exists(self.workspace_base):
             return
 
+        prefix = f"{self.slot_prefix}_"
         for entry in os.listdir(self.workspace_base):
-            if entry.startswith("slot_"):
+            if entry.startswith(prefix):
                 ws_dir = os.path.join(self.workspace_base, entry)
                 try:
                     await self._run_git(f"worktree remove {ws_dir} --force")
@@ -322,9 +325,9 @@ class WorkspacePool:
                     shutil.rmtree(ws_dir, ignore_errors=True)
 
                 # Clean up branch
-                slot_id = entry.replace("slot_", "")
+                slot_id = entry[len(prefix):]
                 try:
-                    await self._run_git(f"branch -D agent-mesh/slot_{slot_id}")
+                    await self._run_git(f"branch -D agent-mesh/{self.slot_prefix}_{slot_id}")
                 except Exception:
                     pass
 

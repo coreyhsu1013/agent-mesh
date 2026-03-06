@@ -46,6 +46,40 @@ class DesignLoop:
         self.max_design_iterations = config.get("design", {}).get(
             "max_design_iterations", 3
         )
+        self._events_path = os.path.join(repo_dir, ".agent-mesh", "events.log")
+        self._discord_webhook = config.get("notifications", {}).get("discord_webhook", "")
+
+    def _emit_event(self, event: str):
+        """Append a timestamped event to events.log + Discord webhook."""
+        import datetime
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        try:
+            with open(self._events_path, 'a') as f:
+                f.write(f"[{ts}] {event}\n")
+        except Exception:
+            pass
+        if self._discord_webhook:
+            self._discord_send(f"[{ts}] {event}")
+
+    def _discord_send(self, message: str):
+        """Fire-and-forget Discord webhook notification."""
+        import threading
+        def _send():
+            try:
+                import subprocess, json as _json
+                payload = _json.dumps({"content": message})
+                subprocess.run(
+                    ["curl", "-s", "-H", "Content-Type: application/json",
+                     "-d", payload, self._discord_webhook],
+                    timeout=10, capture_output=True,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_send, daemon=True).start()
+
+    def _should_stop(self) -> bool:
+        """Check for graceful shutdown signal (touch .agent-mesh/STOP)."""
+        return os.path.exists(os.path.join(self.mesh_dir, "STOP"))
 
     async def run(
         self,
@@ -265,6 +299,12 @@ class DesignLoop:
         completed_chunks: set[str] = set()
 
         for wave_num in sorted(waves.keys()):
+            # v1.2: graceful shutdown — check for stop signal
+            if self._should_stop():
+                self._emit_event("STOP 🛑 graceful shutdown requested")
+                logger.info("[DesignLoop] 🛑 Stop signal detected, finishing gracefully")
+                return all_success
+
             wave_chunks = waves[wave_num]
 
             # Filter: only run chunks whose dependencies are met
@@ -282,6 +322,7 @@ class DesignLoop:
                     if d not in completed_chunks
                 ]
                 if unmet:
+                    self._emit_event(f"CHUNK_SKIP ⏭ {chunk.chunk_id} (unmet deps: {unmet})")
                     logger.warning(
                         f"[DesignLoop] ⏭ {chunk.chunk_id} skipped "
                         f"(unmet deps: {unmet})"
@@ -314,108 +355,34 @@ class DesignLoop:
                 else:
                     all_success = False
             else:
-                # Multiple independent chunks — run in parallel
-                # Each chunk works on its own branch to avoid race conditions
+                # Multiple independent chunks — run sequentially
+                # Each chunk completes fully before next starts,
+                # so each sees previous chunk's changes on main.
                 logger.info(f"\n{'='*50}")
                 logger.info(
-                    f"  🚀 Parallel wave {wave_num}: "
-                    f"{len(ready_chunks)} chunks (isolated branches)"
+                    f"  📦 Sequential wave {wave_num}: "
+                    f"{len(ready_chunks)} chunks"
                 )
                 for c in ready_chunks:
                     logger.info(f"    • {c.chunk_id}: {c.title}")
                 logger.info(f"{'='*50}")
 
-                # Create chunk branches from main
-                chunk_branches: dict[str, str] = {}
                 for chunk in ready_chunks:
-                    branch = f"agent-mesh/chunk-{chunk.chunk_id}"
-                    try:
-                        await self._run_git(f"branch -D {branch}")
-                    except Exception:
-                        pass
-                    await self._run_git(
-                        f"branch {branch} main"
+                    logger.info(f"\n{'─'*50}")
+                    logger.info(
+                        f"  📦 Chunk: {chunk.chunk_id} — {chunk.title}"
                     )
-                    chunk_branches[chunk.chunk_id] = branch
+                    logger.info(f"  Changes: {len(chunk.changes)}")
+                    logger.info(f"{'─'*50}")
 
-                # Run chunks in parallel, each on its own branch
-                results = await asyncio.gather(
-                    *[
-                        self._execute_single_chunk(
-                            chunk, chunks, new_spec,
-                            max_inner_cycles, max_parallel, no_review,
-                            target_branch=chunk_branches[chunk.chunk_id],
-                        )
-                        for chunk in ready_chunks
-                    ],
-                    return_exceptions=True,
-                )
-
-                # Merge successful chunk branches → main (sequential)
-                from .workspace import WorkspacePool
-                pool = WorkspacePool(
-                    self.repo_dir, self.config
-                )
-                build_cmd = self.config.get(
-                    "verify", {}
-                ).get("build_cmd", "")
-
-                for chunk, result in zip(ready_chunks, results):
-                    branch = chunk_branches[chunk.chunk_id]
-                    if isinstance(result, Exception):
-                        logger.error(
-                            f"[DesignLoop] ❌ {chunk.chunk_id} "
-                            f"exception: {result}"
-                        )
-                        all_success = False
-                    elif result:
-                        # Merge chunk branch → main
-                        logger.info(
-                            f"[DesignLoop] Merging {branch} → main"
-                        )
-                        ok = await pool._merge_branch(
-                            branch,
-                            f"[agent-mesh] chunk: {chunk.chunk_id}",
-                        )
-                        if ok:
-                            # Build check after chunk merge
-                            build_ok, build_out = \
-                                await pool.run_build_check(build_cmd)
-                            if not build_ok:
-                                logger.warning(
-                                    f"[DesignLoop] Build broke after "
-                                    f"merging {chunk.chunk_id}, "
-                                    f"will be fixed in next cycle"
-                                )
-                            completed_chunks.add(chunk.chunk_id)
-                        else:
-                            logger.error(
-                                f"[DesignLoop] ❌ Merge {branch} "
-                                f"→ main failed"
-                            )
-                            all_success = False
+                    success = await self._execute_single_chunk(
+                        chunk, chunks, new_spec,
+                        max_inner_cycles, max_parallel, no_review,
+                    )
+                    if success:
+                        completed_chunks.add(chunk.chunk_id)
                     else:
                         all_success = False
-
-                    # Cleanup chunk branch
-                    try:
-                        await self._run_git(f"branch -D {branch}")
-                    except Exception:
-                        pass
-
-                # Drift adjustment after parallel wave
-                remaining = [c for c in chunks if c.status == "pending"]
-                if remaining:
-                    for chunk in ready_chunks:
-                        if chunk.chunk_id in completed_chunks:
-                            validation = self.chunk_history[-1].get(
-                                "validation", {}
-                            ) if self.chunk_history else {}
-                            if validation.get("design_issues") or \
-                               validation.get("drift_notes"):
-                                await self.refiner.adjust_remaining_chunks(
-                                    chunk, validation, remaining, new_spec
-                                )
 
         return all_success
 
@@ -432,17 +399,62 @@ class DesignLoop:
         """Execute one chunk and handle progress/validation."""
         chunk.status = "in_progress"
         self._save_progress(chunk.chunk_id, "in_progress", {})
+        self._emit_event(f"CHUNK_START {chunk.chunk_id} — {chunk.title} ({len(chunk.changes)} tasks)")
 
-        result = await self._run_chunk(
-            chunk, max_inner_cycles, max_parallel, no_review,
-            target_branch=target_branch,
-        )
+        total_attempts = 0
+
+        while True:
+            result = await self._run_chunk(
+                chunk, max_inner_cycles, max_parallel, no_review,
+                target_branch=target_branch,
+            )
+            total_attempts += 1
+
+            if result.get("success"):
+                break
+
+            # After exhausting all cycles, ask user
+            cycles_used = result.get("cycles", max_inner_cycles)
+
+            total_cycles = total_attempts * cycles_used
+
+            # Ask user via Discord + file signal
+            decision = await self._ask_chunk_approval(
+                chunk, result, total_cycles
+            )
+
+            if decision == "skip":
+                logger.info(
+                    f"[DesignLoop] User chose to SKIP {chunk.chunk_id}"
+                )
+                self._emit_event(
+                    f"CHUNK_SKIPPED {chunk.chunk_id} — user decision"
+                )
+                break
+            elif decision == "continue":
+                logger.info(
+                    f"[DesignLoop] User chose to CONTINUE {chunk.chunk_id}"
+                )
+                self._emit_event(
+                    f"CHUNK_RETRY {chunk.chunk_id} — user approved"
+                )
+                # Clear cached plan so it re-plans from gaps
+                plan_path = os.path.join(
+                    self.mesh_dir, f"{chunk.chunk_id}-plan.json"
+                )
+                if os.path.exists(plan_path):
+                    os.remove(plan_path)
+                continue
+            else:
+                # Timeout or error → skip
+                break
 
         validation = await self._validate_chunk(chunk, result)
 
         if result.get("success"):
             chunk.status = "completed"
             self._save_progress(chunk.chunk_id, "completed", result)
+            self._emit_event(f"CHUNK_END ✅ {chunk.chunk_id} completed")
             self.chunk_history.append({
                 "chunk_id": chunk.chunk_id,
                 "result": result,
@@ -462,11 +474,384 @@ class DesignLoop:
         else:
             chunk.status = "needs_redesign"
             self._save_progress(chunk.chunk_id, "needs_redesign", result)
+            self._emit_event(f"CHUNK_END ❌ {chunk.chunk_id} failed — {result.get('error', 'unknown')}")
             logger.warning(
                 f"[DesignLoop] ❌ Chunk {chunk.chunk_id} failed: "
                 f"{result.get('error', 'unknown')}"
             )
             return False
+
+    async def _ask_chunk_approval(
+        self, chunk: DesignChunk, result: dict, total_cycles: int
+    ) -> str:
+        """
+        Ask user whether to continue or skip a failing chunk.
+        Sends Discord notification, polls for file signal.
+        Returns: 'continue', 'skip', or 'timeout'.
+        """
+        chunk_id = chunk.chunk_id
+        gaps = result.get("final_gaps", "?")
+        error = result.get("error", "unknown")
+
+        # Signal file paths
+        continue_file = os.path.join(self.mesh_dir, f"CONTINUE-{chunk_id}")
+        skip_file = os.path.join(self.mesh_dir, f"SKIP-{chunk_id}")
+
+        # Clean up any stale signals
+        for f in [continue_file, skip_file]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        # Send Discord notification
+        ssh_host = self.config.get("notifications", {}).get("ssh_host", "mybox")
+        mesh_path = self.mesh_dir
+        msg = (
+            f"⚠️ **{chunk_id}** failed after {total_cycles} cycles "
+            f"({gaps} gaps remaining, error: {error})\n\n"
+            f"Reply:\n"
+            f"`ssh {ssh_host} 'touch {mesh_path}/CONTINUE-{chunk_id}'` → retry\n"
+            f"`ssh {ssh_host} 'touch {mesh_path}/SKIP-{chunk_id}'` → skip"
+        )
+        self._emit_event(
+            f"CHUNK_APPROVAL_NEEDED {chunk_id} — {total_cycles} cycles, "
+            f"{gaps} gaps"
+        )
+        if self._discord_webhook:
+            self._discord_send(msg)
+
+        # Poll for response (check every 30s, timeout after 2 hours)
+        poll_interval = 30
+        max_wait = 7200  # 2 hours
+        waited = 0
+
+        logger.info(
+            f"[DesignLoop] Waiting for user decision on {chunk_id} "
+            f"(CONTINUE/SKIP file)..."
+        )
+
+        while waited < max_wait:
+            if os.path.exists(continue_file):
+                os.remove(continue_file)
+                return "continue"
+            if os.path.exists(skip_file):
+                os.remove(skip_file)
+                return "skip"
+            if self._should_stop():
+                return "skip"
+            await asyncio.sleep(poll_interval)
+            waited += poll_interval
+
+        # Timeout → auto-skip
+        logger.warning(
+            f"[DesignLoop] Approval timeout for {chunk_id}, auto-skipping"
+        )
+        self._emit_event(f"CHUNK_APPROVAL_TIMEOUT {chunk_id} — auto-skip")
+        return "timeout"
+
+    async def _execute_parallel_wave_sync(
+        self,
+        ready_chunks: list[DesignChunk],
+        all_chunks: list[DesignChunk],
+        new_spec: str,
+        max_inner_cycles: int,
+        max_parallel: int,
+        no_review: bool,
+    ) -> bool:
+        """
+        Synchronized parallel wave execution.
+
+        Combines all chunks' tasks into ONE plan, runs ONE ProjectLoop:
+          Code (parallel worktrees) → Merge+Build (sequential) →
+          Verify (once) → Fix (parallel) → Merge+Build → Verify → ...
+
+        This prevents cross-contamination that occurred when each chunk
+        had its own independent ProjectLoop merging to main unsynchronized.
+        """
+        from ..context.store import ContextStore
+        from ..models.task import TaskPlan
+        from .change_converter import convert_changes_to_plan
+        from .dispatcher import Dispatcher
+        from .project_loop import ProjectLoop
+        from .spec_analyzer import get_code_tree
+        from types import SimpleNamespace
+
+        chunk_ids = [c.chunk_id for c in ready_chunks]
+        wave_label = ", ".join(chunk_ids)
+
+        # ── 1. Emit start events ──
+        for chunk in ready_chunks:
+            chunk.status = "in_progress"
+            self._save_progress(chunk.chunk_id, "in_progress", {})
+            self._emit_event(
+                f"CHUNK_START {chunk.chunk_id} — {chunk.title} "
+                f"({len(chunk.changes)} changes) [sync wave]"
+            )
+
+        # ── 2. Build combined plan from all chunks ──
+        code_tree = await get_code_tree(self.repo_dir, char_limit=20_000)
+        all_tasks = []
+        all_partial_specs = []
+
+        for chunk in ready_chunks:
+            # Write per-chunk spec (for reference)
+            chunk_spec_path = os.path.join(
+                self.mesh_dir, f"{chunk.chunk_id}-spec.md"
+            )
+            with open(chunk_spec_path, 'w') as f:
+                f.write(chunk.partial_spec)
+            all_partial_specs.append(chunk.partial_spec)
+
+            # Generate or load per-chunk plan
+            plan_path = os.path.join(
+                self.mesh_dir, f"{chunk.chunk_id}-plan.json"
+            )
+            if os.path.exists(plan_path):
+                logger.info(f"[SyncWave] Loading cached plan: {plan_path}")
+                with open(plan_path) as f:
+                    plan_data = json.load(f)
+                tasks = plan_data.get("tasks", [])
+            else:
+                logger.info(
+                    f"[SyncWave] Converting {len(chunk.changes)} changes "
+                    f"→ tasks for {chunk.chunk_id}..."
+                )
+                plan_dict = convert_changes_to_plan(
+                    changes=chunk.changes,
+                    project_name=os.path.basename(self.repo_dir),
+                    shared_context={"chunk": chunk.chunk_id},
+                    chunk_title=chunk.title,
+                )
+                tasks = plan_dict.get("tasks", [])
+                with open(plan_path, 'w') as f:
+                    json.dump(plan_dict, f, indent=2, ensure_ascii=False)
+
+            # Prefix task IDs with chunk_id for global uniqueness
+            for task in tasks:
+                if not task["id"].startswith(f"{chunk.chunk_id}/"):
+                    old_id = task["id"]
+                    task["id"] = f"{chunk.chunk_id}/{old_id}"
+                    task["dependencies"] = [
+                        f"{chunk.chunk_id}/{d}"
+                        if not d.startswith(f"{chunk.chunk_id}/")
+                        else d
+                        for d in task.get("dependencies", [])
+                    ]
+
+            all_tasks.extend(tasks)
+
+        if not all_tasks:
+            logger.warning("[SyncWave] No tasks from any chunk")
+            return False
+
+        # Save combined plan
+        combined_plan_path = os.path.join(
+            self.mesh_dir, "sync-wave-plan.json"
+        )
+        combined_plan = {
+            "project_name": os.path.basename(self.repo_dir),
+            "shared_context": {
+                "chunks": chunk_ids, "sync_wave": True,
+            },
+            "modules": {},
+            "tasks": all_tasks,
+        }
+        for task in all_tasks:
+            mod = task.get("module", "")
+            if mod and mod not in combined_plan["modules"]:
+                combined_plan["modules"][mod] = {
+                    "description": f"Module: {mod}",
+                    "interface_files": [],
+                    "imports": [],
+                    "exports": [],
+                }
+        with open(combined_plan_path, 'w') as f:
+            json.dump(combined_plan, f, indent=2, ensure_ascii=False)
+
+        logger.info(
+            f"[SyncWave] Combined plan: {len(all_tasks)} tasks "
+            f"from {len(ready_chunks)} chunks → {combined_plan_path}"
+        )
+
+        # ── 3. Write combined spec for verification ──
+        combined_spec_path = os.path.join(
+            self.mesh_dir, "sync-wave-spec.md"
+        )
+        combined_spec_content = "\n\n---\n\n".join(all_partial_specs)
+        combined_spec_content += (
+            f"\n\n## CURRENT PROJECT STRUCTURE\n"
+            f"IMPORTANT: Use the ACTUAL file paths below. "
+            f"Do NOT invent paths.\n\n{code_tree}\n"
+        )
+        with open(combined_spec_path, 'w') as f:
+            f.write(combined_spec_content)
+
+        # ── 4. Setup stores ──
+        store = ContextStore(self.repo_dir)
+        exp_store = None
+        advisor = None
+        project_name = os.path.basename(self.repo_dir)
+        project_type = "unknown"
+        total_cost = 0.0
+        try:
+            from .experience_store import ExperienceStore
+            from .project_classifier import ProjectClassifier
+            from .experience_advisor import ExperienceAdvisor
+            exp_store = ExperienceStore()
+            classifier = ProjectClassifier()
+            profile = exp_store.get_project_profile(project_name)
+            if profile and profile.get("project_type"):
+                project_type = profile["project_type"]
+            else:
+                classify_result = classifier.classify(self.repo_dir)
+                project_type = classify_result["project_type"]
+            advisor = ExperienceAdvisor(exp_store, project_type)
+        except Exception:
+            pass
+
+        # ── 5. Run ProjectLoop with approval retry ──
+        total_attempts = 0
+        success = False
+        current_plan_path = combined_plan_path
+
+        while True:
+            class _SyncDispatcher:
+                """Dispatcher for synchronized wave — all tasks merge to main."""
+                def __init__(self_, plan_path: str,
+                             max_parallel: int = 4,
+                             no_review: bool = True):
+                    nonlocal total_cost
+                    with open(plan_path) as f:
+                        plan_data = json.load(f)
+                    self_.plan = TaskPlan.from_dict(plan_data)
+                    self_.run_id = store.save_plan(self_.plan)
+                    cfg = {**self.config, "no_review": no_review}
+                    cfg.setdefault("dispatcher", {})["max_parallel"] = \
+                        max_parallel
+                    self_.dispatcher = Dispatcher(
+                        cfg, self.repo_dir, store,
+                        experience_store=exp_store,
+                        project_name=project_name,
+                        project_type=project_type,
+                        target_branch="main",
+                        slot_prefix="slot",
+                    )
+                    if advisor:
+                        self_.dispatcher.router.advisor = advisor
+
+                async def run(self_):
+                    nonlocal total_cost
+                    await self_.dispatcher.execute_plan(
+                        plan=self_.plan,
+                        run_id=self_.run_id,
+                        resume=True,
+                    )
+                    total_cost += self_.dispatcher.wave_cost_usd
+                    return "done"
+
+            loop = ProjectLoop(
+                self.config, self.repo_dir, combined_spec_path
+            )
+            try:
+                success = await loop.run_auto(
+                    max_cycles=max_inner_cycles,
+                    dispatcher_factory=_SyncDispatcher,
+                    initial_plan_path=current_plan_path,
+                    max_parallel=max_parallel,
+                    no_review=no_review,
+                    skip_initial_verify=True,
+                )
+            except Exception as e:
+                logger.error(f"[SyncWave] Execution error: {e}")
+                success = False
+
+            total_attempts += 1
+            if success:
+                break
+
+            # Ask user for approval to retry
+            final_gaps = 0
+            if loop.cycle_history:
+                final_gaps = loop.cycle_history[-1].get("gap_count", 0)
+
+            pseudo_result = {
+                "success": False,
+                "final_gaps": final_gaps,
+                "error": f"Sync wave ({wave_label}) failed",
+                "cycles": len(loop.cycle_history),
+            }
+
+            total_cycles = total_attempts * max_inner_cycles
+            wave_proxy = SimpleNamespace(chunk_id="sync-wave")
+            decision = await self._ask_chunk_approval(
+                wave_proxy, pseudo_result, total_cycles
+            )
+
+            if decision == "continue":
+                logger.info("[SyncWave] User chose to CONTINUE")
+                self._emit_event(
+                    f"SYNC_WAVE_RETRY ({wave_label}) — user approved"
+                )
+                # Use last cycle's fix-plan as next starting point
+                last_cycle = len(loop.cycle_history)
+                fix_plan = os.path.join(
+                    self.repo_dir,
+                    f".agent-mesh/fix-plan-{last_cycle}.json",
+                )
+                if os.path.exists(fix_plan):
+                    current_plan_path = fix_plan
+                continue
+            else:
+                break
+
+        # ── 6. Cleanup ──
+        store.close()
+        if exp_store:
+            if total_cost > 0:
+                exp_store.add_project_cost(project_name, total_cost)
+            exp_store.close()
+
+        # ── 7. Update chunk statuses ──
+        result_dict = {
+            "success": success,
+            "tasks": len(all_tasks),
+            "cost_usd": total_cost,
+        }
+
+        for chunk in ready_chunks:
+            if success:
+                chunk.status = "completed"
+                self._save_progress(chunk.chunk_id, "completed", result_dict)
+                self._emit_event(f"CHUNK_END ✅ {chunk.chunk_id} [sync wave]")
+                self.chunk_history.append({
+                    "chunk_id": chunk.chunk_id,
+                    "result": result_dict,
+                    "validation": {"design_issues": [], "drift_notes": ""},
+                })
+            else:
+                chunk.status = "needs_redesign"
+                self._save_progress(
+                    chunk.chunk_id, "needs_redesign", result_dict
+                )
+                self._emit_event(f"CHUNK_END ❌ {chunk.chunk_id} [sync wave]")
+                logger.warning(
+                    f"[SyncWave] ❌ Chunk {chunk.chunk_id} failed"
+                )
+
+        # Drift adjustment for remaining chunks
+        if success:
+            remaining = [c for c in all_chunks if c.status == "pending"]
+            if remaining and self.chunk_history:
+                last_validation = self.chunk_history[-1].get(
+                    "validation", {}
+                )
+                if (last_validation.get("design_issues")
+                        or last_validation.get("drift_notes")):
+                    for chunk in ready_chunks:
+                        await self.refiner.adjust_remaining_chunks(
+                            chunk, last_validation, remaining, new_spec
+                        )
+
+        return success
 
     async def _run_chunk(
         self,
@@ -582,6 +967,7 @@ class DesignLoop:
                     project_name=project_name,
                     project_type=project_type,
                     target_branch=target_branch,
+                    slot_prefix=chunk.chunk_id,
                 )
                 if advisor:
                     self_.dispatcher.router.advisor = advisor
@@ -814,7 +1200,7 @@ Each object:
 
         # Generate fix plan
         gap_analyzer = GapAnalyzer(self.config)
-        plan_dict = gap_analyzer.generate_fix_plan(report, cycle=999)
+        plan_dict = gap_analyzer.generate_fix_plan(report)
 
         if not plan_dict or not plan_dict.get("tasks"):
             logger.warning("[DesignLoop] No fix tasks generated from residual gaps")
