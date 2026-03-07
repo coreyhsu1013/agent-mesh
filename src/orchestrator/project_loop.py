@@ -484,40 +484,37 @@ class ProjectLoop:
 
     def _get_chunk_scope_modules(self, chunk_id: str) -> set[str]:
         """
-        Extract module keywords from chunk's partial spec filename.
-        Returns set of lowercase module name fragments for matching.
+        Extract module scope from chunk's spec title line and chunk_id.
+        Only uses the FIRST line / Scope declaration to avoid picking up
+        context-only module references.
         """
-        # Read chunk partial spec to find module references
-        spec_path = os.path.join(
-            self.repo_dir, ".agent-mesh", f"{chunk_id}-spec.md"
-        )
-        if not os.path.exists(spec_path):
-            return set()
-
-        try:
-            with open(spec_path) as f:
-                content = f.read()[:5000]  # only need headers
-        except Exception:
-            return set()
-
-        # Extract "Module N — Name" patterns from spec
         import re
         modules = set()
-        for match in re.finditer(
-            r'module\s+(\d+)\s*[—–-]\s*([^\n(]+)', content, re.IGNORECASE
-        ):
-            num = match.group(1)
-            name = match.group(2).strip().rstrip(':').strip()
-            modules.add(f"module {num}")
-            # Add name variants: "Notification", "notification"
-            modules.add(name.lower())
 
-        # Also derive from chunk_id: "chunk-4-notification-backend" → "notification"
+        # 1. From chunk_id: "chunk-4-notification-backend" → "notification"
         parts = chunk_id.split("-")[2:]  # skip "chunk" and number
         for part in parts:
             if part not in ("backend", "frontend", "api", "schema", "dependent",
                             "foundation", "and"):
                 modules.add(part.lower())
+
+        # 2. From spec title + scope lines (first 500 chars only)
+        spec_path = os.path.join(
+            self.repo_dir, ".agent-mesh", f"{chunk_id}-spec.md"
+        )
+        if os.path.exists(spec_path):
+            try:
+                with open(spec_path) as f:
+                    header = f.read(500)
+                # Only match "Module N" in title (# line) or "Scope:" line
+                for line in header.split("\n")[:10]:
+                    if line.startswith("#") or line.lower().startswith("> scope"):
+                        for match in re.finditer(
+                            r'module\s+(\d+)', line, re.IGNORECASE
+                        ):
+                            modules.add(f"module {match.group(1)}")
+            except Exception:
+                pass
 
         return modules
 
