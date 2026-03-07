@@ -15,6 +15,7 @@ v0.8:   Layer 3 (spec feedback) + Layer 4 (integration validation)
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from .verifier import Verifier, VerifyReport, VerifyIssue
 from .gap_analyzer import GapAnalyzer
 from .model_ranking import OuterLoopEscalation
 from .retrospective import RetrospectiveAnalyzer
+from .run_history import RunHistoryRecorder
 
 logger = logging.getLogger("agent-mesh")
 
@@ -46,7 +48,8 @@ class ProjectLoop:
         plan = await loop.verify_and_plan()
     """
 
-    def __init__(self, config: dict, repo_dir: str, spec_path: str | None = None):
+    def __init__(self, config: dict, repo_dir: str, spec_path: str | None = None,
+                 run_history: RunHistoryRecorder | None = None):
         self.config = config
         self.repo_dir = repo_dir
         self.spec_path = spec_path
@@ -55,6 +58,8 @@ class ProjectLoop:
         self.escalation = OuterLoopEscalation(config)
         self.retrospective = RetrospectiveAnalyzer(config, repo_dir)
         self.cycle_history: list[dict] = []
+        # v1.3: structured run history (shared from DesignLoop if provided)
+        self.run_history = run_history or RunHistoryRecorder(repo_dir)
         # v1.2: Layer 3 per-gap cache (avoid re-analyzing same gap)
         self._spec_feedback_cache: dict[str, str] = {}  # gap_key → root_cause
         # v1.2: event log for monitoring
@@ -119,6 +124,8 @@ class ProjectLoop:
             return report, None
 
         # Generate fix-plan
+        # v1.3: pass cycle to gap_analyzer for fix-cycle merge
+        self.gap_analyzer.fix_cycle = cycle
         plan = self.gap_analyzer.generate_fix_plan(report)
         plan_path = os.path.join(self.repo_dir, f".agent-mesh/fix-plan-{cycle}.json")
         self.gap_analyzer.save_fix_plan(plan, plan_path)
@@ -143,7 +150,7 @@ class ProjectLoop:
         verify_cfg = self.config.get("verify", {})
         exclude_modules = verify_cfg.get("exclude_modules", [])
         max_new = verify_cfg.get("max_new_gaps_per_cycle", 5)
-        convergence_threshold = verify_cfg.get("convergence_threshold", 3)
+        convergence_threshold = verify_cfg.get("convergence_threshold", 0)
 
         logger.info(f"\n{'='*60}")
         logger.info(f"  🔍 Verify Cycle {cycle} (closed-loop)")
@@ -156,9 +163,22 @@ class ProjectLoop:
             f"test={'✅' if report.test_ok else '❌'} lint={'✅' if report.lint_ok else '❌'}"
         )
 
+        # Step 0.5: Load deferred gaps from previous chunks (if any)
+        chunk_id = self.config.get("current_chunk_id", "")
+        deferred_for_us = []
+        if chunk_id and cycle == 1:
+            deferred_for_us = self._load_deferred_gaps(chunk_id)
+
         # Step 1: Regression check (if previous report exists)
         remaining_gaps = []
         prev_gaps = self._load_prev_gaps(cycle)
+        # Merge deferred gaps into prev_gaps for regression
+        if deferred_for_us:
+            prev_gaps.extend(deferred_for_us)
+            logger.info(
+                f"[ScopeFilter] Added {len(deferred_for_us)} deferred gaps "
+                f"from previous chunks to regression check"
+            )
         code_tree = await self.verifier._get_code_tree()
 
         if prev_gaps:
@@ -252,6 +272,36 @@ class ProjectLoop:
 
         all_gap_count = len([i for i in report.issues if i.category == "spec_gap"])
         report.spec_gap_count = all_gap_count
+
+        # Step 2.6: Scope filter — remove gaps not belonging to current chunk
+        chunk_id = self.config.get("current_chunk_id", "")
+        if chunk_id and all_gap_count > 0:
+            scope_modules = self._get_chunk_scope_modules(chunk_id)
+            if scope_modules:
+                in_scope = []
+                deferred = []
+                for issue in report.issues:
+                    if issue.category != "spec_gap":
+                        in_scope.append(issue)
+                        continue
+                    if self._issue_in_scope(issue, scope_modules):
+                        in_scope.append(issue)
+                    else:
+                        deferred.append(issue)
+
+                if deferred:
+                    logger.info(
+                        f"[ScopeFilter] {len(deferred)} gaps out of chunk scope, "
+                        f"deferring to later chunks"
+                    )
+                    for d in deferred:
+                        logger.info(f"  ↳ deferred: [{d.module}] {d.message[:80]}")
+                    self._save_deferred_gaps(deferred)
+                    report.issues = in_scope
+                    all_gap_count = len([
+                        i for i in report.issues if i.category == "spec_gap"
+                    ])
+                    report.spec_gap_count = all_gap_count
 
         # Save report
         report_path = os.path.join(self.repo_dir, f".agent-mesh/verify-report-{cycle}.json")
@@ -363,6 +413,8 @@ class ProjectLoop:
         if report.passed:
             return report, None
 
+        # v1.3: pass cycle to gap_analyzer for fix-cycle merge
+        self.gap_analyzer.fix_cycle = cycle
         plan = self.gap_analyzer.generate_fix_plan(report)
         plan_path = os.path.join(self.repo_dir, f".agent-mesh/fix-plan-{cycle}.json")
         self.gap_analyzer.save_fix_plan(plan, plan_path)
@@ -429,6 +481,125 @@ class ProjectLoop:
         logger.info(
             f"[Layer3] Saved {len(questions)} spec questions → {questions_path}"
         )
+
+    def _get_chunk_scope_modules(self, chunk_id: str) -> set[str]:
+        """
+        Extract module keywords from chunk's partial spec filename.
+        Returns set of lowercase module name fragments for matching.
+        """
+        # Read chunk partial spec to find module references
+        spec_path = os.path.join(
+            self.repo_dir, ".agent-mesh", f"{chunk_id}-spec.md"
+        )
+        if not os.path.exists(spec_path):
+            return set()
+
+        try:
+            with open(spec_path) as f:
+                content = f.read()[:5000]  # only need headers
+        except Exception:
+            return set()
+
+        # Extract "Module N — Name" patterns from spec
+        import re
+        modules = set()
+        for match in re.finditer(
+            r'module\s+(\d+)\s*[—–-]\s*([^\n(]+)', content, re.IGNORECASE
+        ):
+            num = match.group(1)
+            name = match.group(2).strip().rstrip(':').strip()
+            modules.add(f"module {num}")
+            # Add name variants: "Notification", "notification"
+            modules.add(name.lower())
+
+        # Also derive from chunk_id: "chunk-4-notification-backend" → "notification"
+        parts = chunk_id.split("-")[2:]  # skip "chunk" and number
+        for part in parts:
+            if part not in ("backend", "frontend", "api", "schema", "dependent",
+                            "foundation", "and"):
+                modules.add(part.lower())
+
+        return modules
+
+    @staticmethod
+    def _issue_in_scope(issue: VerifyIssue, scope_modules: set[str]) -> bool:
+        """Check if an issue's module matches the current chunk scope."""
+        if not issue.module:
+            return True  # no module info → keep it (conservative)
+
+        mod_lower = issue.module.lower()
+        for scope_mod in scope_modules:
+            if scope_mod in mod_lower:
+                return True
+        return False
+
+    def _save_deferred_gaps(self, gaps: list[VerifyIssue]):
+        """Save out-of-scope gaps to deferred-gaps.json for later chunks."""
+        mesh_dir = os.path.join(self.repo_dir, ".agent-mesh")
+        path = os.path.join(mesh_dir, "deferred-gaps.json")
+
+        existing = []
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = []
+
+        # Dedup by module+message
+        existing_keys = {
+            (g.get("module") or "").lower() + "|" + (g.get("message") or "").lower()
+            for g in existing
+        }
+        for gap in gaps:
+            key = (gap.module or "").lower() + "|" + gap.message.lower()
+            if key not in existing_keys:
+                existing.append(gap.to_dict())
+                existing_keys.add(key)
+
+        with open(path, 'w') as f:
+            json.dump(existing, f, indent=2, ensure_ascii=False)
+        logger.info(f"[ScopeFilter] Deferred gaps saved: {len(existing)} total")
+
+    def _load_deferred_gaps(self, chunk_id: str) -> list[dict]:
+        """Load deferred gaps that belong to this chunk's scope."""
+        path = os.path.join(self.repo_dir, ".agent-mesh", "deferred-gaps.json")
+        if not os.path.exists(path):
+            return []
+
+        try:
+            with open(path) as f:
+                all_deferred = json.load(f)
+        except Exception:
+            return []
+
+        if not all_deferred:
+            return []
+
+        scope_modules = self._get_chunk_scope_modules(chunk_id)
+        if not scope_modules:
+            return []
+
+        # Pick gaps that match this chunk's scope
+        matched = []
+        remaining = []
+        for gap in all_deferred:
+            mod = (gap.get("module") or "").lower()
+            in_scope = any(s in mod for s in scope_modules)
+            if in_scope:
+                matched.append(gap)
+            else:
+                remaining.append(gap)
+
+        if matched:
+            # Save back only unmatched gaps
+            with open(path, 'w') as f:
+                json.dump(remaining, f, indent=2, ensure_ascii=False)
+            logger.info(
+                f"[ScopeFilter] Loaded {len(matched)} deferred gaps for {chunk_id}"
+            )
+
+        return matched
 
     def _is_diverging(self, current_gap_count: int) -> bool:
         """Check if gaps are getting worse instead of converging."""
@@ -511,6 +682,7 @@ class ProjectLoop:
         max_parallel: int = 3,
         no_review: bool = True,
         skip_initial_verify: bool = False,
+        manual_mode: bool = False,
     ):
         """
         Auto mode: run cycles until convergence or max_cycles.
@@ -526,6 +698,27 @@ class ProjectLoop:
                 bounded scan instead of expensive open-ended spec diff.
         """
         t0 = time.time()
+
+        # v1.3: auto-start run if not already started (standalone mode)
+        if self.run_history._current_run is None:
+            import datetime as _dt
+            _run_id = f"run-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            self.run_history.start_run(_run_id, self.config)
+
+        # v1.3: check STOP before cleaning — respect active stop signal
+        mesh_dir = os.path.join(self.repo_dir, ".agent-mesh")
+        stop_path = os.path.join(mesh_dir, "STOP")
+        if os.path.exists(stop_path):
+            self._emit_event("STOP 🛑 stop signal detected at startup")
+            logger.info("[ProjectLoop] 🛑 Stop signal exists, not starting")
+            return False
+
+        # Clean stale CONTINUE/SKIP from previous runs (not STOP)
+        for sig in ["CONTINUE", "SKIP"]:
+            sig_path = os.path.join(mesh_dir, sig)
+            if os.path.exists(sig_path):
+                os.remove(sig_path)
+                logger.info(f"[ProjectLoop] Cleaned stale signal: {sig}")
 
         for cycle in range(1, max_cycles + 1):
             # v1.2: graceful shutdown check
@@ -561,7 +754,46 @@ class ProjectLoop:
                 break
 
             # ── ACT: Execute the plan ──
+            cycle_start = time.time()
+            commit_before = self.run_history.get_current_commit()
+            dispatcher = None  # will be set if dispatcher_factory exists
+
             if dispatcher_factory:
+                # v1.3: manual mode — pause before execution
+                if manual_mode:
+                    # Read plan to show summary
+                    try:
+                        import json as _json
+                        with open(plan_path) as _f:
+                            _plan_data = _json.load(_f)
+                        _tasks = _plan_data.get("tasks", [])
+                        _task_lines = []
+                        for _t in _tasks:
+                            _task_lines.append(
+                                f"  • {_t.get('title', '?')} "
+                                f"[{_t.get('complexity', '?')}] "
+                                f"files: {', '.join(_t.get('target_files', [])[:3]) or 'auto'}"
+                            )
+                        _model_hint = "DeepSeek→Sonnet→Opus" if cycle == 1 else (
+                            "Sonnet start" if cycle == 2 else "Opus start"
+                        )
+                        _summary = (
+                            f"Cycle {cycle}/{max_cycles}\n"
+                            f"Plan: {plan_path}\n"
+                            f"Tasks: {len(_tasks)}\n"
+                            f"Model chain: {_model_hint}\n"
+                            f"Max parallel: {max_parallel}\n\n"
+                            f"Tasks:\n" + "\n".join(_task_lines)
+                        )
+                    except Exception:
+                        _summary = f"Cycle {cycle}/{max_cycles}\nPlan: {plan_path}"
+
+                    decision = await self._manual_pause("PRE-EXECUTE", _summary)
+                    if decision == "skip":
+                        return False
+                    if decision == "stop":
+                        return False
+
                 logger.info(f"[ProjectLoop] 🚀 Executing plan: {plan_path}")
                 dispatcher = dispatcher_factory(
                     plan_path=plan_path,
@@ -606,6 +838,40 @@ class ProjectLoop:
             fix_count = len(plan['tasks']) if plan else 0
             status = "✅ PASSED" if report.passed else f"❌ {gap_count} gaps, {fix_count} fix tasks"
             self._emit_event(f"VERIFY cycle={cycle} build={'✅' if report.build_ok else '❌'} {status}")
+
+            # v1.3: save checkpoint for restore
+            self._save_checkpoint(cycle, gap_count, fix_count, report)
+
+            # v1.3: record cycle to run history
+            commit_after = self.run_history.get_current_commit()
+            chunk_id = self.config.get("current_chunk_id", "unknown")
+
+            # Collect execution data from dispatcher (if available)
+            exec_cost = getattr(dispatcher, 'cost_usd', 0) if dispatcher else 0
+            exec_tasks = getattr(dispatcher, 'task_summaries', []) if dispatcher else []
+            exec_completed = sum(1 for t in exec_tasks if t.get("status") == "completed")
+
+            self.run_history.record_cycle(
+                chunk_id=chunk_id,
+                cycle=cycle,
+                duration_sec=time.time() - cycle_start,
+                cost_usd=exec_cost,
+                commit_before=commit_before,
+                commit_after=commit_after,
+                execution={
+                    "task_count": len(exec_tasks) if exec_tasks else _count_plan_tasks(plan_path),
+                    "completed": exec_completed,
+                    "failed": len(exec_tasks) - exec_completed,
+                    "tasks": exec_tasks,
+                },
+                verify={
+                    "build_ok": report.build_ok,
+                    "test_ok": report.test_ok,
+                    "lint_ok": report.lint_ok,
+                    "total_gaps": gap_count,
+                },
+                escalation=self.escalation.get_status(),
+            )
 
             # ── Check termination ──
             if report.passed:
@@ -653,6 +919,35 @@ class ProjectLoop:
                 f"min rank: {esc_status['current_min_rank']} ({esc_status['rank_label']})"
             )
 
+            # v1.3: manual mode — pause after verify, before next cycle
+            if manual_mode and cycle < max_cycles:
+                # Build gap summary for user
+                _gap_lines = []
+                for _i in report.issues:
+                    if _i.category == "spec_gap":
+                        _gap_lines.append(f"  • [{_i.severity}] {_i.message[:120]}")
+                _gap_history = " → ".join(
+                    str(e.get("gap_count", "?")) for e in self.cycle_history
+                )
+                _next_model = "Sonnet" if cycle + 1 == 2 else (
+                    "Opus" if cycle + 1 >= 3 else "DeepSeek"
+                )
+                _verify_summary = (
+                    f"Cycle {cycle} complete.\n"
+                    f"Build: {'✅' if report.build_ok else '❌'}\n"
+                    f"Gaps: {gap_count}\n"
+                    f"Gap trend: {_gap_history}\n"
+                    f"Fix tasks generated: {fix_count}\n"
+                    f"Next cycle model: {_next_model}\n\n"
+                    f"Gap details:\n" + "\n".join(_gap_lines[:15])
+                )
+
+                decision = await self._manual_pause("POST-VERIFY", _verify_summary)
+                if decision == "skip":
+                    return False
+                if decision == "stop":
+                    return False
+
         # Max cycles reached
         total_time = time.time() - t0
         remaining = len(self.cycle_history[-1]['report'].issues) if self.cycle_history else 0
@@ -681,3 +976,201 @@ class ProjectLoop:
             logger.info(
                 f"🏆 Final min rank: {esc['current_min_rank']} ({esc['rank_label']})"
             )
+
+    async def _manual_pause(self, phase: str, summary: str) -> str:
+        """
+        v1.3: Manual mode — pause and wait for user confirmation.
+        Writes a status file with details, waits for CONTINUE/SKIP signal.
+
+        Args:
+            phase: Phase name (e.g. "pre-execute", "post-verify")
+            summary: Human-readable summary of what's about to happen / just happened
+
+        Returns: 'continue', 'skip', or 'timeout'
+        """
+        mesh_dir = os.path.join(self.repo_dir, ".agent-mesh")
+        os.makedirs(mesh_dir, exist_ok=True)
+
+        # Write status file for user to review
+        status_path = os.path.join(mesh_dir, "MANUAL-STATUS.txt")
+        with open(status_path, 'w') as f:
+            f.write(f"=== MANUAL MODE: {phase} ===\n\n")
+            f.write(summary)
+            f.write(f"\n\n--- Actions ---\n")
+            f.write(f"touch {mesh_dir}/CONTINUE  → proceed\n")
+            f.write(f"touch {mesh_dir}/SKIP      → skip to next chunk\n")
+            f.write(f"touch {mesh_dir}/STOP      → stop entirely\n")
+
+        continue_file = os.path.join(mesh_dir, "CONTINUE")
+        skip_file = os.path.join(mesh_dir, "SKIP")
+        stop_file = os.path.join(mesh_dir, "STOP")
+
+        # Clean stale signals
+        for f in [continue_file, skip_file]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        # Notify
+        logger.info(f"\n{'='*60}")
+        logger.info(f"  ⏸️  MANUAL PAUSE: {phase}")
+        logger.info(f"{'='*60}")
+        logger.info(summary)
+        logger.info(f"\nWaiting for signal: touch CONTINUE / SKIP / STOP")
+        logger.info(f"Status file: {status_path}")
+        self._emit_event(f"MANUAL_PAUSE {phase}")
+
+        # Discord notification
+        if self._discord_webhook:
+            self._discord_send(
+                f"⏸️ **Manual pause: {phase}**\n\n{summary}\n\n"
+                f"`touch CONTINUE` / `touch SKIP` / `touch STOP`"
+            )
+
+        # Poll (every 10s, no timeout — wait forever in manual mode)
+        while True:
+            if os.path.exists(stop_file):
+                return "stop"
+            if os.path.exists(continue_file):
+                os.remove(continue_file)
+                logger.info("[Manual] ▶️ CONTINUE received")
+                return "continue"
+            if os.path.exists(skip_file):
+                os.remove(skip_file)
+                logger.info("[Manual] ⏭️ SKIP received")
+                return "skip"
+            await asyncio.sleep(10)
+
+    def _save_checkpoint(self, cycle: int, gap_count: int,
+                         fix_count: int, report) -> None:
+        """
+        v1.3: Save checkpoint after each cycle for restore capability.
+        Stores git commit hash + cycle metadata so user can jump back.
+        """
+        import datetime
+        import subprocess
+
+        mesh_dir = os.path.join(self.repo_dir, ".agent-mesh")
+        checkpoints_path = os.path.join(mesh_dir, "checkpoints.json")
+
+        # Get current git commit hash
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo_dir, capture_output=True, text=True
+            )
+            commit_hash = result.stdout.strip()
+        except Exception:
+            commit_hash = "unknown"
+
+        # Get chunk_id from config (set by design_loop)
+        chunk_id = self.config.get("current_chunk_id", "unknown")
+
+        # Build gap summary
+        gap_details = []
+        if not report.passed:
+            for issue in report.issues:
+                if issue.category == "spec_gap":
+                    gap_details.append({
+                        "severity": issue.severity,
+                        "message": issue.message[:200],
+                        "module": issue.module or "",
+                    })
+
+        checkpoint = {
+            "chunk_id": chunk_id,
+            "cycle": cycle,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "commit": commit_hash,
+            "gaps": gap_count,
+            "fix_tasks": fix_count,
+            "build_ok": report.build_ok,
+            "passed": report.passed,
+            "gap_details": gap_details[:20],
+            "fix_plan_path": os.path.join(mesh_dir, f"fix-plan-{cycle}.json"),
+        }
+
+        # Load existing checkpoints
+        checkpoints = []
+        if os.path.exists(checkpoints_path):
+            try:
+                with open(checkpoints_path) as f:
+                    checkpoints = json.load(f)
+            except Exception:
+                checkpoints = []
+
+        checkpoints.append(checkpoint)
+
+        with open(checkpoints_path, 'w') as f:
+            json.dump(checkpoints, f, indent=2, ensure_ascii=False)
+
+        logger.info(
+            f"[Checkpoint] Saved: {chunk_id}/cycle-{cycle} "
+            f"commit={commit_hash[:8]} gaps={gap_count}"
+        )
+
+    @staticmethod
+    def list_checkpoints(repo_dir: str) -> list[dict]:
+        """List all saved checkpoints for display."""
+        path = os.path.join(repo_dir, ".agent-mesh", "checkpoints.json")
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    @staticmethod
+    async def restore_checkpoint(repo_dir: str, chunk_id: str, cycle: int) -> dict | None:
+        """
+        Restore code to a specific checkpoint state.
+        Returns the checkpoint dict if found, None otherwise.
+        """
+        import asyncio
+
+        checkpoints = ProjectLoop.list_checkpoints(repo_dir)
+
+        # Find matching checkpoint
+        target = None
+        for cp in checkpoints:
+            if cp["chunk_id"] == chunk_id and cp["cycle"] == cycle:
+                target = cp
+
+        if not target:
+            logger.error(
+                f"[Checkpoint] Not found: {chunk_id}/cycle-{cycle}. "
+                f"Available: {[(c['chunk_id'], c['cycle']) for c in checkpoints]}"
+            )
+            return None
+
+        commit = target["commit"]
+        if commit == "unknown":
+            logger.error("[Checkpoint] No git commit hash saved for this checkpoint")
+            return None
+
+        # Restore git state
+        proc = await asyncio.create_subprocess_shell(
+            f"git reset --hard {commit}",
+            cwd=repo_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(f"[Checkpoint] git reset failed: {stderr.decode()}")
+            return None
+
+        logger.info(
+            f"[Checkpoint] Restored to {chunk_id}/cycle-{cycle} "
+            f"(commit {commit[:8]})"
+        )
+        return target
+
+
+def _count_plan_tasks(plan_path: str) -> int:
+    """Count tasks in a plan file (safe fallback)."""
+    try:
+        with open(plan_path) as f:
+            return len(json.load(f).get("tasks", []))
+    except Exception:
+        return 0
