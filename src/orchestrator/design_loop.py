@@ -123,21 +123,36 @@ class DesignLoop:
         finally:
             self.run_history.end_run()
 
-    def _clear_all_cache(self):
-        """Clear all residual cache files for a fresh run.
+    def _find_max_iter(self) -> int:
+        """Scan existing design-chunks-iter*.json to find the highest iteration number."""
+        import glob
+        max_iter = 0
+        for f in glob.glob(os.path.join(self.mesh_dir, "design-chunks-iter*.json")):
+            basename = os.path.basename(f)
+            # design-chunks-iter3.json → 3
+            try:
+                n = int(basename.replace("design-chunks-iter", "").replace(".json", ""))
+                max_iter = max(max_iter, n)
+            except ValueError:
+                pass
+        return max_iter
 
-        Called when NOT resuming. Removes design-changes, design-chunks,
-        design-progress, fix-plans, remaining-gaps, and chunk-specific files
-        so the pipeline starts from a clean spec delta analysis.
+    def _clear_all_cache(self):
+        """Clear residual cache files for a fresh run.
+
+        Called when NOT resuming. Clears working state (design-changes,
+        design-progress, fix-plans) but preserves historical iteration
+        records (design-chunks-iter*.json, design-final-report-iter*.json)
+        so iteration numbering continues across runs.
         """
         import glob
 
         patterns = [
             "design-changes.json",
             "design-chunks.json",
-            "design-chunks-iter*.json",
+            # NOTE: design-chunks-iter*.json preserved for history
             "design-progress.json",
-            "design-progress-*.json",
+            # NOTE: design-progress-*.json preserved (timestamped backups)
             "remaining-gaps.json",
             "fix-plan-*.json",
             "chunk-*-spec.md",
@@ -241,7 +256,11 @@ class DesignLoop:
             logger.warning(f"[DesignLoop] CLAUDE.md generation failed: {e}")
 
         # ── Outer recursion loop (infinite until converged or stopped) ──
-        design_iter = 0
+        # v1.5: continue iteration numbering from previous runs
+        iter_offset = self._find_max_iter()
+        if iter_offset > 0:
+            logger.info(f"[DesignLoop] Found previous iterations up to {iter_offset}, continuing from {iter_offset + 1}")
+        design_iter = iter_offset
         while True:
             design_iter += 1
             logger.info(f"\n{'='*60}")
@@ -319,41 +338,24 @@ class DesignLoop:
                 logger.info(f"{'='*60}")
                 return True
 
-            # ── Recursion: gaps found → ask whether to continue ──
+            # ── Gaps remain → pause and ask whether to continue ──
             gap_count = final.get("gap_count", 0)
-
-            if self.config.get("manual_mode", False):
-                # Manual mode: pause and ask
-                summary = (
-                    f"Iteration {design_iter} complete.\n"
-                    f"Gaps: {gap_count}\n"
-                    f"Total time: {time.time() - t0:.0f}s\n\n"
-                    f"CONTINUE = run iteration {design_iter + 1}\n"
-                    f"STOP = finish here"
+            summary = (
+                f"Iteration {design_iter} complete.\n"
+                f"Gaps: {gap_count}\n"
+                f"Total time: {time.time() - t0:.0f}s\n\n"
+                f"CONTINUE = run iteration {design_iter + 1}\n"
+                f"STOP = finish here"
+            )
+            signal = await self._wait_for_signal(
+                "POST-ITERATION", summary
+            )
+            if signal in ("stop", "skip"):
+                logger.info(
+                    f"[DesignLoop] Stopped after iteration "
+                    f"{design_iter} with {gap_count} gaps remaining"
                 )
-                signal = await self._wait_for_signal(
-                    "POST-ITERATION", summary
-                )
-                if signal == "stop":
-                    logger.info(
-                        f"[DesignLoop] Stopped by user after iteration "
-                        f"{design_iter} with {gap_count} gaps remaining"
-                    )
-                    break
-                if signal == "skip":
-                    logger.info(
-                        f"[DesignLoop] Skipping remaining gaps, finishing"
-                    )
-                    break
-            else:
-                # Non-manual mode: use max_design_iterations as before
-                if design_iter >= self.max_design_iterations:
-                    logger.warning(
-                        f"[DesignLoop] Max design iterations "
-                        f"({self.max_design_iterations}) reached with "
-                        f"{gap_count} gaps remaining"
-                    )
-                    break
+                break
 
             logger.info(
                 f"\n🔄 Final validation found {gap_count} gaps — "
