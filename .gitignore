@@ -9,3 +9,5 @@ dist/
 *.egg-info/
 .mypy_cache/
 plan.json
+CLAUDE.local.md
+.claude/settings.local.json

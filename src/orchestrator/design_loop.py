@@ -189,10 +189,12 @@ class DesignLoop:
         except Exception as e:
             logger.warning(f"[DesignLoop] CLAUDE.md generation failed: {e}")
 
-        # ── Outer recursion loop ──
-        for design_iter in range(1, self.max_design_iterations + 1):
+        # ── Outer recursion loop (infinite until converged or stopped) ──
+        design_iter = 0
+        while True:
+            design_iter += 1
             logger.info(f"\n{'='*60}")
-            logger.info(f"  🔄 Design Iteration {design_iter}/{self.max_design_iterations}")
+            logger.info(f"  🔄 Design Iteration {design_iter}")
             logger.info(f"{'='*60}")
 
             # ── Step 3: Plan chunks (cached if design-chunks-iter{N}.json exists) ──
@@ -266,14 +268,41 @@ class DesignLoop:
                 logger.info(f"{'='*60}")
                 return True
 
-            # ── Recursion: gaps found → convert to new changes → re-chunk ──
+            # ── Recursion: gaps found → ask whether to continue ──
             gap_count = final.get("gap_count", 0)
-            if design_iter >= self.max_design_iterations:
-                logger.warning(
-                    f"[DesignLoop] Max design iterations ({self.max_design_iterations}) "
-                    f"reached with {gap_count} gaps remaining"
+
+            if self.config.get("manual_mode", False):
+                # Manual mode: pause and ask
+                summary = (
+                    f"Iteration {design_iter} complete.\n"
+                    f"Gaps: {gap_count}\n"
+                    f"Total time: {time.time() - t0:.0f}s\n\n"
+                    f"CONTINUE = run iteration {design_iter + 1}\n"
+                    f"STOP = finish here"
                 )
-                break
+                signal = await self._wait_for_signal(
+                    "POST-ITERATION", summary
+                )
+                if signal == "stop":
+                    logger.info(
+                        f"[DesignLoop] Stopped by user after iteration "
+                        f"{design_iter} with {gap_count} gaps remaining"
+                    )
+                    break
+                if signal == "skip":
+                    logger.info(
+                        f"[DesignLoop] Skipping remaining gaps, finishing"
+                    )
+                    break
+            else:
+                # Non-manual mode: use max_design_iterations as before
+                if design_iter >= self.max_design_iterations:
+                    logger.warning(
+                        f"[DesignLoop] Max design iterations "
+                        f"({self.max_design_iterations}) reached with "
+                        f"{gap_count} gaps remaining"
+                    )
+                    break
 
             logger.info(
                 f"\n🔄 Final validation found {gap_count} gaps — "
@@ -1395,6 +1424,47 @@ Each object:
             "remaining": remaining,
             "cost_usd": total_cost,
         }
+
+    async def _wait_for_signal(self, phase: str, summary: str) -> str:
+        """Wait for manual signal (CONTINUE/SKIP/STOP) via touch files."""
+        mesh_dir = self.mesh_dir
+
+        status_path = os.path.join(mesh_dir, "MANUAL-STATUS.txt")
+        with open(status_path, 'w') as f:
+            f.write(f"=== MANUAL MODE: {phase} ===\n\n")
+            f.write(summary)
+            f.write(f"\n\n--- Actions ---\n")
+            f.write(f"touch {mesh_dir}/CONTINUE  → proceed\n")
+            f.write(f"touch {mesh_dir}/SKIP      → skip\n")
+            f.write(f"touch {mesh_dir}/STOP      → stop entirely\n")
+
+        continue_file = os.path.join(mesh_dir, "CONTINUE")
+        skip_file = os.path.join(mesh_dir, "SKIP")
+        stop_file = os.path.join(mesh_dir, "STOP")
+
+        for f in [continue_file, skip_file]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"  ⏸️  MANUAL PAUSE: {phase}")
+        logger.info(f"{'='*60}")
+        logger.info(summary)
+        logger.info(f"\nWaiting for signal: touch CONTINUE / SKIP / STOP")
+        logger.info(f"Status file: {status_path}")
+
+        while True:
+            if os.path.exists(stop_file):
+                return "stop"
+            if os.path.exists(continue_file):
+                os.remove(continue_file)
+                logger.info("[Manual] ▶️ CONTINUE received")
+                return "continue"
+            if os.path.exists(skip_file):
+                os.remove(skip_file)
+                logger.info("[Manual] ⏭️ SKIP received")
+                return "skip"
+            await asyncio.sleep(10)
 
     async def _final_validation(
         self, new_spec_path: str, design_iter: int = 1
