@@ -324,7 +324,7 @@ async def run_verify(config: dict, repo_dir: str, spec_path: str | None = None,
 
 async def run_evolve(config: dict, repo_dir: str, old_spec: str, new_spec: str,
                      max_cycles: int = 3, max_parallel: int | None = None,
-                     no_review: bool = True):
+                     no_review: bool = True, resume: bool = False):
     """Run Design Pipeline: spec evolution mode (v1.0)."""
     from .design_loop import DesignLoop
 
@@ -335,8 +335,10 @@ async def run_evolve(config: dict, repo_dir: str, old_spec: str, new_spec: str,
     logger.info(f"📁 Repo: {repo_dir}")
     logger.info(f"📋 Old spec: {old_spec}")
     logger.info(f"📋 New spec: {new_spec}")
+    if resume:
+        logger.info(f"🔄 Resume mode: using cached state from previous run")
 
-    loop = DesignLoop(config, repo_dir)
+    loop = DesignLoop(config, repo_dir, resume=resume)
     success = await loop.run(
         old_spec_path=old_spec,
         new_spec_path=new_spec,
@@ -614,6 +616,7 @@ def _run_action(args, config: dict, repo_dir: str):
             max_cycles=args.cycles or 3,
             max_parallel=args.max_parallel,
             no_review=args.no_review,
+            resume=args.resume,
         ))
         if args.deploy and success:
             asyncio.run(run_deploy(config, repo_dir))

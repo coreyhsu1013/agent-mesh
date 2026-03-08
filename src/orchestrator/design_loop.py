@@ -38,9 +38,10 @@ logger = logging.getLogger("agent-mesh")
 class DesignLoop:
     """Orchestrates Design Pipeline ↔ Implementation Pipeline recursion."""
 
-    def __init__(self, config: dict, repo_dir: str):
+    def __init__(self, config: dict, repo_dir: str, resume: bool = False):
         self.config = config
         self.repo_dir = repo_dir
+        self.resume = resume
         self.analyzer = SpecAnalyzer(config)
         self.refiner = SpecRefiner(config)
         self.codebase_guide = CodebaseGuide(config)
@@ -122,6 +123,50 @@ class DesignLoop:
         finally:
             self.run_history.end_run()
 
+    def _clear_all_cache(self):
+        """Clear all residual cache files for a fresh run.
+
+        Called when NOT resuming. Removes design-changes, design-chunks,
+        design-progress, fix-plans, remaining-gaps, and chunk-specific files
+        so the pipeline starts from a clean spec delta analysis.
+        """
+        import glob
+
+        patterns = [
+            "design-changes.json",
+            "design-chunks.json",
+            "design-chunks-iter*.json",
+            "design-progress.json",
+            "design-progress-*.json",
+            "remaining-gaps.json",
+            "fix-plan-*.json",
+            "chunk-*-spec.md",
+            "chunk-*-plan.json",
+            "MANUAL-STATUS.txt",
+        ]
+        removed = []
+        for pattern in patterns:
+            for f in glob.glob(os.path.join(self.mesh_dir, pattern)):
+                try:
+                    os.remove(f)
+                    removed.append(os.path.basename(f))
+                except Exception:
+                    pass
+
+        # Also clean CONTINUE/SKIP signals (but NOT STOP)
+        for sig in ["CONTINUE", "SKIP"]:
+            sig_path = os.path.join(self.mesh_dir, sig)
+            if os.path.exists(sig_path):
+                os.remove(sig_path)
+                removed.append(sig)
+
+        if removed:
+            logger.info(
+                f"[DesignLoop] 🧹 Cleared {len(removed)} cache files for fresh run: "
+                f"{', '.join(removed[:10])}"
+                + (f"... (+{len(removed)-10})" if len(removed) > 10 else "")
+            )
+
     async def _run_pipeline(
         self,
         old_spec_path: str,
@@ -132,6 +177,12 @@ class DesignLoop:
         t0: float,
     ) -> bool:
         """Inner pipeline logic — always wrapped by run() try/finally."""
+        # v1.5: fresh run = clear all stale cache from previous runs
+        if not self.resume:
+            self._clear_all_cache()
+        else:
+            logger.info("[DesignLoop] 🔄 Resume mode — using cached state")
+
         # Load specs
         with open(old_spec_path) as f:
             old_spec = f.read()
