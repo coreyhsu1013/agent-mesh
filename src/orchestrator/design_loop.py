@@ -29,6 +29,8 @@ from typing import Any
 
 from .spec_analyzer import SpecAnalyzer, DesignChange
 from .spec_refiner import SpecRefiner, DesignChunk
+from .run_history import RunHistoryRecorder
+from .codebase_guide import CodebaseGuide
 
 logger = logging.getLogger("agent-mesh")
 
@@ -41,6 +43,7 @@ class DesignLoop:
         self.repo_dir = repo_dir
         self.analyzer = SpecAnalyzer(config)
         self.refiner = SpecRefiner(config)
+        self.codebase_guide = CodebaseGuide(config)
         self.mesh_dir = os.path.join(repo_dir, ".agent-mesh")
         self.chunk_history: list[dict] = []
         self.max_design_iterations = config.get("design", {}).get(
@@ -48,6 +51,8 @@ class DesignLoop:
         )
         self._events_path = os.path.join(repo_dir, ".agent-mesh", "events.log")
         self._discord_webhook = config.get("notifications", {}).get("discord_webhook", "")
+        # v1.3: structured run history
+        self.run_history = RunHistoryRecorder(repo_dir)
 
     def _emit_event(self, event: str):
         """Append a timestamped event to events.log + Discord webhook."""
@@ -98,6 +103,35 @@ class DesignLoop:
         t0 = time.time()
         os.makedirs(self.mesh_dir, exist_ok=True)
 
+        # v1.3: start run history
+        import datetime
+        run_id = f"run-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        self.run_history.start_run(run_id, {
+            "spec_old": old_spec_path,
+            "spec_new": new_spec_path,
+            "max_parallel": max_parallel,
+            "force_model": self.config.get("force_model", None),
+            "manual_mode": self.config.get("manual_mode", False),
+        })
+
+        try:
+            return await self._run_pipeline(
+                old_spec_path, new_spec_path,
+                max_inner_cycles, max_parallel, no_review, t0,
+            )
+        finally:
+            self.run_history.end_run()
+
+    async def _run_pipeline(
+        self,
+        old_spec_path: str,
+        new_spec_path: str,
+        max_inner_cycles: int,
+        max_parallel: int,
+        no_review: bool,
+        t0: float,
+    ) -> bool:
+        """Inner pipeline logic — always wrapped by run() try/finally."""
         # Load specs
         with open(old_spec_path) as f:
             old_spec = f.read()
@@ -144,6 +178,16 @@ class DesignLoop:
                 f"[DesignLoop] {len(blocked)} changes blocked: "
                 + ", ".join(c.change_id for c in blocked)
             )
+
+        # ── Step 2.5: Generate CLAUDE.md codebase guide ──
+        try:
+            guide_path = await self.codebase_guide.ensure_guide(
+                self.repo_dir, new_spec_path
+            )
+            if guide_path:
+                logger.info(f"[DesignLoop] CLAUDE.md ready: {guide_path}")
+        except Exception as e:
+            logger.warning(f"[DesignLoop] CLAUDE.md generation failed: {e}")
 
         # ── Outer recursion loop ──
         for design_iter in range(1, self.max_design_iterations + 1):
@@ -291,6 +335,26 @@ class DesignLoop:
                 f"[DesignLoop] Cleaned {len(stale)} stale progress entries: {stale}"
             )
 
+        # v1.3: --jump-to: skip all chunks before the target
+        jump_to = self.config.get("jump_to", "")
+        if jump_to:
+            found = False
+            for c in chunks:
+                if c.chunk_id == jump_to:
+                    found = True
+                    break
+                # Mark chunks before target as completed (skip them)
+                progress = self._load_progress()
+                if progress.get(c.chunk_id, {}).get("status") != "completed":
+                    self._save_progress(c.chunk_id, "completed", {
+                        "success": True, "skipped": True,
+                        "tasks": 0, "cost_usd": 0, "cycles": 0,
+                        "final_gaps": 0, "jump_skipped": True,
+                    })
+                    logger.info(f"[DesignLoop] ⏩ Jump: skipping {c.chunk_id}")
+            if not found:
+                logger.warning(f"[DesignLoop] --jump-to target not found: {jump_to}")
+
         # Group chunks by wave_order for parallel execution
         waves: dict[int, list[DesignChunk]] = {}
         for chunk in chunks:
@@ -400,6 +464,7 @@ class DesignLoop:
         chunk.status = "in_progress"
         self._save_progress(chunk.chunk_id, "in_progress", {})
         self._emit_event(f"CHUNK_START {chunk.chunk_id} — {chunk.title} ({len(chunk.changes)} tasks)")
+        self.run_history.start_chunk(chunk.chunk_id, chunk.title, chunk.wave_order)
 
         total_attempts = 0
 
@@ -430,7 +495,22 @@ class DesignLoop:
                 self._emit_event(
                     f"CHUNK_SKIPPED {chunk.chunk_id} — user decision"
                 )
-                break
+                # Mark as completed (skipped) so resume doesn't re-run
+                skip_result = {
+                    "success": True,
+                    "skipped": True,
+                    "tasks": result.get("tasks", 0),
+                    "cost_usd": result.get("cost_usd", 0),
+                    "cycles": total_cycles,
+                    "final_gaps": len(result.get("final_issues", [])),
+                    "final_issues": result.get("final_issues", []),
+                }
+                self._save_progress(chunk.chunk_id, "completed", skip_result)
+                self.run_history.end_chunk(
+                    chunk.chunk_id, "skipped",
+                    len(result.get("final_issues", [])),
+                )
+                return True
             elif decision == "continue":
                 logger.info(
                     f"[DesignLoop] User chose to CONTINUE {chunk.chunk_id}"
@@ -446,8 +526,25 @@ class DesignLoop:
                     os.remove(plan_path)
                 continue
             else:
-                # Timeout or error → skip
-                break
+                # Timeout or error → treat as skip
+                logger.info(
+                    f"[DesignLoop] Approval timeout for {chunk.chunk_id}, skipping"
+                )
+                skip_result = {
+                    "success": True,
+                    "skipped": True,
+                    "tasks": result.get("tasks", 0),
+                    "cost_usd": result.get("cost_usd", 0),
+                    "cycles": total_cycles,
+                    "final_gaps": len(result.get("final_issues", [])),
+                    "final_issues": result.get("final_issues", []),
+                }
+                self._save_progress(chunk.chunk_id, "completed", skip_result)
+                self.run_history.end_chunk(
+                    chunk.chunk_id, "skipped",
+                    len(result.get("final_issues", [])),
+                )
+                return True
 
         validation = await self._validate_chunk(chunk, result)
 
@@ -455,6 +552,9 @@ class DesignLoop:
             chunk.status = "completed"
             self._save_progress(chunk.chunk_id, "completed", result)
             self._emit_event(f"CHUNK_END ✅ {chunk.chunk_id} completed")
+            self.run_history.end_chunk(
+                chunk.chunk_id, "completed", result.get("final_gaps", 0)
+            )
             self.chunk_history.append({
                 "chunk_id": chunk.chunk_id,
                 "result": result,
@@ -475,6 +575,9 @@ class DesignLoop:
             chunk.status = "needs_redesign"
             self._save_progress(chunk.chunk_id, "needs_redesign", result)
             self._emit_event(f"CHUNK_END ❌ {chunk.chunk_id} failed — {result.get('error', 'unknown')}")
+            self.run_history.end_chunk(
+                chunk.chunk_id, "failed", result.get("final_gaps", 0)
+            )
             logger.warning(
                 f"[DesignLoop] ❌ Chunk {chunk.chunk_id} failed: "
                 f"{result.get('error', 'unknown')}"
@@ -585,6 +688,9 @@ class DesignLoop:
             self._emit_event(
                 f"CHUNK_START {chunk.chunk_id} — {chunk.title} "
                 f"({len(chunk.changes)} changes) [sync wave]"
+            )
+            self.run_history.start_chunk(
+                chunk.chunk_id, chunk.title, chunk.wave_order
             )
 
         # ── 2. Build combined plan from all chunks ──
@@ -737,6 +843,8 @@ class DesignLoop:
                     )
                     if advisor:
                         self_.dispatcher.router.advisor = advisor
+                    # Expose router for ProjectLoop cycle escalation
+                    self_.router = self_.dispatcher.router
 
                 async def run(self_):
                     nonlocal total_cost
@@ -746,10 +854,14 @@ class DesignLoop:
                         resume=True,
                     )
                     total_cost += self_.dispatcher.wave_cost_usd
+                    # v1.3: expose execution data for run history
+                    self_.cost_usd = self_.dispatcher.wave_cost_usd
+                    self_.task_summaries = self_.dispatcher.task_summaries
                     return "done"
 
             loop = ProjectLoop(
-                self.config, self.repo_dir, combined_spec_path
+                self.config, self.repo_dir, combined_spec_path,
+                run_history=self.run_history,
             )
             try:
                 success = await loop.run_auto(
@@ -759,6 +871,7 @@ class DesignLoop:
                     max_parallel=max_parallel,
                     no_review=no_review,
                     skip_initial_verify=True,
+                    manual_mode=self.config.get("manual_mode", False),
                 )
             except Exception as e:
                 logger.error(f"[SyncWave] Execution error: {e}")
@@ -816,12 +929,18 @@ class DesignLoop:
             "tasks": len(all_tasks),
             "cost_usd": total_cost,
         }
+        # Get final gap count from loop history (shared across sync wave chunks)
+        sync_final_gaps = (
+            loop.cycle_history[-1].get("gap_count", 0)
+            if loop.cycle_history else 0
+        )
 
         for chunk in ready_chunks:
             if success:
                 chunk.status = "completed"
                 self._save_progress(chunk.chunk_id, "completed", result_dict)
                 self._emit_event(f"CHUNK_END ✅ {chunk.chunk_id} [sync wave]")
+                self.run_history.end_chunk(chunk.chunk_id, "completed", 0)
                 self.chunk_history.append({
                     "chunk_id": chunk.chunk_id,
                     "result": result_dict,
@@ -833,6 +952,7 @@ class DesignLoop:
                     chunk.chunk_id, "needs_redesign", result_dict
                 )
                 self._emit_event(f"CHUNK_END ❌ {chunk.chunk_id} [sync wave]")
+                self.run_history.end_chunk(chunk.chunk_id, "failed", sync_final_gaps)
                 logger.warning(
                     f"[SyncWave] ❌ Chunk {chunk.chunk_id} failed"
                 )
@@ -971,6 +1091,8 @@ class DesignLoop:
                 )
                 if advisor:
                     self_.dispatcher.router.advisor = advisor
+                # Expose router for ProjectLoop cycle escalation
+                self_.router = self_.dispatcher.router
 
             async def run(self_):
                 nonlocal total_cost
@@ -980,9 +1102,16 @@ class DesignLoop:
                     resume=True,
                 )
                 total_cost += self_.dispatcher.wave_cost_usd
+                # v1.3: expose execution data for run history
+                self_.cost_usd = self_.dispatcher.wave_cost_usd
+                self_.task_summaries = self_.dispatcher.task_summaries
                 return "done"
 
-        loop = ProjectLoop(self.config, self.repo_dir, spec_path)
+        # v1.3: set current chunk for checkpoint tracking
+        self.config["current_chunk_id"] = chunk.chunk_id
+
+        loop = ProjectLoop(self.config, self.repo_dir, spec_path,
+                           run_history=self.run_history)
 
         try:
             success = await loop.run_auto(
@@ -992,6 +1121,7 @@ class DesignLoop:
                 max_parallel=max_parallel,
                 no_review=no_review,
                 skip_initial_verify=True,  # v1.2: plan from design → skip full verify
+                manual_mode=self.config.get("manual_mode", False),
             )
         except Exception as e:
             logger.error(f"[DesignLoop] Execution error for {chunk.chunk_id}: {e}")
@@ -1346,13 +1476,22 @@ Each change object:
         return changes
 
     def _clear_progress(self):
-        """Clear progress file for a fresh design iteration."""
+        """Clear progress file and chunk caches for a fresh design iteration."""
         progress_path = os.path.join(self.mesh_dir, "design-progress.json")
         if os.path.exists(progress_path):
             os.rename(
                 progress_path,
                 progress_path.replace(".json", f"-{int(time.time())}.json"),
             )
+
+        # Clean up chunk-specific cache files to avoid iter1/iter2 collisions
+        import glob
+        for pattern in ["chunk-*-spec.md", "chunk-*-plan.json"]:
+            for f in glob.glob(os.path.join(self.mesh_dir, pattern)):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
 
     def _save_progress(self, chunk_id: str, status: str, result: dict):
         """Save to .agent-mesh/design-progress.json for resume."""

@@ -307,6 +307,11 @@ class WorkspacePool:
         if os.path.exists(lock_file):
             os.remove(lock_file)
 
+        # Copy CLAUDE.md into worktree (untracked, not in git checkout)
+        claude_md = os.path.join(self.repo_dir, "CLAUDE.md")
+        if os.path.isfile(claude_md):
+            shutil.copy2(claude_md, os.path.join(ws_dir, "CLAUDE.md"))
+
         logger.debug(f"[WorkspacePool] Created slot_{slot_id}")
         return ws_dir
 

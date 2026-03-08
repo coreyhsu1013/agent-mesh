@@ -717,7 +717,10 @@ class ProjectLoop:
                 os.remove(sig_path)
                 logger.info(f"[ProjectLoop] Cleaned stale signal: {sig}")
 
-        for cycle in range(1, max_cycles + 1):
+        cycle = 0
+        while True:
+            cycle += 1
+
             # v1.2: graceful shutdown check
             stop_file = os.path.join(self.repo_dir, ".agent-mesh", "STOP")
             if os.path.exists(stop_file):
@@ -726,7 +729,7 @@ class ProjectLoop:
                 return False
 
             logger.info(f"\n{'='*60}")
-            logger.info(f"  🔄 Project ReAct — Cycle {cycle}/{max_cycles}")
+            logger.info(f"  🔄 Project ReAct — Cycle {cycle}")
             logger.info(f"{'='*60}")
 
             # ── THINK: What's the current plan? ──
@@ -775,7 +778,7 @@ class ProjectLoop:
                             "Sonnet start" if cycle == 2 else "Opus start"
                         )
                         _summary = (
-                            f"Cycle {cycle}/{max_cycles}\n"
+                            f"Cycle {cycle}\n"
                             f"Plan: {plan_path}\n"
                             f"Tasks: {len(_tasks)}\n"
                             f"Model chain: {_model_hint}\n"
@@ -783,7 +786,7 @@ class ProjectLoop:
                             f"Tasks:\n" + "\n".join(_task_lines)
                         )
                     except Exception:
-                        _summary = f"Cycle {cycle}/{max_cycles}\nPlan: {plan_path}"
+                        _summary = f"Cycle {cycle}\nPlan: {plan_path}"
 
                     decision = await self._manual_pause("PRE-EXECUTE", _summary)
                     if decision == "skip":
@@ -916,13 +919,23 @@ class ProjectLoop:
                 f"min rank: {esc_status['current_min_rank']} ({esc_status['rank_label']})"
             )
 
-            # v1.3: manual mode — pause after verify, before next cycle
-            if manual_mode and cycle < max_cycles:
-                # Build gap summary for user
+            # v1.4: manual mode — pause after every cycle that doesn't pass
+            if manual_mode:
+                # Classify each gap: NEW / RECURRING / SPEC / OUT_OF_SCOPE
                 _gap_lines = []
+                _chunk_id = self.config.get("current_chunk_id", "")
+                _chunk_modules = self._get_chunk_modules(_chunk_id)
+                _prev_gap_msgs = self._collect_previous_gap_messages()
+                _fixed_gap_msgs = self._collect_fixed_gap_messages(cycle)
+
                 for _i in report.issues:
-                    if _i.category == "spec_gap":
-                        _gap_lines.append(f"  • [{_i.severity}] {_i.message[:120]}")
+                    if _i.category != "spec_gap":
+                        continue
+                    _tag = self._classify_gap(
+                        _i, _chunk_modules, _prev_gap_msgs, _fixed_gap_msgs
+                    )
+                    _gap_lines.append(f"  • [{_tag}] {_i.message[:120]}")
+
                 _gap_history = " → ".join(
                     str(e.get("gap_count", "?")) for e in self.cycle_history
                 )
@@ -945,17 +958,84 @@ class ProjectLoop:
                 if decision == "stop":
                     return False
 
-        # Max cycles reached
-        total_time = time.time() - t0
-        remaining = len(self.cycle_history[-1]['report'].issues) if self.cycle_history else 0
-        logger.warning(
-            f"[ProjectLoop] ⚠️ Max cycles ({max_cycles}) reached. "
-            f"{remaining} issues remain. "
-            f"Total time: {total_time:.0f}s"
-        )
-        self._print_convergence_summary()
-        self._emit_event(f"CHUNK_DONE ⚠️ max cycles ({max_cycles}) reached, {remaining} gaps remain ({total_time:.0f}s)")
-        return False
+    def _get_chunk_modules(self, chunk_id: str) -> set[str]:
+        """Extract module keyword(s) that belong to this chunk."""
+        keywords = set()
+        # Parse from chunk_id like "chunk-3-notification-module"
+        parts = chunk_id.replace("chunk-", "").split("-", 1)
+        if len(parts) > 1:
+            # Extract meaningful words (skip generic: module, backend, frontend)
+            skip = {"module", "backend", "frontend", "fullstack", "behavior", "rules"}
+            for word in parts[1].split("-"):
+                if word.lower() not in skip and len(word) > 2:
+                    keywords.add(word.lower())
+        # Also check config for explicit module list
+        chunk_modules = self.config.get("chunk_modules", [])
+        for m in chunk_modules:
+            keywords.add(m.lower())
+        return keywords
+
+    def _collect_previous_gap_messages(self) -> set[str]:
+        """Collect all gap messages from all previous cycles."""
+        msgs = set()
+        for entry in self.cycle_history:
+            report = entry.get("report")
+            if report:
+                for issue in report.issues:
+                    if issue.category == "spec_gap":
+                        # Normalize: first 80 chars for fuzzy matching
+                        msgs.add(issue.message[:80].strip().lower())
+        return msgs
+
+    def _collect_fixed_gap_messages(self, current_cycle: int) -> set[str]:
+        """Collect gaps that were fixed (appeared before but not in latest cycle).
+        These are gaps that appeared in earlier cycles but got resolved."""
+        if len(self.cycle_history) < 2:
+            return set()
+
+        # Gaps from all cycles except the latest
+        prev_msgs = set()
+        for entry in self.cycle_history[:-1]:
+            report = entry.get("report")
+            if report:
+                for issue in report.issues:
+                    if issue.category == "spec_gap":
+                        prev_msgs.add(issue.message[:80].strip().lower())
+
+        # Gaps in the latest cycle
+        latest = self.cycle_history[-1].get("report")
+        latest_msgs = set()
+        if latest:
+            for issue in latest.issues:
+                if issue.category == "spec_gap":
+                    latest_msgs.add(issue.message[:80].strip().lower())
+
+        # Fixed = appeared before but not in latest
+        return prev_msgs - latest_msgs
+
+    def _classify_gap(self, issue, chunk_modules: set[str],
+                      prev_gap_msgs: set[str], fixed_gap_msgs: set[str]) -> str:
+        """Classify a gap as NEW / RECURRING / PERSISTENT.
+
+        - RECURRING: this gap was fixed before but came back (loop detected)
+        - PERSISTENT: gap seen in previous cycles, not yet fixed
+        - NEW: first time seeing this gap
+
+        Note: OUT_OF_SCOPE classification removed — the verifier's scoped prompt
+        already ensures only in-scope gaps are reported. chunk_id-based keyword
+        matching was too crude and caused false OUT_OF_SCOPE labels.
+        """
+        msg_key = issue.message[:80].strip().lower()
+
+        # Check if this gap was previously fixed but came back
+        if msg_key in fixed_gap_msgs:
+            return "🔄 RECURRING"
+
+        # Check if this gap has been seen in previous cycles (persistent, not fixed)
+        if msg_key in prev_gap_msgs:
+            return "⚠️ PERSISTENT"
+
+        return "🆕 NEW"
 
     def _print_convergence_summary(self):
         """Print convergence progress across all cycles."""

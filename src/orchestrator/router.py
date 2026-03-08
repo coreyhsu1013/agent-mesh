@@ -26,6 +26,7 @@ class RoutingDecision:
     model: str
     reason: str
     timeout_multiplier: float = 1.0
+    force_timeout_seconds: int = 0  # v1.3: absolute timeout override (0 = use default)
 
     @property
     def model_short(self) -> str:
@@ -127,6 +128,16 @@ class ModelRouter:
             "outer_loop_timeout_multiplier", 1.0
         )
 
+        # v1.2: cycle-based fix escalation (set by ProjectLoop)
+        # cycle 2 → start from Sonnet, cycle 3+ → start from Opus
+        self.fix_cycle: int = 0
+
+        # v1.3: force model override (from --force-model CLI)
+        self.force_model: str = config.get("force_model", "")
+
+        # v1.3: force timeout override (from --force-timeout CLI)
+        self.force_timeout: int = config.get("force_timeout", 0)
+
     def apply_complexity_floor(self, task: Task) -> str:
         """Bump task complexity if title/module matches foundational keywords."""
         original = getattr(task, "complexity", "M")
@@ -157,7 +168,12 @@ class ModelRouter:
           2. Fix tasks (cycle 2+) → force Sonnet
           3. Outer-loop escalation → enforce min tier for ALL tasks
         Returns 1-based attempt index.
+
+        v1.3: force_model → always start at 1 (bypass all routing).
         """
+        if self.force_model:
+            return 1
+
         complexity = getattr(task, "complexity", "M")
         chain = self.matrix.get(complexity, self.matrix["M"])
         start = 1
@@ -175,20 +191,33 @@ class ModelRouter:
                 should_force = True
                 break
 
-        # Rule 2: fix tasks (cycle 2+) → skip Grok, start from DeepSeek+
+        # Rule 2: fix tasks — escalate by cycle
+        #   cycle 1 fix → skip Grok, start from DeepSeek+
+        #   cycle 2 fix → start from Sonnet
+        #   cycle 3+ fix → start from Opus
         if task_id.startswith("fix-"):
             should_force = True
 
         if should_force:
-            # Find first non-Grok model (DeepSeek or Claude)
+            if self.fix_cycle >= 3:
+                # Cycle 3+: start from Opus
+                target_prefix = "claude-opus"
+            elif self.fix_cycle >= 2:
+                # Cycle 2: start from Sonnet
+                target_prefix = "claude-sonnet"
+            else:
+                # Cycle 1 / non-fix: skip Grok → DeepSeek+
+                target_prefix = "deepseek/"
+
             for idx, model in enumerate(chain):
-                if model.startswith("deepseek/") or model.startswith("claude-"):
+                if model.startswith(target_prefix) or \
+                   (target_prefix == "deepseek/" and model.startswith("claude-")):
                     candidate = idx + 1  # 1-based
                     if candidate > start:
                         start = candidate
                     logger.info(
-                        f"[Router] Force skip Grok: '{task.title}' → attempt {candidate} "
-                        f"({model})"
+                        f"[Router] Force skip → '{task.title}' → attempt {candidate} "
+                        f"({model}) [cycle {self.fix_cycle or 1}]"
                     )
                     break
 
@@ -225,6 +254,25 @@ class ModelRouter:
         attempt 從 1 開始。最後一級 retry: timeout_multiplier = 2.0。
         v0.9: advisor can cause model skipping.
         """
+        # v1.3: force model override — bypass all routing logic
+        if self.force_model:
+            model, agent_type = self._resolve_force_model(self.force_model)
+            reason = f"forced:{self.force_model}"
+            force_secs = self.force_timeout
+            if force_secs:
+                reason += f" (timeout={force_secs}s)"
+            decision = RoutingDecision(
+                agent_type=agent_type,
+                model=model,
+                reason=reason,
+                force_timeout_seconds=force_secs,
+            )
+            if log:
+                logger.info(
+                    f"[Router] FORCED → {agent_type.value} ({model}) [{reason}]"
+                )
+            return decision
+
         chain = self.matrix.get(complexity, self.matrix["M"])
         idx = min(attempt - 1, len(chain) - 1)
         model = chain[idx]
@@ -249,6 +297,10 @@ class ModelRouter:
         is_last_retry = (idx == len(chain) - 1) and (attempt > 1)
         timeout_multiplier = 2.0 if is_last_retry else 1.0
 
+        # v1.2: cycle 4+ fix → extra 2× timeout (Opus needs more time)
+        if self.fix_cycle >= 4:
+            timeout_multiplier *= 2.0
+
         # ★ Outer-loop timeout extension (top tier retry)
         if self.outer_loop_timeout_mul > 1.0:
             timeout_multiplier *= self.outer_loop_timeout_mul
@@ -272,8 +324,24 @@ class ModelRouter:
 
         return decision
 
+    def _resolve_force_model(self, shorthand: str) -> tuple[str, AgentType]:
+        """Resolve --force-model shorthand to (model_id, AgentType)."""
+        mapping = {
+            "opus": ("claude-opus-4-6", AgentType.CLAUDE_CODE),
+            "sonnet": ("claude-sonnet-4-6", AgentType.CLAUDE_CODE),
+            "deepseek": ("deepseek/deepseek-reasoner", AgentType.DEEPSEEK_AIDER),
+            "grok": ("xai/grok-4-1-fast-reasoning", AgentType.GROK_AIDER),
+        }
+        if shorthand in mapping:
+            return mapping[shorthand]
+        # Fallback: treat as full model ID
+        agent_type = _model_to_agent_type(shorthand)
+        return shorthand, agent_type
+
     def get_max_attempts(self, complexity: str) -> int:
         """Return chain length for this complexity."""
+        if self.force_model:
+            return 1  # forced model: one attempt only
         chain = self.matrix.get(complexity, self.matrix["M"])
         return len(chain)
 

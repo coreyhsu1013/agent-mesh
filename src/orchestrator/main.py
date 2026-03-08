@@ -403,6 +403,8 @@ async def run_cycles(config: dict, repo_dir: str, spec_path: str,
                 project_type=project_type,
             )
             self.dispatcher.router.advisor = advisor
+            # Expose router for ProjectLoop cycle escalation
+            self.router = self.dispatcher.router
 
         async def run(self):
             nonlocal total_cost
@@ -422,6 +424,7 @@ async def run_cycles(config: dict, repo_dir: str, spec_path: str,
         initial_plan_path=initial_plan,
         max_parallel=max_parallel,
         no_review=no_review,
+        manual_mode=config.get("manual_mode", False),
     )
 
     # v0.9: update project cost
@@ -470,6 +473,14 @@ Examples:
     parser.add_argument("--waves", nargs="+", type=int, help="Execute specific wave numbers")
     parser.add_argument("--max-parallel", type=int, help="Override max parallel tasks")
     parser.add_argument("--no-review", action="store_true", help="Skip code review")
+    parser.add_argument("--manual", action="store_true", help="Manual mode: pause before each step for confirmation")
+    parser.add_argument("--jump-to", help="Skip to a specific chunk (e.g. chunk-4-notification-backend)")
+    parser.add_argument("--force-model", choices=["opus", "sonnet", "deepseek", "grok"],
+                        help="Force all tasks to use this model")
+    parser.add_argument("--force-timeout", type=int, help="Force timeout in seconds for all tasks")
+    parser.add_argument("--restore", help="Restore to checkpoint: chunk-id/cycle (e.g. chunk-4-notification-backend/2)")
+    parser.add_argument("--list-checkpoints", action="store_true", help="List all saved checkpoints")
+    parser.add_argument("--history", action="store_true", help="Print run history summary")
     # v0.7 flags
     parser.add_argument("--verify", action="store_true", help="Run verification checks")
     parser.add_argument("--fix-plan", action="store_true", help="Generate fix-plan from verify")
@@ -498,6 +509,14 @@ Examples:
         config["dispatcher"]["max_parallel"] = args.max_parallel
     if args.no_review:
         config["no_review"] = True
+    if getattr(args, 'manual', False):
+        config["manual_mode"] = True
+    if getattr(args, 'jump_to', None):
+        config["jump_to"] = args.jump_to
+    if getattr(args, 'force_model', None):
+        config["force_model"] = args.force_model
+    if getattr(args, 'force_timeout', None):
+        config["force_timeout"] = args.force_timeout
 
     # Acquire lock (prevent concurrent orchestrator on same repo)
     acquire_lock(repo_dir)
@@ -519,6 +538,63 @@ Examples:
 
 def _run_action(args, config: dict, repo_dir: str):
     """Route to the appropriate action."""
+
+    # v1.3: print run history
+    if getattr(args, 'history', False):
+        from .run_history import RunHistoryRecorder
+        RunHistoryRecorder.print_summary(repo_dir)
+        return
+
+    # v1.3: list checkpoints
+    if getattr(args, 'list_checkpoints', False):
+        from .project_loop import ProjectLoop
+        checkpoints = ProjectLoop.list_checkpoints(repo_dir)
+        if not checkpoints:
+            print("No checkpoints saved yet.")
+            return
+        print(f"\n{'='*70}")
+        print(f"  Checkpoints ({len(checkpoints)} total)")
+        print(f"{'='*70}")
+        for cp in checkpoints:
+            print(
+                f"  {cp['chunk_id']}/cycle-{cp['cycle']}  "
+                f"commit={cp['commit'][:8]}  "
+                f"gaps={cp['gaps']}  "
+                f"build={'✅' if cp.get('build_ok') else '❌'}  "
+                f"{cp['timestamp'][:19]}"
+            )
+        print()
+        return
+
+    # v1.3: restore checkpoint
+    if getattr(args, 'restore', None):
+        from .project_loop import ProjectLoop
+        parts = args.restore.split("/")
+        if len(parts) != 2:
+            logger.error("--restore format: chunk-id/cycle (e.g. chunk-4-notification-backend/2)")
+            sys.exit(1)
+        chunk_id, cycle_str = parts[0], parts[1]
+        try:
+            cycle = int(cycle_str)
+        except ValueError:
+            logger.error(f"Invalid cycle number: {cycle_str}")
+            sys.exit(1)
+
+        cp = asyncio.run(ProjectLoop.restore_checkpoint(repo_dir, chunk_id, cycle))
+        if not cp:
+            sys.exit(1)
+
+        print(f"\n✅ Restored to {chunk_id}/cycle-{cycle}")
+        print(f"   Commit: {cp['commit'][:12]}")
+        print(f"   Gaps: {cp['gaps']}")
+        print(f"   Fix plan: {cp.get('fix_plan_path', 'N/A')}")
+        if cp.get('gap_details'):
+            print(f"\n   Gap details:")
+            for g in cp['gap_details'][:10]:
+                print(f"     • [{g['severity']}] {g['message'][:100]}")
+        print(f"\n   Next step: run with --plan {cp.get('fix_plan_path', '')} --force-model opus --manual")
+        return
+
     # Route to action
     if args.evolve:
         # v1.0: Spec evolution mode

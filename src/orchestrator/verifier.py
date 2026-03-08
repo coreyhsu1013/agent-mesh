@@ -367,6 +367,12 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
 
         prompt = f"""You are scanning for NEW critical gaps not previously identified.
 
+## SCOPE RESTRICTION (CRITICAL)
+You are verifying a PARTIAL specification for one chunk of a larger project.
+ONLY report gaps for requirements that are EXPLICITLY listed in the SPECIFICATION section below.
+Do NOT report issues for features, modules, or requirements not mentioned in this specification.
+If a feature is not mentioned in the spec, it is handled by a different chunk — IGNORE it completely.
+
 ## CONSTRAINTS
 - Only report HIGH severity gaps that affect core functionality
 - Maximum {max_gaps} new gaps
@@ -374,6 +380,7 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
 - Do NOT re-report issues that are already partially implemented
 - Do NOT re-report any issue listed in ALREADY KNOWN GAPS below
 - Focus on completely MISSING functionality only
+- IMPORTANT: If a requirement is not in the SPECIFICATION below, do NOT report it as a gap
 {known_section}
 ## Output Format
 Respond ONLY with a JSON array (max {max_gaps} items). No other text.
@@ -791,9 +798,12 @@ If no integration issues, return: []
     async def _get_code_tree_uncached(self) -> str:
         """Get a summary of the code tree (file listing + key file contents)."""
         try:
+            # Support both TypeScript and Python projects
             proc = await asyncio.create_subprocess_shell(
                 'find . -name "*.ts" -o -name "*.tsx" -o -name "*.prisma" -o -name "*.sol" '
-                '| grep -v node_modules | grep -v .agent-mesh | grep -v typechain | sort',
+                '-o -name "*.py" -o -name "*.sql" '
+                '| grep -v node_modules | grep -v .agent-mesh | grep -v typechain '
+                '| grep -v __pycache__ | grep -v .pyc | sort',
                 cwd=self.repo_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -810,8 +820,12 @@ If no integration issues, return: []
                 filepath = filepath.strip()
                 if not filepath:
                     continue
-                # Prioritize: services, routes, schemas, workers
-                if any(kw in filepath for kw in ['/services/', '/routes/', '/schemas/', '/workers/', 'schema.prisma']):
+                # Prioritize: services, routes, schemas, models, migrations
+                if any(kw in filepath for kw in [
+                    '/services/', '/routes/', '/schemas/', '/workers/', 'schema.prisma',
+                    '_service.py', '/models.py', '/routes.py', '/schemas.py',
+                    'migrations/',
+                ]):
                     full_path = os.path.join(self.repo_dir, filepath)
                     try:
                         with open(full_path, 'r') as f:

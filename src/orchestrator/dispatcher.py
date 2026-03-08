@@ -19,7 +19,7 @@ from typing import Optional
 
 from ..models.task import Task, TaskPlan, TaskStatus, AgentType
 from ..context.store import ContextStore
-from ..auth.aider_runner import AiderRunner, ClaudeRunner
+from ..auth.aider_runner import AiderRunner, ClaudeRunner, heartbeat_wait
 from .router import ModelRouter
 from .react_loop import ReactLoop, TaskResult
 from .reviewer import Reviewer
@@ -34,7 +34,8 @@ class Dispatcher:
     def __init__(self, config: dict, repo_dir: str, store: ContextStore,
                  experience_store=None, project_name: str = "",
                  project_type: str = "",
-                 target_branch: str = "main"):
+                 target_branch: str = "main",
+                 slot_prefix: str = "slot"):
         self.config = config
         self.repo_dir = repo_dir
         self.store = store
@@ -42,7 +43,7 @@ class Dispatcher:
         self.router = ModelRouter(config)
         self.react_loop = ReactLoop(config)
         self.reviewer = Reviewer(config, repo_dir)
-        self.pool = WorkspacePool(repo_dir, config, target_branch)
+        self.pool = WorkspacePool(repo_dir, config, target_branch, slot_prefix)
 
         aider = AiderRunner(config)
         self.runners = {
@@ -66,6 +67,8 @@ class Dispatcher:
         self.project_name = project_name or os.path.basename(repo_dir)
         self.project_type = project_type
         self.wave_cost_usd = 0.0  # accumulates per wave
+        # v1.3: per-task execution summary for run history
+        self.task_summaries: list[dict] = []
 
     async def execute_plan(
         self,
@@ -407,6 +410,19 @@ class Dispatcher:
                     f"(cumulative: ${self.wave_cost_usd:.4f})"
                 )
 
+            # v1.3: collect per-task summaries for run history
+            for task_idx, (task, result) in task_results.items():
+                if isinstance(result, TaskResult):
+                    self.task_summaries.append({
+                        "task_id": task.id,
+                        "title": task.title,
+                        "status": result.status,
+                        "attempts": result.attempts,
+                        "final_model": result.final_model,
+                        "duration_sec": round(result.total_duration_sec, 1),
+                        "cost_usd": round(result.total_cost_usd, 4),
+                    })
+
             # v0.9: refresh experience stats after each wave
             if self.experience_store:
                 try:
@@ -643,7 +659,10 @@ class Dispatcher:
                 f.write(prompt)
                 prompt_file = f.name
 
-            # ── ACT ──
+            # ── ACT (heartbeat-based timeout) ──
+            # idle_timeout: Sonnet 120s, Opus 600s (thinks longer)
+            # max_timeout: safety net (same as before)
+            idle_t = 600 if "opus" in model else 120
             stdout_text = ""
             try:
                 proc = await asyncio.create_subprocess_shell(
@@ -653,18 +672,21 @@ class Dispatcher:
                     cwd=self.repo_dir,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
                 )
-                stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                stdout_text, stderr_text, timed_out, reason = await heartbeat_wait(
+                    proc,
+                    idle_timeout=idle_t,
+                    max_timeout=timeout,
+                    label=f"BuildFix/{model_label}",
                 )
-                stdout_text = stdout_bytes.decode(
-                    errors="replace"
-                )[:5000] if stdout_bytes else ""
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[BuildFix] Attempt {attempt} timed out ({timeout}s)"
-                )
-                continue
+                stdout_text = stdout_text[:5000]
+                if timed_out:
+                    logger.warning(
+                        f"[BuildFix] Attempt {attempt} heartbeat timeout "
+                        f"({reason}, idle={idle_t}s, max={timeout}s)"
+                    )
+                    continue
             except Exception as e:
                 logger.warning(
                     f"[BuildFix] Attempt {attempt} error: {e}"

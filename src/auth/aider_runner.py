@@ -13,11 +13,59 @@ import asyncio
 import logging
 import os
 import signal
+import json as _json
 import tempfile
 import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_stream_json_result(raw_stdout: str) -> str:
+    """
+    Extract final text result from claude stream-json output.
+
+    stream-json emits one JSON object per line. We look for 'result' type
+    messages which contain the final text output, and also collect 'assistant'
+    type messages as fallback.
+    """
+    result_text = ""
+    assistant_parts = []
+
+    for line in raw_stdout.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = _json.loads(line)
+        except (ValueError, _json.JSONDecodeError):
+            continue
+
+        msg_type = obj.get("type", "")
+
+        # Final result message
+        if msg_type == "result":
+            result_text = obj.get("result", "")
+            break
+
+        # Collect assistant content blocks as fallback
+        if msg_type == "assistant":
+            for block in obj.get("message", {}).get("content", []):
+                if block.get("type") == "text":
+                    assistant_parts.append(block.get("text", ""))
+
+        # Content block delta (streaming text chunks)
+        if msg_type == "content_block_delta":
+            delta = obj.get("delta", {})
+            if delta.get("type") == "text_delta":
+                assistant_parts.append(delta.get("text", ""))
+
+    if result_text:
+        return result_text
+    if assistant_parts:
+        return "".join(assistant_parts)
+    # Fallback: return raw (might be plain text if format wasn't stream-json)
+    return raw_stdout[:5000]
 
 
 class RunResult:
@@ -42,6 +90,8 @@ async def heartbeat_wait(
     label: str = "agent",
     max_stdout: int = 8000,
     max_stderr: int = 3000,
+    stdout_log_path: str | None = None,
+    workspace_dir: str | None = None,
 ) -> tuple[str, str, bool, Optional[str]]:
     """
     等待 process 完成，用 heartbeat 機制偵測是否卡住。
@@ -49,6 +99,9 @@ async def heartbeat_wait(
     每收到 stdout/stderr 新行就重置 idle 計時器。
     連續 idle_timeout 秒沒輸出 → 判定卡住。
     超過 max_timeout → 強制結束（安全網）。
+
+    stdout_log_path: 如果指定，即時寫入 stdout 到檔案（供未來分析）。
+    workspace_dir: 如果指定，監控 worktree 檔案變動作為額外 heartbeat。
 
     Returns: (stdout, stderr, timed_out, timeout_reason)
     """
@@ -59,6 +112,15 @@ async def heartbeat_wait(
     last_activity = time.time()
     start_time = time.time()
     finished = asyncio.Event()
+
+    # Open log file for real-time stdout recording
+    _log_file = None
+    if stdout_log_path:
+        try:
+            os.makedirs(os.path.dirname(stdout_log_path), exist_ok=True)
+            _log_file = open(stdout_log_path, "w")
+        except Exception as e:
+            logger.warning(f"[Heartbeat] Cannot open log file {stdout_log_path}: {e}")
 
     async def _read_stream(stream, chunks: list, max_len: int, is_stdout: bool):
         nonlocal last_activity, stdout_len, stderr_len
@@ -74,6 +136,13 @@ async def heartbeat_wait(
                     break
                 last_activity = time.time()
                 decoded = line.decode(errors="replace")
+                # Real-time log to file
+                if is_stdout and _log_file:
+                    try:
+                        _log_file.write(decoded)
+                        _log_file.flush()
+                    except Exception:
+                        pass
                 current_len = stdout_len if is_stdout else stderr_len
                 if current_len < max_len:
                     chunks.append(decoded)
@@ -84,12 +153,80 @@ async def heartbeat_wait(
         except Exception:
             pass
 
+    def _check_workspace_activity() -> float:
+        """Check most recent file mtime in workspace as secondary heartbeat."""
+        if not workspace_dir:
+            return 0.0
+        try:
+            latest = 0.0
+            for root, _dirs, files in os.walk(workspace_dir):
+                # Skip .git and __pycache__
+                if "/.git" in root or "__pycache__" in root:
+                    continue
+                for f in files:
+                    if f.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".sql", ".md")):
+                        try:
+                            mt = os.path.getmtime(os.path.join(root, f))
+                            if mt > latest:
+                                latest = mt
+                        except OSError:
+                            pass
+            return latest
+        except Exception:
+            return 0.0
+
+    def _is_process_alive() -> bool:
+        """Check if process is actually alive via OS."""
+        try:
+            os.kill(proc.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True  # alive but can't signal
+
     async def _monitor() -> Optional[str]:
         """監控 idle timeout 和 max timeout。"""
+        nonlocal last_activity
+        check_count = 0
         while not finished.is_set():
             await asyncio.sleep(5)
+            check_count += 1
             elapsed = time.time() - start_time
             idle = time.time() - last_activity
+
+            # Every 30s: check workspace file activity as secondary heartbeat
+            if workspace_dir and check_count % 6 == 0 and idle > 30:
+                latest_mtime = _check_workspace_activity()
+                if latest_mtime > last_activity:
+                    logger.info(
+                        f"[Heartbeat] {label}: file activity detected "
+                        f"(idle was {idle:.0f}s), resetting idle timer"
+                    )
+                    last_activity = latest_mtime
+                    idle = time.time() - last_activity
+
+            # Every 30s: check if process is actually dead (proc.wait() stuck bug)
+            if check_count % 6 == 0 and not _is_process_alive():
+                logger.warning(
+                    f"[Heartbeat] {label}: process {proc.pid} is dead "
+                    f"but wait() stuck — forcing completion"
+                )
+                # Close pipes to unblock readers and proc.wait()
+                for pipe in [proc.stdout, proc.stderr]:
+                    if pipe:
+                        try:
+                            pipe.feed_eof()
+                        except Exception:
+                            pass
+                return None  # Not a timeout — treat as normal exit
+
+            # Log activity every 60s (12 checks × 5s)
+            if check_count % 12 == 0:
+                logger.debug(
+                    f"[Heartbeat] {label}: elapsed={elapsed:.0f}s "
+                    f"idle={idle:.0f}s stdout={stdout_len}B"
+                )
 
             if idle > idle_timeout:
                 logger.warning(
@@ -163,6 +300,14 @@ async def heartbeat_wait(
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
+
+    # Close log file
+    if _log_file:
+        try:
+            _log_file.close()
+            logger.debug(f"[Heartbeat] {label}: saved stdout to {stdout_log_path}")
+        except Exception:
+            pass
 
     stdout = "".join(stdout_chunks)
     stderr = "".join(stderr_chunks)
@@ -251,7 +396,11 @@ class AiderRunner:
 
         # ★ Retry with extended timeout
         timeout_multiplier = kwargs.pop("timeout_multiplier", 1)
-        max_timeout = int(max_timeout * timeout_multiplier)
+        force_timeout = kwargs.pop("force_timeout_seconds", 0)
+        if force_timeout > 0:
+            max_timeout = force_timeout
+        else:
+            max_timeout = int(max_timeout * timeout_multiplier)
 
         env = {**os.environ}
         # Set all possible API key env vars so aider/litellm can find the right one
@@ -268,6 +417,12 @@ class AiderRunner:
             "--no-show-model-warnings",
             "--message", prompt,
         ]
+
+        # ★ Pass CLAUDE.md as read-only context (so Grok/DeepSeek get codebase guide too)
+        claude_md = os.path.join(workspace_dir, "CLAUDE.md")
+        if os.path.isfile(claude_md):
+            cmd.extend(["--read", claude_md])
+            logger.info(f"[AiderRunner] Added CLAUDE.md as read-only context")
 
         if target_files:
             # ★ Expand directories to actual files (aider needs specific file paths)
@@ -292,6 +447,12 @@ class AiderRunner:
                 logger.warning(f"[AiderRunner] No files found after expanding directories")
             cmd.extend(target_files)
 
+        # Log file for stdout analysis
+        task_id = kwargs.get("task_id", "unknown")
+        log_dir = os.path.join(os.path.dirname(workspace_dir), "logs")
+        timestamp = int(time.time())
+        stdout_log = os.path.join(log_dir, f"{task_id}_{model_short}_{timestamp}.log")
+
         logger.info(
             f"[AiderRunner] {model_short} in {workspace_dir}, "
             f"files={target_files or 'auto'}, "
@@ -311,6 +472,8 @@ class AiderRunner:
                 idle_timeout=self.idle_timeout,
                 max_timeout=max_timeout,
                 label=f"aider/{model_short}",
+                stdout_log_path=stdout_log,
+                workspace_dir=workspace_dir,
             )
 
             if timed_out:
@@ -357,16 +520,17 @@ class AiderRunner:
 class ClaudeRunner:
     """
     Claude Code CLI runner.
-    Heartbeat timeout: idle 120s, max 因 model 不同。
+    v1.4: plain text output (stream-json pipe breaks at ~160KB).
+    Heartbeat uses workspace file activity as secondary signal.
     """
 
-    IDLE_TIMEOUT = 120
+    IDLE_TIMEOUT = 600
 
     def __init__(self, config: dict):
         claude_cfg = config.get("agents", {}).get("claude_code", {})
         hb_cfg = config.get("heartbeat", {})
-        self.idle_timeout = hb_cfg.get("idle_timeout", 120)
-        self.idle_timeout_opus = claude_cfg.get("idle_timeout_opus", 600)  # ★ Opus 思考久
+        self.idle_timeout = hb_cfg.get("idle_timeout", 600)  # v1.3: 600s with stream-json
+        self.idle_timeout_opus = claude_cfg.get("idle_timeout_opus", 1200)  # v1.3: 1200s
         self.model_opus = claude_cfg.get("model_opus", "claude-opus-4-6")
         self.model_sonnet = claude_cfg.get("model_sonnet", "claude-sonnet-4-6")
         self.timeout_opus = claude_cfg.get("timeout_opus", 1200)
@@ -395,8 +559,13 @@ class ClaudeRunner:
 
         # ★ Retry with extended timeout (e.g. opus retry 2×)
         timeout_multiplier = kwargs.pop("timeout_multiplier", 1)
-        max_timeout = int(max_timeout * timeout_multiplier)
-        idle_timeout = int(idle_timeout * timeout_multiplier)
+        force_timeout = kwargs.pop("force_timeout_seconds", 0)
+        if force_timeout > 0:
+            max_timeout = force_timeout
+            idle_timeout = force_timeout  # user controls everything
+        else:
+            max_timeout = int(max_timeout * timeout_multiplier)
+            idle_timeout = int(idle_timeout * timeout_multiplier)
 
         model_short = "opus" if "opus" in use_model else "sonnet"
 
@@ -404,12 +573,19 @@ class ClaudeRunner:
             f.write(prompt)
             prompt_file = f.name
 
+        # v1.4: plain text output (stream-json pipe breaks at ~160KB)
+        # heartbeat uses workspace file activity as secondary signal
         cmd = (
-            f"cat {prompt_file} | claude -p "
+            f"cat {prompt_file} | claude -p --verbose "
             f"--model {use_model} "
-            f"--dangerously-skip-permissions "
-            f"--output-format text"
+            f"--dangerously-skip-permissions"
         )
+
+        # Log file for stdout analysis
+        task_id = kwargs.get("task_id", "unknown")
+        log_dir = os.path.join(os.path.dirname(workspace_dir), "logs")
+        timestamp = int(time.time())
+        stdout_log = os.path.join(log_dir, f"{task_id}_{model_short}_{timestamp}.jsonl")
 
         logger.info(
             f"[ClaudeRunner] {model_short} in {workspace_dir}, "
@@ -429,6 +605,9 @@ class ClaudeRunner:
                 idle_timeout=idle_timeout,
                 max_timeout=max_timeout,
                 label=f"claude/{model_short}",
+                max_stdout=10_000_000,
+                stdout_log_path=stdout_log,
+                workspace_dir=workspace_dir,
             )
 
             if timed_out:
@@ -438,17 +617,17 @@ class ClaudeRunner:
                           f"idle>{idle_timeout}s or max>{max_timeout}s"
                 )
 
-            stdout = stdout[:5000]
+            stdout_text = stdout
             stderr = stderr[:2000]
             success = proc.returncode == 0
 
             if success:
-                logger.info(f"[ClaudeRunner] ✅ {model_short} output: {len(stdout)} chars")
+                logger.info(f"[ClaudeRunner] ✅ {model_short} output: {len(stdout_text)} chars")
             else:
                 logger.warning(f"[ClaudeRunner] ❌ Exit {proc.returncode}: {stderr[:300]}")
 
             return RunResult(
-                success=success, stdout=stdout, stderr=stderr,
+                success=success, stdout=stdout_text[:5000], stderr=stderr,
                 error=None if success else f"Exit {proc.returncode}: {stderr[:500]}",
             )
         finally:

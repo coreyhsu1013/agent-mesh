@@ -45,7 +45,7 @@ timeouts:
     max: 600
   claude:
     idle: 600               # Sonnet/Opus 都需要長 idle
-    max_sonnet: 600
+    max_sonnet: 1200
     max_opus: 1200
     idle_opus: 600
   gemini:
@@ -153,7 +153,7 @@ verify:
   # ── Convergence settings (v0.7.4) ──
   exclude_modules: []                    # e.g. ["Module 1: Android Capture Service"]
   max_new_gaps_per_cycle: 5
-  convergence_threshold: 3               # remaining + new <= this → converged
+  convergence_threshold: 0               # must fix ALL gaps to pass
   regression_model: "claude-sonnet-4-6"  # cheaper model for regression check
   scan_model: "claude-opus-4-6"          # stronger model for new gap scan
 

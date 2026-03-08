@@ -1,16 +1,19 @@
 """
-Agent Mesh v0.8 — Gap Analyzer
+Agent Mesh v1.3 — Gap Analyzer
 Converts a VerifyReport into a plan.json that can be directly
 executed by the dispatcher.
 
 Flow:
-  VerifyReport → group issues by module → split large groups
-  → add dependencies (schema first) → output plan.json
+  VerifyReport → file-based clustering (union-find)
+  → schema task first → clustered logic tasks → output plan.json
+
+Clustering:
+  Gaps touching the same file are merged into one task (union-find).
+  This prevents parallel agents from overwriting each other's changes.
 
 Phases:
   0: Mechanical fixes (conflicts, build, test)
-  1: Group spec gaps by module
-  2: Schema-first, then parallel logic tasks
+  1+2: File-based clustering — schema first, then logic clusters
   3: Lint fixes
   4: Spec feedback tasks (Layer 3 — spec corrections)
   5: Integration fix tasks (Layer 4 — cross-module)
@@ -20,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,17 +31,9 @@ from .verifier import VerifyReport, VerifyIssue
 
 logger = logging.getLogger("agent-mesh")
 
-# Known module → file path mappings for common project structures
-MODULE_FILE_HINTS = {
-    "auth": ["apps/api/src/services/", "apps/api/src/routes/", "packages/database/prisma/schema.prisma"],
-    "groupbuy": ["apps/api/src/services/", "apps/api/src/routes/", "packages/database/prisma/schema.prisma"],
-    "yaopoint": ["apps/api/src/services/", "apps/api/src/routes/", "packages/database/prisma/schema.prisma"],
-    "leader": ["apps/api/src/services/", "apps/api/src/routes/", "apps/leader/"],
-    "contract": ["packages/contracts/contracts/", "packages/contracts/test/"],
-    "admin": ["apps/admin/", "apps/api/src/routes/", "apps/api/src/services/"],
-    "erp": ["packages/erp-connector/", "apps/api/src/routes/", "apps/api/src/workers/"],
-    "ui": ["packages/ui/"],
-}
+# File path pattern for extracting paths from gap messages
+# Matches: src/foo/bar.py, apps/api/src/services/contract.ts, packages/database/prisma/schema.prisma
+FILE_PATH_PATTERN = re.compile(r'(?:^|[\s,;:(])([a-zA-Z][\w./\-]*\.\w{1,10})(?:[\s,;:)]|$)')
 
 # Issue categories that indicate schema changes (must run first)
 SCHEMA_KEYWORDS = ["model ", "field ", "prisma", "schema", " enum ", " fk ", "fk →", "fk )", "missing field"]
@@ -48,9 +44,9 @@ class GapAnalyzer:
 
     def __init__(self, config: dict):
         self.config = config
-        self.max_issues_per_task = 5  # split if more
         verify_cfg = config.get("verify", {})
         self.exclude_modules: list[str] = verify_cfg.get("exclude_modules", [])
+        self.fix_cycle: int = 0
 
     def generate_fix_plan(self, report: VerifyReport) -> dict:
         """
@@ -128,26 +124,14 @@ class GapAnalyzer:
                 depends_on=[t for t in phase0_ids if t != tid],
             ))
 
-        # ── Phase 1: Group spec gaps by module ──
+        # ── Phase 1+2: File-based clustering ──
+        # Gaps that touch the same file MUST be in the same task (prevent parallel conflicts).
+        # Uses union-find: if gap A touches file X and gap B also touches file X → same cluster.
         spec_issues = [i for i in report.issues if i.category == "spec_gap"]
-        modules: dict[str, list[VerifyIssue]] = {}
-        for issue in spec_issues:
-            mod = issue.module or "General"
-            modules.setdefault(mod, []).append(issue)
 
-        # ── Phase 2: Two-pass — ONE schema task, then parallel logic tasks ──
-        # Pass 1: Collect ALL schema issues across modules into ONE task
-        # (schema.prisma is a single file — parallel edits = guaranteed conflicts)
-        all_schema_issues: list[VerifyIssue] = []
-        logic_groups: list[tuple[str, list[VerifyIssue]]] = []
-
-        for mod_name, mod_issues in modules.items():
-            schema_issues = [i for i in mod_issues if self._is_schema_issue(i)]
-            logic_issues = [i for i in mod_issues if not self._is_schema_issue(i)]
-
-            all_schema_issues.extend(schema_issues)
-            if logic_issues:
-                logic_groups.append((mod_name, logic_issues))
+        # Separate schema vs logic issues
+        all_schema_issues = [i for i in spec_issues if self._is_schema_issue(i)]
+        logic_issues = [i for i in spec_issues if not self._is_schema_issue(i)]
 
         schema_task_ids = []
         if all_schema_issues:
@@ -158,43 +142,48 @@ class GapAnalyzer:
                 id=tid,
                 title="Schema migration: all modules",
                 description=self._build_spec_desc("All Modules — Schema Changes", all_schema_issues),
-                complexity="H",  # single critical-path task
+                complexity="H",
                 module="database",
-                target_files=["packages/database/prisma/schema.prisma"],
                 depends_on=phase0_ids.copy(),
-                acceptance_criteria="npx prisma validate passes; npx prisma generate succeeds; pnpm build passes",
+                acceptance_criteria="Schema changes applied; build passes",
             ))
 
-        # Pass 2: Create logic tasks (depend on schema task)
+        # Cluster logic issues by file overlap (union-find)
+        clusters = self._cluster_by_files(logic_issues)
         logic_tasks_pending = []
         all_schema_deps = phase0_ids + schema_task_ids
 
-        for mod_name, logic_issues in logic_groups:
-            chunks = self._chunk_issues(logic_issues, self.max_issues_per_task)
-            for chunk_idx, chunk in enumerate(chunks):
-                task_counter += 1
-                tid = f"fix-{report.cycle}-{task_counter}"
-                short_mod = self._short_module_name(mod_name)
-                suffix = f" ({chunk_idx + 1})" if len(chunks) > 1 else ""
+        for cluster in clusters:
+            task_counter += 1
+            tid = f"fix-{report.cycle}-{task_counter}"
 
-                # ★ Fix tasks: M (Sonnet) by default
-                # Only INCORRECT items need H (Opus) — wrong logic requires careful reasoning
-                has_incorrect = any("INCORRECT" in i.message for i in chunk)
-                complexity = "H" if has_incorrect else "M"
-                target_files = self._guess_target_files(short_mod, chunk)
+            # Derive module name from cluster issues
+            mod_names = list(dict.fromkeys(i.module or "General" for i in cluster))
+            primary_mod = mod_names[0]
+            short_mod = self._short_module_name(primary_mod)
 
-                logic_tasks_pending.append(self._make_task(
-                    id=tid,
-                    title=f"Implement: {short_mod}{suffix}",
-                    description=self._build_spec_desc(mod_name, chunk),
-                    complexity=complexity,
-                    module=short_mod,
-                    target_files=target_files,
-                    depends_on=all_schema_deps.copy(),
-                    acceptance_criteria=self._build_ac(chunk),
-                ))
+            has_incorrect = any("INCORRECT" in i.message for i in cluster)
+            complexity = "H" if has_incorrect else "M"
+            target_files = self._guess_target_files(short_mod, cluster)
+
+            title = f"Fix: {short_mod} ({len(cluster)} gaps)"
+
+            logic_tasks_pending.append(self._make_task(
+                id=tid,
+                title=title,
+                description=self._build_spec_desc(primary_mod, cluster),
+                complexity=complexity,
+                module=short_mod,
+                target_files=target_files,
+                depends_on=all_schema_deps.copy(),
+                acceptance_criteria=self._build_ac(cluster),
+            ))
 
         all_tasks.extend(logic_tasks_pending)
+
+        logger.info(
+            f"[GapAnalyzer] File clustering: {len(logic_issues)} gaps → {len(clusters)} task(s)"
+        )
 
         # ── Phase 3: Lint fixes (lowest priority, parallel) ──
         lint_issues = [i for i in report.issues if i.category == "lint"]
@@ -322,40 +311,105 @@ class GapAnalyzer:
     def _short_module_name(self, mod_name: str) -> str:
         """Extract short module name from full name."""
         # "Module 1: Auth & Identity" → "auth"
-        # "Module 2: GroupBuy Engine" → "groupbuy"
+        # "Module 10 — Notification" → "notification"
+        # "Contract Management" → "contract"
         lower = mod_name.lower()
-        for key in MODULE_FILE_HINTS:
-            if key in lower:
-                return key
-        # Fallback: take last word
-        parts = mod_name.split(":")
+
+        # Strip common prefixes: "Module N:", "Module N —", "Module N -"
+        cleaned = re.sub(r'^module\s+\d+\s*[:\-—]+\s*', '', lower).strip()
+        if cleaned:
+            # Take first meaningful word (skip articles/prepositions)
+            skip = {"the", "a", "an", "and", "or", "of", "for", "in", "on", "to"}
+            for word in cleaned.split():
+                word = re.sub(r'[^a-z0-9]', '', word)
+                if word and word not in skip:
+                    return word
+
+        # Last fallback: take last word after colon or dash
+        parts = re.split(r'[:\-—]', mod_name)
         if len(parts) > 1:
-            return parts[-1].strip().split()[0].lower()
-        return mod_name.lower().replace(" ", "-")[:20]
+            last = parts[-1].strip().split()[0].lower()
+            return re.sub(r'[^a-z0-9]', '', last) or "general"
+        return "general"
+
+    def _cluster_by_files(self, issues: list[VerifyIssue]) -> list[list[VerifyIssue]]:
+        """
+        Cluster issues by file overlap using union-find.
+        Two gaps sharing any target file → same cluster.
+        Gaps with no files → grouped by module (fallback).
+        """
+        if not issues:
+            return []
+
+        n = len(issues)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Extract files for each issue
+        issue_files: list[set[str]] = []
+        for issue in issues:
+            files: set[str] = set()
+            if issue.file:
+                files.add(issue.file)
+            for match in FILE_PATH_PATTERN.findall(issue.message):
+                if '/' in match and not match.startswith('http'):
+                    files.add(match)
+            issue_files.append(files)
+
+        # Union issues that share any file
+        file_to_issue: dict[str, int] = {}
+        for i, files in enumerate(issue_files):
+            for f in files:
+                if f in file_to_issue:
+                    union(i, file_to_issue[f])
+                else:
+                    file_to_issue[f] = i
+
+        # Issues with NO files: group by module
+        for i in range(n):
+            if not issue_files[i]:
+                mod = issues[i].module or "General"
+                # Find another issue with same module to union with
+                for j in range(i):
+                    if not issue_files[j] and (issues[j].module or "General") == mod:
+                        union(i, j)
+                        break
+
+        # Collect clusters
+        clusters: dict[int, list[int]] = {}
+        for i in range(n):
+            root = find(i)
+            clusters.setdefault(root, []).append(i)
+
+        return [[issues[i] for i in indices] for indices in clusters.values()]
 
     def _guess_target_files(self, module: str, issues: list[VerifyIssue]) -> list[str]:
-        """Guess target files based on module and issue content."""
-        files = MODULE_FILE_HINTS.get(module, []).copy()
+        """Extract target files from gap messages. Project-agnostic."""
+        files: set[str] = set()
 
-        # Add hints from issue messages
         for issue in issues:
-            msg = issue.message.lower()
-            if "route" in msg or "api" in msg or "endpoint" in msg:
-                files.append(f"apps/api/src/routes/{module}.ts")
-            if "service" in msg or "logic" in msg:
-                files.append(f"apps/api/src/services/{module}.ts")
-            if "worker" in msg or "cron" in msg:
-                files.append("apps/api/src/workers/")
-            if "contract" in msg or "solidity" in msg:
-                files.append("packages/contracts/contracts/")
+            # 1. Use issue.file if available
+            if issue.file:
+                files.add(issue.file)
 
-        return list(set(files))[:5]  # deduplicate, cap at 5
+            # 2. Extract file paths from message text
+            for match in FILE_PATH_PATTERN.findall(issue.message):
+                # Filter out version numbers, URLs, etc.
+                if '/' in match and not match.startswith('http'):
+                    files.add(match)
 
-    def _chunk_issues(self, issues: list[VerifyIssue], max_size: int) -> list[list[VerifyIssue]]:
-        """Split issues into chunks of max_size."""
-        if len(issues) <= max_size:
-            return [issues]
-        return [issues[i:i + max_size] for i in range(0, len(issues), max_size)]
+        # Return extracted paths (empty = aider will use auto mode)
+        return list(files)[:8]
 
     # ── Description Builders ──
 

@@ -171,15 +171,20 @@ class ReactLoop:
             if not current_runner:
                 current_runner = runners.get(AgentType.CLAUDE_CODE)
 
-            current_kwargs: dict[str, Any] = {"model": decision.model}
+            current_kwargs: dict[str, Any] = {"model": decision.model, "task_id": task.id}
             if decision.timeout_multiplier != 1.0:
                 current_kwargs["timeout_multiplier"] = decision.timeout_multiplier
+            # v1.3: absolute timeout override
+            if decision.force_timeout_seconds > 0:
+                current_kwargs["force_timeout_seconds"] = decision.force_timeout_seconds
 
             model_label = decision.model_short
             escalation_info = ""
             if attempt > 1:
                 escalation_info = f" [⬆ {model_label}]"
-            if decision.timeout_multiplier > 1:
+            if decision.force_timeout_seconds > 0:
+                escalation_info += f" [timeout={decision.force_timeout_seconds}s]"
+            elif decision.timeout_multiplier > 1:
                 escalation_info += f" [timeout ×{decision.timeout_multiplier:.0f}]"
 
             logger.info(
