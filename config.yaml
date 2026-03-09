@@ -187,6 +187,11 @@ design:
   refiner_model: "claude-sonnet-4-6"      # Chunking is more mechanical
   max_tasks_per_chunk: 10                 # Cap tasks per chunk
   max_design_iterations: 3               # Non-manual mode fallback limit; manual mode loops until STOP
+  gap_classification:
+    enabled: true
+    auto_fix_spec: true           # 自動修改 spec.md
+    min_recurrence: 2             # gap 出現 N 次才觸發分析
+    model: "claude-opus-4-6"      # 強制用 Opus
 
 # ── Layer 4: Integration Validation (v0.8) ──
 # 跨模組整合驗證：type 匹配、API contract、import 正確性

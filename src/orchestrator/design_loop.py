@@ -338,11 +338,31 @@ class DesignLoop:
                 logger.info(f"{'='*60}")
                 return True
 
+            # ── Step 5.5: Gap Classification + Spec Auto-fix ──
+            classification = await self._classify_and_fix_gaps(
+                final.get("issues_detail", []),
+                design_iter,
+                new_spec_path,
+            )
+            if classification.get("spec_modified"):
+                with open(new_spec_path) as f:
+                    new_spec = f.read()
+                logger.info("[DesignLoop] Spec auto-fixed, next iteration uses refined spec")
+
             # ── Gaps remain → pause and ask whether to continue ──
             gap_count = final.get("gap_count", 0)
+            cls_info = (
+                f"  Classification: NEW={classification['new']}, "
+                f"RECURRING={classification['recurring']}, "
+                f"REGRESSION={classification['regression']}\n"
+                f"  Spec fixes applied: {classification['fixes_applied']}\n"
+                if classification.get("recurring", 0) + classification.get("regression", 0) > 0
+                else ""
+            )
             summary = (
                 f"Iteration {design_iter} complete.\n"
                 f"Gaps: {gap_count}\n"
+                f"{cls_info}"
                 f"Total time: {time.time() - t0:.0f}s\n\n"
                 f"CONTINUE = run iteration {design_iter + 1}\n"
                 f"STOP = finish here"
@@ -1597,6 +1617,269 @@ Each change object:
             f"[DesignLoop] Converted {len(issues)} gaps → {len(changes)} new changes"
         )
         return changes
+
+    # ── Gap Classification + Spec Auto-Fix (Layer 3.5) ──
+
+    @staticmethod
+    def _gap_key(issue: dict) -> str:
+        """Stable key for gap dedup: module|message (lowercased)."""
+        return (issue.get("module") or "").lower() + "|" + (issue.get("message") or "").lower()
+
+    def _load_all_historical_gaps(self, current_iter: int) -> dict[str, list[int]]:
+        """Scan design-final-report-iter*.json and return {gap_key: [iter_numbers]}."""
+        import glob
+        history: dict[str, list[int]] = {}
+        for path in sorted(glob.glob(os.path.join(self.mesh_dir, "design-final-report-iter*.json"))):
+            basename = os.path.basename(path)
+            try:
+                n = int(basename.replace("design-final-report-iter", "").replace(".json", ""))
+            except ValueError:
+                continue
+            if n >= current_iter:
+                continue
+            try:
+                with open(path) as f:
+                    report = json.load(f)
+                issues = report.get("issues", [])
+                for issue in issues:
+                    key = self._gap_key(issue)
+                    if key and key != "|":
+                        history.setdefault(key, []).append(n)
+            except Exception as e:
+                logger.warning(f"[GapClassify] Failed to load {basename}: {e}")
+        return history
+
+    async def _analyze_recurring_gap(
+        self, gap: dict, occurrences: int, iter_history: list[int],
+        spec_content: str, current_iter: int,
+    ) -> dict:
+        """Call Opus to analyze root cause of a recurring gap."""
+        gap_cfg = self.config.get("design", {}).get("gap_classification", {})
+        model = gap_cfg.get("model", "claude-opus-4-6")
+
+        # Build history lines
+        history_lines = "\n".join(
+            f"- Iter {n}: same gap present" for n in iter_history
+        )
+        history_lines += f"\n- Iter {current_iter}: same gap present (current)"
+
+        # Extract relevant spec excerpt (search for module name in spec)
+        module = gap.get("module", "")
+        spec_excerpt = ""
+        if module:
+            for line_idx, line in enumerate(spec_content.split("\n")):
+                if module.lower() in line.lower():
+                    start = max(0, line_idx - 5)
+                    end = min(len(spec_content.split("\n")), line_idx + 20)
+                    spec_excerpt = "\n".join(spec_content.split("\n")[start:end])
+                    break
+        if not spec_excerpt:
+            spec_excerpt = spec_content[:3000]
+
+        prompt = f"""你是 spec 品質分析師。以下 gap 在 {occurrences} 個 iteration 中反覆出現：
+
+Gap: {gap.get("message", "")}
+Module: {module}
+Severity: {gap.get("severity", "unknown")}
+
+相關 spec 段落:
+{spec_excerpt}
+
+歷史紀錄:
+{history_lines}
+
+請分析根因:
+1. ROOT_CAUSE: CODE_BUG | SPEC_AMBIGUOUS | SPEC_CONTRADICTION
+2. ANALYSIS: 為什麼 agent 一直修不好
+3. 如果是 SPEC 問題，提供修改建議:
+   OLD_TEXT: spec 中模糊的原文（必須是 spec 中的精確子字串）
+   NEW_TEXT: 修改後更精確的文字
+
+回傳 JSON 格式:
+{{
+  "root_cause": "CODE_BUG" | "SPEC_AMBIGUOUS" | "SPEC_CONTRADICTION",
+  "analysis": "...",
+  "old_text": "...",
+  "new_text": "..."
+}}
+
+只回傳 JSON，不要其他文字。"""
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write(prompt)
+            prompt_file = f.name
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions '
+                f'--model {model} --output-format text',
+                cwd=self.repo_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            raw = stdout.decode().strip()
+        finally:
+            os.unlink(prompt_file)
+
+        # Parse JSON from response
+        try:
+            # Strip markdown fences if present
+            if "```json" in raw:
+                raw = raw.split("```json", 1)[1].split("```", 1)[0]
+            elif "```" in raw:
+                raw = raw.split("```", 1)[1].split("```", 1)[0]
+            return json.loads(raw.strip())
+        except (json.JSONDecodeError, IndexError):
+            logger.warning(f"[GapClassify] Failed to parse Opus response for gap: {gap.get('message', '')[:80]}")
+            return {"root_cause": "CODE_BUG", "analysis": "Failed to parse analysis"}
+
+    def _apply_spec_fix(self, spec_path: str, old_text: str, new_text: str) -> bool:
+        """Replace old_text with new_text in spec file. Returns True if applied."""
+        if not old_text or not new_text or old_text == new_text:
+            return False
+        try:
+            with open(spec_path) as f:
+                content = f.read()
+            if old_text not in content:
+                logger.warning(f"[GapClassify] OLD_TEXT not found in spec: {old_text[:80]}...")
+                return False
+            content = content.replace(old_text, new_text, 1)
+            with open(spec_path, 'w') as f:
+                f.write(content)
+            logger.info(f"[GapClassify] ✏️ Spec fixed: {old_text[:60]}... → {new_text[:60]}...")
+            return True
+        except Exception as e:
+            logger.error(f"[GapClassify] Failed to apply spec fix: {e}")
+            return False
+
+    async def _classify_and_fix_gaps(
+        self,
+        current_issues: list[dict],
+        design_iter: int,
+        spec_path: str,
+    ) -> dict:
+        """
+        Classify gaps as NEW/RECURRING/REGRESSION and auto-fix spec for recurring ones.
+
+        Returns: {"spec_modified": bool, "new": N, "recurring": N, "regression": N, "fixes_applied": N}
+        """
+        gap_cfg = self.config.get("design", {}).get("gap_classification", {})
+        if not gap_cfg.get("enabled", True):
+            return {"spec_modified": False, "new": 0, "recurring": 0, "regression": 0, "fixes_applied": 0}
+
+        min_recurrence = gap_cfg.get("min_recurrence", 2)
+        auto_fix = gap_cfg.get("auto_fix_spec", True)
+
+        logger.info(f"\n🔬 Step 5.5: Gap Classification (iter {design_iter})")
+
+        # Load historical gaps from all previous iterations
+        history = self._load_all_historical_gaps(design_iter)
+
+        # Read spec for analysis
+        with open(spec_path) as f:
+            spec_content = f.read()
+
+        classifications: list[dict] = []
+        counts = {"new": 0, "recurring": 0, "regression": 0}
+        fixes_applied = 0
+
+        for issue in current_issues:
+            key = self._gap_key(issue)
+            if not key or key == "|":
+                continue
+
+            past_iters = history.get(key, [])
+            total_occurrences = len(past_iters) + 1  # +1 for current
+
+            if not past_iters:
+                # Check if it appeared in earlier iters but was fixed — regression
+                # (appears in history of any iter, then disappeared, now back)
+                # Since it's not in history at all, it's truly NEW
+                classification = "NEW"
+                counts["new"] += 1
+                classifications.append({
+                    "gap_key": key,
+                    "classification": classification,
+                    "occurrences": 1,
+                    "iterations": [design_iter],
+                })
+                continue
+
+            # It appeared before — check if it's recurring or regression
+            # Regression: gap was absent in the most recent iter but present in older ones
+            most_recent_historical = max(past_iters)
+            if most_recent_historical < design_iter - 1:
+                classification = "REGRESSION"
+                counts["regression"] += 1
+            else:
+                classification = "RECURRING"
+                counts["recurring"] += 1
+
+            entry: dict[str, Any] = {
+                "gap_key": key,
+                "classification": classification,
+                "occurrences": total_occurrences,
+                "iterations": sorted(past_iters + [design_iter]),
+            }
+
+            # Analyze recurring gaps with Opus if they meet threshold
+            if classification == "RECURRING" and total_occurrences >= min_recurrence:
+                analysis = await self._analyze_recurring_gap(
+                    issue, total_occurrences, sorted(past_iters),
+                    spec_content, design_iter,
+                )
+                entry["root_cause"] = analysis.get("root_cause", "CODE_BUG")
+                entry["analysis"] = analysis.get("analysis", "")
+
+                # Auto-fix spec if applicable
+                if entry["root_cause"] in ("SPEC_AMBIGUOUS", "SPEC_CONTRADICTION"):
+                    old_text = analysis.get("old_text", "")
+                    new_text = analysis.get("new_text", "")
+                    if auto_fix and old_text and new_text:
+                        applied = self._apply_spec_fix(spec_path, old_text, new_text)
+                        entry["spec_fix_applied"] = applied
+                        entry["old_text"] = old_text
+                        entry["new_text"] = new_text
+                        if applied:
+                            fixes_applied += 1
+                            # Re-read spec after modification
+                            with open(spec_path) as f:
+                                spec_content = f.read()
+                    else:
+                        entry["spec_fix_applied"] = False
+
+            classifications.append(entry)
+
+        # Save classifications
+        cls_path = os.path.join(self.mesh_dir, f"gap-classifications-iter{design_iter}.json")
+        with open(cls_path, 'w') as f:
+            json.dump(classifications, f, indent=2, ensure_ascii=False)
+
+        spec_modified = fixes_applied > 0
+
+        # Log summary
+        logger.info(
+            f"[GapClassify] 📊 {len(current_issues)} gaps classified: "
+            f"NEW={counts['new']}, RECURRING={counts['recurring']}, REGRESSION={counts['regression']}"
+        )
+        if fixes_applied:
+            logger.info(f"[GapClassify] ✏️ {fixes_applied} spec fixes applied → {spec_path}")
+        logger.info(f"[GapClassify] Classifications → {cls_path}")
+
+        self._emit_event(
+            f"GAP_CLASSIFY iter{design_iter}: "
+            f"new={counts['new']} recurring={counts['recurring']} "
+            f"regression={counts['regression']} spec_fixes={fixes_applied}"
+        )
+
+        return {
+            "spec_modified": spec_modified,
+            "new": counts["new"],
+            "recurring": counts["recurring"],
+            "regression": counts["regression"],
+            "fixes_applied": fixes_applied,
+        }
 
     def _clear_progress(self):
         """Clear progress file and chunk caches for a fresh design iteration."""
