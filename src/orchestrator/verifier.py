@@ -820,11 +820,13 @@ If no integration issues, return: []
                 filepath = filepath.strip()
                 if not filepath:
                     continue
-                # Prioritize: services, routes, schemas, models, migrations
+                # Prioritize: services, routes, schemas, models, migrations,
+                # frontend pages, tests
                 if any(kw in filepath for kw in [
                     '/services/', '/routes/', '/schemas/', '/workers/', 'schema.prisma',
                     '_service.py', '/models.py', '/routes.py', '/schemas.py',
                     'migrations/',
+                    'page.tsx', 'test_',
                 ]):
                     full_path = os.path.join(self.repo_dir, filepath)
                     try:
