@@ -198,8 +198,17 @@ class ModelRouter:
         if task_id.startswith("fix-"):
             should_force = True
 
+        # Rule 3: spec correction tasks → always start from Sonnet minimum
+        # (spec changes need strong reasoning, Grok/DeepSeek not suitable)
+        is_spec_fix = task_id.startswith("spec-fix-")
+        if is_spec_fix:
+            should_force = True
+
         if should_force:
-            if self.fix_cycle >= 3:
+            if is_spec_fix:
+                # Spec corrections always start from Sonnet (needs strong reasoning)
+                target_prefix = "claude-sonnet"
+            elif self.fix_cycle >= 3:
                 # Cycle 3+: start from Opus
                 target_prefix = "claude-opus"
             elif self.fix_cycle >= 2:

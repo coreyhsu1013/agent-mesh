@@ -213,7 +213,7 @@ class GapAnalyzer:
                         f"Implement the code change according to the suggested correction above. "
                         f"The original spec may be ambiguous or contradictory in this area."
                     ),
-                    complexity="M",
+                    complexity="H",  # spec corrections need strong reasoning (Sonnet/Opus)
                     module=issue.module or "spec",
                     depends_on=all_schema_deps.copy(),
                     acceptance_criteria="Code matches corrected spec interpretation; build passes",
