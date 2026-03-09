@@ -168,8 +168,8 @@ class DesignLoop:
                 except Exception:
                     pass
 
-        # Also clean CONTINUE/SKIP signals (but NOT STOP)
-        for sig in ["CONTINUE", "SKIP"]:
+        # Clean all signals — fresh run starts clean
+        for sig in ["CONTINUE", "SKIP", "STOP"]:
             sig_path = os.path.join(self.mesh_dir, sig)
             if os.path.exists(sig_path):
                 os.remove(sig_path)
