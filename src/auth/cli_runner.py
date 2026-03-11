@@ -12,6 +12,8 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
+from src.auth.claude_account_pool import get_pool
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,11 +45,16 @@ async def run_claude_prompt(prompt: str, cwd: str, timeout: int = 300,
 
         logger.debug(f"[ClaudeRunner] cwd={cwd}, prompt_len={len(prompt)}")
 
+        # Multi-account: inject CLAUDE_CONFIG_DIR
+        account_env = await get_pool().next_env()
+        proc_env = {**os.environ, **account_env} if account_env else None
+
         proc = await asyncio.create_subprocess_shell(
             cmd,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=proc_env,
         )
 
         try:

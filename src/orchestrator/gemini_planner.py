@@ -20,6 +20,8 @@ import os
 import tempfile
 from typing import Optional
 
+from src.auth.claude_account_pool import get_pool
+
 logger = logging.getLogger(__name__)
 
 
@@ -378,10 +380,15 @@ class GeminiPlanner:
                 f"--model {use_model} "
                 f"--output-format text"
             )
+            # Multi-account: inject CLAUDE_CONFIG_DIR
+            account_env = await get_pool().next_env()
+            proc_env = {**os.environ, **account_env} if account_env else None
+
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout

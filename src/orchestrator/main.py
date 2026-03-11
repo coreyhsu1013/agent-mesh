@@ -28,6 +28,8 @@ import signal
 
 import yaml
 
+from src.auth.claude_account_pool import init_pool
+
 logger = logging.getLogger("agent-mesh")
 
 
@@ -505,6 +507,9 @@ Examples:
 
     # Load config
     config = load_config(args.config)
+
+    # Initialize Claude multi-account pool
+    init_pool(config)
 
     # Apply CLI overrides
     if args.max_parallel:

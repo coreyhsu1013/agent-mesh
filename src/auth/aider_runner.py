@@ -18,6 +18,8 @@ import tempfile
 import time
 from typing import Optional
 
+from src.auth.claude_account_pool import get_pool
+
 logger = logging.getLogger(__name__)
 
 
@@ -593,11 +595,19 @@ class ClaudeRunner:
         )
 
         try:
+            # Multi-account: inject CLAUDE_CONFIG_DIR for rate limit distribution
+            account_env = await get_pool().next_env()
+            proc_env = None
+            if account_env:
+                proc_env = {**os.environ, **account_env}
+                logger.info(f"[ClaudeRunner] using account: {account_env.get('CLAUDE_CONFIG_DIR', 'default')}")
+
             proc = await asyncio.create_subprocess_shell(
                 cmd, cwd=workspace_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,  # ★ allow killpg to kill child processes
+                env=proc_env,
             )
 
             stdout, stderr, timed_out, reason = await heartbeat_wait(

@@ -55,6 +55,12 @@ timeouts:
 agents:
   claude_code:
     enabled: true
+    # Multi-account: round-robin CLAUDE_CONFIG_DIR for 3x rate limit
+    # Each dir must have `claude login` completed beforehand
+    accounts:
+      - "~/.claude"        # account A (default)
+      # - "~/.claude-b"    # account B (uncomment after `claude-b login`)
+      # - "~/.claude-c"    # account C (uncomment after `claude-c login`)
     # Opus: 架構、安全、review（最強推理）
     model_opus: "claude-opus-4-6"
     timeout_opus: 1200
