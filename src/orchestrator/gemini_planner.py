@@ -380,8 +380,8 @@ class GeminiPlanner:
                 f"--model {use_model} "
                 f"--output-format text"
             )
-            # Multi-account: inject CLAUDE_CONFIG_DIR
-            account_env = await get_pool().next_env()
+            # Multi-account: least-loaded account selection
+            account_env = await get_pool().next_env(model=use_model)
             proc_env = {**os.environ, **account_env} if account_env else None
 
             proc = await asyncio.create_subprocess_shell(

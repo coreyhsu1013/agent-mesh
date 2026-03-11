@@ -595,8 +595,8 @@ class ClaudeRunner:
         )
 
         try:
-            # Multi-account: inject CLAUDE_CONFIG_DIR for rate limit distribution
-            account_env = await get_pool().next_env()
+            # Multi-account: least-loaded account selection
+            account_env = await get_pool().next_env(model=use_model)
             proc_env = None
             if account_env:
                 proc_env = {**os.environ, **account_env}
