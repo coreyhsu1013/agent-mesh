@@ -1,9 +1,14 @@
 """
 Agent Mesh v0.6.0 — Task Models
 新增 DEEPSEEK_AIDER AgentType + WorkspaceType。
+
+v2.0: Task-Gate Architecture
+- GateProfile / GateResult dataclasses
+- Task 新增 gate metadata 欄位
 """
 
 from __future__ import annotations
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -44,6 +49,73 @@ class TaskStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+# ── Gate Architecture (v2.0) ──
+
+@dataclass
+class GateProfile:
+    """Defines deterministic quality gate checks for a task type."""
+    name: str = "coding_basic"
+    input_checks: list[str] = field(default_factory=list)
+    format_checks: list[str] = field(default_factory=list)
+    rule_checks: list[str] = field(default_factory=list)
+    verification_checks: list[str] = field(default_factory=list)
+    escalation_checks: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> GateProfile:
+        if not d:
+            return cls()
+        return cls(
+            name=d.get("name", "coding_basic"),
+            input_checks=d.get("input_checks", []),
+            format_checks=d.get("format_checks", []),
+            rule_checks=d.get("rule_checks", []),
+            verification_checks=d.get("verification_checks", []),
+            escalation_checks=d.get("escalation_checks", []),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "input_checks": self.input_checks,
+            "format_checks": self.format_checks,
+            "rule_checks": self.rule_checks,
+            "verification_checks": self.verification_checks,
+            "escalation_checks": self.escalation_checks,
+        }
+
+
+@dataclass
+class GateResult:
+    """Result from running a single gate check."""
+    gate_name: str = ""
+    passed: bool = True
+    details: str = ""
+    failed_checks: list[str] = field(default_factory=list)
+    timestamp: float = field(default_factory=time.time)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> GateResult:
+        if not d:
+            return cls()
+        return cls(
+            gate_name=d.get("gate_name", ""),
+            passed=d.get("passed", True),
+            details=d.get("details", ""),
+            failed_checks=d.get("failed_checks", []),
+            timestamp=d.get("timestamp", 0.0),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "gate_name": self.gate_name,
+            "passed": self.passed,
+            "details": self.details,
+            "failed_checks": self.failed_checks,
+            "timestamp": self.timestamp,
+        }
+
+
 @dataclass
 class Task:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -70,6 +142,18 @@ class Task:
     duration_sec: float = 0.0          # 執行耗時
     error: str = ""                    # 錯誤訊息
 
+    # v2.0: Task-Gate Architecture
+    task_type: str = ""                # e.g. "api", "schema", "ui", "auth"
+    input_requirements: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    deliverables: list[str] = field(default_factory=list)
+    gate_profile: dict = field(default_factory=dict)   # serialized GateProfile
+    gate_results: list[dict] = field(default_factory=list)  # list of serialized GateResult
+    gate_feedback: dict = field(default_factory=dict)  # serialized GateFeedback for retry
+    retry_reason: str = ""
+    escalation_reason: str = ""
+    verification_artifacts: dict = field(default_factory=dict)
+
     @classmethod
     def from_dict(cls, d: dict) -> Task:
         return cls(
@@ -92,10 +176,21 @@ class Task:
             diff=d.get("diff", ""),
             duration_sec=d.get("duration_sec", 0.0),
             error=d.get("error", ""),
+            # v2.0: gate fields (safe fallback for old plan.json)
+            task_type=d.get("task_type", ""),
+            input_requirements=d.get("input_requirements", []),
+            constraints=d.get("constraints", []),
+            deliverables=d.get("deliverables", []),
+            gate_profile=d.get("gate_profile", {}),
+            gate_results=d.get("gate_results", []),
+            gate_feedback=d.get("gate_feedback", {}),
+            retry_reason=d.get("retry_reason", ""),
+            escalation_reason=d.get("escalation_reason", ""),
+            verification_artifacts=d.get("verification_artifacts", {}),
         )
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "id": self.id,
             "title": self.title,
             "description": self.description,
@@ -116,6 +211,28 @@ class Task:
             "duration_sec": self.duration_sec,
             "error": self.error,
         }
+        # v2.0: gate fields (only include if non-empty to keep backward compat)
+        if self.task_type:
+            d["task_type"] = self.task_type
+        if self.input_requirements:
+            d["input_requirements"] = self.input_requirements
+        if self.constraints:
+            d["constraints"] = self.constraints
+        if self.deliverables:
+            d["deliverables"] = self.deliverables
+        if self.gate_profile:
+            d["gate_profile"] = self.gate_profile
+        if self.gate_results:
+            d["gate_results"] = self.gate_results
+        if self.gate_feedback:
+            d["gate_feedback"] = self.gate_feedback
+        if self.retry_reason:
+            d["retry_reason"] = self.retry_reason
+        if self.escalation_reason:
+            d["escalation_reason"] = self.escalation_reason
+        if self.verification_artifacts:
+            d["verification_artifacts"] = self.verification_artifacts
+        return d
 
 
 @dataclass

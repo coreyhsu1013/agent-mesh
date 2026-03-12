@@ -20,6 +20,8 @@ from typing import Optional
 from ..models.task import Task, TaskPlan, TaskStatus, AgentType
 from ..context.store import ContextStore
 from ..auth.aider_runner import AiderRunner, ClaudeRunner, heartbeat_wait
+from ..gates.runner import GateRunner
+from ..gates.registry import GateRegistry
 from .router import ModelRouter
 from .react_loop import ReactLoop, TaskResult
 from .reviewer import Reviewer
@@ -43,6 +45,7 @@ class Dispatcher:
         self.router = ModelRouter(config)
         self.react_loop = ReactLoop(config)
         self.reviewer = Reviewer(config, repo_dir)
+        self.gate_runner = GateRunner(GateRegistry())
         self.pool = WorkspacePool(repo_dir, config, target_branch, slot_prefix)
 
         aider = AiderRunner(config)
@@ -552,7 +555,62 @@ class Dispatcher:
                         except Exception as e:
                             logger.debug(f"[Experience] Record failed: {e}")
 
-                    # 3) Review (optional, no merge here)
+                    # 3) Deterministic Gate (v2.0, before reviewer)
+                    #    Gate retry: up to 2 retries with structured feedback
+                    max_gate_retries = self.config.get("gates", {}).get(
+                        "max_retries", 2
+                    )
+                    for gate_attempt in range(1, max_gate_retries + 2):
+                        if result.status != "completed":
+                            break
+
+                        gate_summary = await self.gate_runner.run(
+                            task=task,
+                            diff=result.final_diff,
+                            workspace_dir=workspace_dir,
+                        )
+                        # Persist gate results (always keep latest)
+                        task.gate_results = [
+                            r.to_dict() for r in gate_summary.results
+                        ]
+
+                        if gate_summary.overall_passed:
+                            task.gate_feedback = {}  # clear on success
+                            break
+
+                        # Gate failed
+                        if gate_attempt > max_gate_retries:
+                            # Exhausted retries — final failure
+                            logger.warning(
+                                f"[Gate] ❌ '{task.title}' gate failed after "
+                                f"{max_gate_retries} retries: "
+                                f"{', '.join(gate_summary.failed_checks)}"
+                            )
+                            result.status = "failed"
+                            result.error = (
+                                f"Gate failed: {', '.join(gate_summary.failed_checks)}"
+                            )
+                            break
+
+                        # Store feedback and re-run ReactLoop
+                        feedback = gate_summary.to_feedback(attempt=gate_attempt)
+                        task.gate_feedback = feedback.to_dict()
+                        logger.info(
+                            f"[Gate] 🔄 '{task.title}' gate retry "
+                            f"{gate_attempt}/{max_gate_retries} — "
+                            f"failed: {', '.join(feedback.failed_checks)}"
+                        )
+
+                        result = await self.react_loop.execute_task(
+                            task=task,
+                            runners=self.runners,
+                            router=self.router,
+                            workspace_dir=workspace_dir,
+                            shared_context=self.shared_context,
+                            start_attempt=start_attempt,
+                        )
+
+                    # 4) Review (optional, only if gate passed)
                     if result.status == "completed" and not self.no_review:
                         review = await self.reviewer.review(
                             diff=result.final_diff,

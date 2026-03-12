@@ -758,3 +758,6 @@ Output ONLY valid JSON. No explanation, no markdown code blocks.
             task.setdefault("target_files", [])
             task.setdefault("module", "core")
             task.setdefault("category", "backend")
+            # v2.0: gate fields (will be enriched later by Planner)
+            task.setdefault("task_type", "")
+            task.setdefault("gate_profile", {})

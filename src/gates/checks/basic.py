@@ -1,0 +1,421 @@
+"""
+Agent Mesh v2.0 — Basic Deterministic Checks
+First-version gate check implementations.
+
+Principles:
+1. Minimal viable — don't over-engineer
+2. Repo-generic — works across project types
+3. Conservative on unconfigured projects — don't false-positive
+4. Reuse existing build/test behavior where possible
+"""
+
+from __future__ import annotations
+import asyncio
+import logging
+import os
+import re
+
+logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════
+# Input Checks — validate task inputs before execution
+# ══════════════════════════════════════════════════════════
+
+def target_files_defined(task, **kwargs) -> tuple[bool, str]:
+    """Check that task has at least one target file defined."""
+    files = getattr(task, "target_files", None) or []
+    if files:
+        return True, f"{len(files)} target files defined"
+    return False, "No target_files defined on task"
+
+
+def acceptance_defined(task, **kwargs) -> tuple[bool, str]:
+    """Check that task has acceptance criteria."""
+    criteria = getattr(task, "acceptance_criteria", "") or ""
+    if criteria.strip():
+        return True, "Acceptance criteria defined"
+    return False, "No acceptance_criteria defined on task"
+
+
+# ══════════════════════════════════════════════════════════
+# Rule Checks — deterministic rule enforcement on diff
+# ══════════════════════════════════════════════════════════
+
+def allowed_paths_only(task, diff: str = "", workspace_dir: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Check that changed files are within expected paths.
+    Conservative: if no target_files defined, pass (don't block).
+    """
+    if not diff:
+        return True, "No diff to check"
+
+    target_files = getattr(task, "target_files", None) or []
+    if not target_files:
+        return True, "No target_files constraint — skipping path check"
+
+    # Extract changed files from diff
+    changed = _extract_changed_files(diff)
+    if not changed:
+        return True, "No files changed"
+
+    # Build allowed directories from target_files
+    allowed_dirs = set()
+    for tf in target_files:
+        # Allow the file itself and its parent directory
+        allowed_dirs.add(os.path.dirname(tf))
+        allowed_dirs.add(tf)
+
+    # Check each changed file
+    violations = []
+    for f in changed:
+        # Check if file or its parent is in allowed set
+        in_allowed = False
+        for allowed in allowed_dirs:
+            if not allowed:  # root dir
+                in_allowed = True
+                break
+            if f == allowed or f.startswith(allowed + "/") or allowed.startswith(os.path.dirname(f)):
+                in_allowed = True
+                break
+        if not in_allowed:
+            violations.append(f)
+
+    if violations:
+        return False, f"Files outside target paths: {', '.join(violations[:5])}"
+    return True, f"{len(changed)} files all within allowed paths"
+
+
+def no_new_dependency(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Check that no new package dependencies were added.
+    Only flags — not a hard blocker for most profiles.
+    Conservative: only checks package.json and requirements.txt patterns.
+    """
+    if not diff:
+        return True, "No diff to check"
+
+    # Look for additions to dependency sections
+    suspicious_patterns = [
+        r'^\+\s*"[^"]+"\s*:\s*"[\^~]?\d',  # package.json dep addition
+        r'^\+[a-zA-Z].*==',                  # requirements.txt addition
+    ]
+
+    lines = diff.split("\n")
+    new_deps = []
+    for line in lines:
+        for pattern in suspicious_patterns:
+            if re.search(pattern, line):
+                new_deps.append(line.strip()[:80])
+                break
+
+    if new_deps:
+        return False, f"New dependencies detected: {'; '.join(new_deps[:3])}"
+    return True, "No new dependencies detected"
+
+
+def no_secret_leak(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Check for potential secret/credential leaks in diff.
+    Conservative: only flags obvious patterns.
+    """
+    if not diff:
+        return True, "No diff to check"
+
+    secret_patterns = [
+        (r'(?i)(api[_-]?key|secret[_-]?key|password|token)\s*[=:]\s*["\'][a-zA-Z0-9]{16,}', "Hardcoded secret"),
+        (r'sk-[a-zA-Z0-9]{20,}', "OpenAI-style API key"),
+        (r'ghp_[a-zA-Z0-9]{36,}', "GitHub personal access token"),
+        (r'-----BEGIN (RSA |EC )?PRIVATE KEY-----', "Private key"),
+    ]
+
+    # Only check added lines
+    added_lines = [
+        line[1:] for line in diff.split("\n")
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    added_text = "\n".join(added_lines)
+
+    findings = []
+    for pattern, label in secret_patterns:
+        if re.search(pattern, added_text):
+            findings.append(label)
+
+    if findings:
+        return False, f"Potential secret leak: {', '.join(findings)}"
+    return True, "No secret patterns detected"
+
+
+# ══════════════════════════════════════════════════════════
+# Verification Checks — post-execution verification
+# ══════════════════════════════════════════════════════════
+
+def diff_not_empty(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """Check that the task actually produced changes."""
+    if diff and diff.strip() and len(diff.strip()) > 10:
+        lines = len(diff.split("\n"))
+        return True, f"Diff has {lines} lines"
+    return False, "Diff is empty — task produced no changes"
+
+
+async def build_pass(task, workspace_dir: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Run build check in workspace.
+    Strategy:
+    1. Detect package manager from lock file (pnpm > yarn > bun > npm)
+    2. Determine build command: package.json "build" script > tsconfig.json tsc > skip
+    3. Run exactly ONE command — no || fallthrough that masks errors
+    Conservative: if no build mechanism found, pass.
+    """
+    if not workspace_dir or not os.path.isdir(workspace_dir):
+        return True, "No workspace dir — skipping build check"
+
+    pm = _detect_package_manager(workspace_dir)
+    build_cmd = _resolve_build_cmd(workspace_dir, pm)
+
+    if not build_cmd:
+        return True, "No build script or tsconfig found — skipping"
+
+    build_output = await _run_cmd(f"cd {workspace_dir} && {build_cmd} 2>&1", timeout=120)
+
+    if _has_build_errors(build_output):
+        return False, f"Build failed ({pm}): {build_output[:300]}"
+    return True, f"Build passed ({pm})"
+
+
+async def tests_pass(task, workspace_dir: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Run tests in workspace.
+    Strategy:
+    1. Detect package manager from lock file
+    2. Detect test framework: vitest > jest > generic "test" script
+    3. Run exactly ONE test command with appropriate flags
+    Conservative: if no test script found, pass.
+    """
+    if not workspace_dir or not os.path.isdir(workspace_dir):
+        return True, "No workspace dir — skipping test check"
+
+    pm = _detect_package_manager(workspace_dir)
+    test_cmd = _resolve_test_cmd(workspace_dir, pm)
+
+    if not test_cmd:
+        return True, "No test script found — skipping"
+
+    test_output = await _run_cmd(f"cd {workspace_dir} && {test_cmd} 2>&1", timeout=120)
+
+    if _has_test_failures(test_output):
+        return False, f"Tests failed ({pm}): {test_output[:300]}"
+    return True, f"Tests passed ({pm})"
+
+
+# ══════════════════════════════════════════════════════════
+# Escalation Checks — flag for human/senior review
+# (These return (should_escalate, reason) — True = needs escalation)
+# ══════════════════════════════════════════════════════════
+
+def auth_or_payment_touched(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """Flag if auth or payment related files were modified."""
+    if not diff:
+        return False, ""
+
+    changed = _extract_changed_files(diff)
+    sensitive_patterns = ["auth", "payment", "billing", "stripe", "session", "token", "credential"]
+
+    touched = []
+    for f in changed:
+        f_lower = f.lower()
+        for pattern in sensitive_patterns:
+            if pattern in f_lower:
+                touched.append(f)
+                break
+
+    if touched:
+        return True, f"Sensitive files touched: {', '.join(touched[:5])}"
+    return False, "No sensitive files touched"
+
+
+def migration_detected(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """Flag if database migration files were created/modified."""
+    if not diff:
+        return False, ""
+
+    changed = _extract_changed_files(diff)
+    migration_patterns = ["migration", "migrate", "prisma/migrations", "alembic", "knex"]
+
+    migrations = []
+    for f in changed:
+        f_lower = f.lower()
+        for pattern in migration_patterns:
+            if pattern in f_lower:
+                migrations.append(f)
+                break
+
+    if migrations:
+        return True, f"Migration files detected: {', '.join(migrations[:5])}"
+    return False, "No migration files detected"
+
+
+# ══════════════════════════════════════════════════════════
+# Registry — maps check name to function
+# ══════════════════════════════════════════════════════════
+
+CHECK_REGISTRY: dict[str, callable] = {
+    # Input checks
+    "target_files_defined": target_files_defined,
+    "acceptance_defined": acceptance_defined,
+    # Rule checks
+    "allowed_paths_only": allowed_paths_only,
+    "no_new_dependency": no_new_dependency,
+    "no_secret_leak": no_secret_leak,
+    # Verification checks
+    "diff_not_empty": diff_not_empty,
+    "build_pass": build_pass,
+    "tests_pass": tests_pass,
+    # Escalation checks
+    "auth_or_payment_touched": auth_or_payment_touched,
+    "migration_detected": migration_detected,
+}
+
+
+# ══════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════
+
+def _extract_changed_files(diff: str) -> list[str]:
+    """Extract file paths from git diff output."""
+    files = []
+    for line in diff.split("\n"):
+        if line.startswith("diff --git"):
+            parts = line.split(" b/")
+            if len(parts) > 1:
+                files.append(parts[1])
+    return files
+
+
+def _detect_package_manager(workspace_dir: str) -> str:
+    """
+    Detect package manager from lock file.
+    Priority: pnpm > yarn > bun > npm (fallback).
+    """
+    if os.path.exists(os.path.join(workspace_dir, "pnpm-lock.yaml")):
+        return "pnpm"
+    if os.path.exists(os.path.join(workspace_dir, "yarn.lock")):
+        return "yarn"
+    if os.path.exists(os.path.join(workspace_dir, "bun.lockb")):
+        return "bun"
+    return "npm"
+
+
+def _read_package_json(workspace_dir: str) -> dict:
+    """Read and parse package.json, return empty dict on failure."""
+    pkg_path = os.path.join(workspace_dir, "package.json")
+    if not os.path.exists(pkg_path):
+        return {}
+    try:
+        import json
+        with open(pkg_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _resolve_build_cmd(workspace_dir: str, pm: str) -> str | None:
+    """
+    Determine the single best build command for the workspace.
+    Returns None if no build mechanism is found.
+
+    Resolution order:
+    1. package.json has "build" script → {pm} run build
+    2. tsconfig.json exists → npx tsc --noEmit
+    3. None (no build — gate will skip)
+    """
+    pkg = _read_package_json(workspace_dir)
+    scripts = pkg.get("scripts", {})
+
+    if "build" in scripts:
+        return f"{pm} run build"
+
+    if os.path.exists(os.path.join(workspace_dir, "tsconfig.json")):
+        return "npx tsc --noEmit"
+
+    return None
+
+
+def _resolve_test_cmd(workspace_dir: str, pm: str) -> str | None:
+    """
+    Determine the single best test command for the workspace.
+    Returns None if no test mechanism is found.
+
+    Resolution order:
+    1. vitest in devDependencies → {pm} test --passWithNoTests
+    2. jest in devDependencies   → {pm} test -- --passWithNoTests
+    3. "test" script exists      → {pm} test
+    4. None (no tests — gate will skip)
+    """
+    pkg = _read_package_json(workspace_dir)
+    all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+    scripts = pkg.get("scripts", {})
+
+    if "vitest" in all_deps:
+        return f"{pm} test --passWithNoTests"
+
+    if "jest" in all_deps:
+        return f"{pm} test -- --passWithNoTests"
+
+    if "test" in scripts:
+        # Generic test script — don't add framework-specific flags
+        return f"{pm} test"
+
+    return None
+
+
+def _has_build_errors(output: str) -> bool:
+    """Check for build error indicators. Uses exit code aware patterns."""
+    if not output or output.strip() == "NO_BUILD_SCRIPT":
+        return False
+    # Specific patterns that reliably indicate build failure
+    indicators = [
+        "error TS",                    # TypeScript compiler error
+        "SyntaxError:",                # JS/TS syntax error
+        "TypeError:",                  # Type error at build time
+        "ReferenceError:",             # Reference error at build time
+        "Cannot find module",          # Missing module
+        "Module not found",            # Webpack/Next.js missing module
+        "failed with exit code",       # Process exit with error
+        "Build error",                 # Next.js build error
+        "ENOENT",                      # File not found
+        "ERR!",                        # npm/pnpm error marker
+    ]
+    return any(ind in output for ind in indicators)
+
+
+def _has_test_failures(output: str) -> bool:
+    """Check for test failure indicators."""
+    if not output or output.strip() == "NO_TEST_SCRIPT":
+        return False
+    indicators = [
+        "FAIL ",                       # Jest/vitest FAIL marker (with space to avoid "FAILED")
+        "Tests:.*failed",              # Jest summary
+        "Test Files.*failed",          # Vitest summary
+        " failing",                    # Mocha style
+        "AssertionError",              # Assertion failure
+        "failed with exit code",       # Process exit with error
+        "ERR!",                        # npm/pnpm error marker
+    ]
+    return any(re.search(ind, output) for ind in indicators)
+
+
+async def _run_cmd(cmd: str, timeout: int = 60) -> str:
+    """Run shell command with timeout."""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return stdout.decode(errors="replace")[:5000] if stdout else ""
+    except asyncio.TimeoutError:
+        return "TIMEOUT"
+    except Exception as e:
+        return f"CMD_ERROR: {e}"

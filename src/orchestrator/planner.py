@@ -16,6 +16,7 @@ from typing import Optional
 
 from ..models.task import TaskPlan
 from ..auth.cli_runner import run_claude_prompt, run_gemini_prompt
+from ..gates.registry import GateRegistry
 from .gemini_planner import GeminiPlanner
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,9 @@ class Planner:
 
         # Gemini planner (for API fallback)
         self.gemini_planner = GeminiPlanner(config)
+
+        # v2.0: gate registry for task enrichment
+        self.gate_registry = GateRegistry()
 
     async def plan(
         self,
@@ -74,11 +78,28 @@ class Planner:
         )
 
         plan = TaskPlan.from_dict(plan_dict)
+
+        # v2.0: enrich tasks with gate profiles
+        self._enrich_tasks(plan)
+
         logger.info(
             f"[Planner] Generated plan: {len(plan.tasks)} tasks, "
             f"modules={list(plan.modules.keys()) if plan.modules else ['core']}"
         )
         return plan
+
+    def _enrich_tasks(self, plan: TaskPlan) -> None:
+        """Enrich all tasks with gate_profile and task_type via heuristic."""
+        profile_counts: dict[str, int] = {}
+        for task in plan.tasks:
+            self.gate_registry.enrich_task(task)
+            pname = task.gate_profile.get("name", "coding_basic")
+            profile_counts[pname] = profile_counts.get(pname, 0) + 1
+
+        logger.info(
+            f"[Planner] Gate profiles assigned: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(profile_counts.items()))
+        )
 
     @staticmethod
     def save_plan(plan: TaskPlan, output_path: str):

@@ -120,6 +120,8 @@ class TaskResult:
     # v0.9: cost tracking
     cost_results: list = field(default_factory=list)  # list[CostResult]
     total_cost_usd: float = 0.0
+    # v2.0: observation artifacts for gate runner
+    observation_artifacts: dict = field(default_factory=dict)
 
 
 class AgentRunner(Protocol):
@@ -240,6 +242,7 @@ class ReactLoop:
                     final_model=decision.model,
                     cost_results=cost_results,
                     total_cost_usd=total_cost,
+                    observation_artifacts=observation.to_dict(),
                 )
 
             if attempt == max_attempts:
@@ -279,6 +282,14 @@ class ReactLoop:
 
         if shared_context:
             parts.append(f"\n## Project Context:\n{shared_context[:2000]}")
+
+        # v2.0: inject gate feedback from previous gate failure
+        gate_fb = getattr(task, "gate_feedback", None)
+        if gate_fb:
+            from ..gates.runner import GateFeedback
+            feedback = GateFeedback.from_dict(gate_fb)
+            if feedback.failed_checks:
+                parts.append(f"\n{feedback.to_prompt_block()}")
 
         history_ctx = history.to_context()
         if history_ctx:
