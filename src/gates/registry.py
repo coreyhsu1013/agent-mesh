@@ -78,25 +78,30 @@ class GateRegistry:
                 return GateProfile.from_dict(task.gate_profile)
 
         title = (task.title or "").lower()
+        category = (task.category or "").lower()
         full_text = " ".join([
             title,
             (task.description or "").lower(),
-            (task.category or "").lower(),
+            category,
             (task.task_type or "").lower(),
             (task.module or "").lower(),
         ])
 
-        # 2. Title-based match (high confidence — prevents description noise from overriding)
+        # 2. Category override: frontend tasks never get backend gate profiles
+        if category == "frontend":
+            return self.profiles.get("ui_operability_basic", CODING_BASIC)
+
+        # 3. Title-based match (high confidence — prevents description noise from overriding)
         result = self._match_heuristics(title, task.title or "")
         if result:
             return result
 
-        # 3. Full-text match (lower confidence fallback)
+        # 4. Full-text match (lower confidence fallback)
         result = self._match_heuristics(full_text, task.title or "")
         if result:
             return result
 
-        # 4. Default
+        # 5. Default
         return CODING_BASIC
 
     def _match_heuristics(self, text: str, title: str) -> GateProfile | None:
