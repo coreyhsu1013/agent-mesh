@@ -1,7 +1,7 @@
-# Agent Mesh v0.6.5 Configuration
-# ============================
+# Agent Mesh Configuration
+# ========================
 
-version: "0.7.1"
+version: "1.5"
 
 # ── Planner ──
 planner:

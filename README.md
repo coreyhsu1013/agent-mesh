@@ -1,50 +1,83 @@
-# Agent Mesh v0.6.5
+# Agent Mesh
 
-Multi-Agent CLI Orchestration — Planner → DAG → Dispatcher → CLI Agents → Reviewer → Git Merge
+Multi-agent CLI orchestration system — spec → plan → parallel agents → review → merge.
+
+Takes a markdown spec, plans tasks via Gemini/Opus, dispatches them to multiple AI agents (Grok, DeepSeek, Claude) in parallel using git worktrees, reviews with Opus, and merges back to main.
 
 ## Architecture
 
 ```
-Spec (.md) → Planner (Gemini CLI) → plan.json
-  → Dispatcher (ModelRouter)
-    ├─ DeepSeek Agent (aider CLI) ← primary code writer (L/M complexity)
-    │   └─ ReAct Loop (Think → Act → Observe → Retry)
-    ├─ Claude Agent (claude -p)   ← architecture/security/review (H complexity)
-    │   └─ ReAct Loop
-    └─ Codex Agent (pending)
-  → Reviewer (Claude)
-  → Git Merge (main)
+Five-Layer Architecture:
+
+Design Pipeline: spec delta → chunk → implement per chunk
+  ↓ each chunk calls Layer 1-4
+Layer 1 (ReAct):       task → escalate → complete
+Layer 2 (ProjectLoop): plan → execute → verify → fix
+Layer 3 (SpecFeedback): stuck gaps → analyze → spec fix
+Layer 4 (Integration):  cross-module → contract check
 ```
 
-## Model Loading Distribution
+### Execution Modes
 
-| Agent | Loading | Role |
-|-------|---------|------|
-| Claude | ~30% | H complexity + review |
-| DeepSeek | ~50% | L/M complexity code writing |
-| Gemini | ~20% | Planning |
+**Standard** (`--plan + --cycles`):
+```
+Spec (.md) → Planner (Gemini) → plan.json
+  → Dispatcher (wave-based, parallel worktrees)
+    → ModelRouter (matrix-based escalation chain)
+      ├─ Grok (aider CLI)      ← L/S, cheapest first
+      ├─ DeepSeek (aider CLI)  ← M fallback
+      ├─ Claude (claude CLI)   ← M/H + review
+      └─ ReAct loop (think → act → observe → evaluate)
+  → Reviewer (always Opus)
+  → Git merge (sequential, build check after each merge)
+```
+
+**Spec Evolution** (`--evolve`):
+```
+Delta analysis (old spec vs new spec)
+  → Feasibility review
+  → Dependency-ordered chunking
+  → Per-chunk: plan → execute (Layer 1-4) → validate
+  → Final validation → re-chunk if gaps remain
+```
+
+## Model Routing
+
+| Complexity | Escalation Chain | Use Case |
+|-----------|-----------------|----------|
+| L | Grok → DeepSeek → Sonnet | Scaffolding, config, boilerplate |
+| S | Grok → DeepSeek → Sonnet | Simple logic, imports |
+| M | Grok → DeepSeek → Sonnet → Opus | Business rules, middleware |
+| H | Grok → DeepSeek → Sonnet → Opus | Architecture, security, payment |
+
+Model ranking (0-7): Grok variants → DeepSeek → Sonnet → Opus.
+Auto-escalation when gap reduction < 15%.
 
 ## Quick Start
 
 ```bash
 # Prerequisites
-claude auth status           # Claude CLI logged in
-gemini --version            # Gemini CLI installed
-aider --version             # aider >= 0.86
+claude auth status              # Claude CLI logged in
+gemini --version                # Gemini CLI installed
+aider --version                 # aider >= 0.86
+export XAI_API_KEY="xai-..."
 export DEEPSEEK_API_KEY="sk-..."
 
 # Setup
 python3 -m venv .venv && source .venv/bin/activate
 pip install pyyaml google-generativeai
 
-# Plan (Gemini)
-python -m src.orchestrator.main --spec ~/work/project/spec.md --repo ~/work/project --plan-only
+# Plan only
+python -m src.orchestrator.main --spec spec.md --repo ~/project --plan-only
 
-# Execute (DeepSeek + Claude mixed)
-python -m src.orchestrator.main --plan plan.json --repo ~/work/project
+# Execute plan with auto-fix cycles
+python -m src.orchestrator.main --plan plan.json --repo ~/project --cycles 3
 
-# Resume failed tasks
-python -m src.orchestrator.main --plan plan.json --repo ~/work/project --resume
+# Spec evolution (delta → chunk → implement)
+python -m src.orchestrator.main --evolve --spec-old old.md --spec-new new.md --repo ~/project
+
+# Resume after crash
+python -m src.orchestrator.main --plan plan.json --repo ~/project --resume
 ```
 
 ## CLI Options
@@ -55,26 +88,56 @@ python -m src.orchestrator.main --plan plan.json --repo ~/work/project --resume
 | `--plan` | Path to existing plan.json |
 | `--repo` | Target git repository |
 | `--config` | Path to config.yaml |
-| `--plan-only` | Generate plan only |
+| `--plan-only` | Generate plan only, don't execute |
 | `--resume` | Resume pending/failed tasks |
+| `--evolve` | Spec evolution mode (delta → chunk → implement) |
+| `--spec-old` / `--spec-new` | Old and new spec for evolution |
+| `--cycles` | Number of verify-fix cycles |
 | `--module` | Filter by module names |
-| `--waves` | Filter by wave numbers |
 | `--max-parallel` | Override max parallel tasks |
 | `--no-review` | Skip code review |
+| `--deploy` | Deploy after completion (rsync + SSH) |
 | `-v` | Verbose logging |
 
-## Version History
+## Key Features
 
-| Version | Date | Changes |
-|---------|------|---------|
-| v0.1.0 | 2026-02-27 | Initial (API key mode) |
-| v0.2.0 | 2026-02-27 | CLI OAuth2 migration |
-| v0.3.0 | 2026-02-27 | Resume + version management |
-| v0.4.0 | 2026-02-27 | Modular architecture (--module, --waves) |
-| v0.5.0 | 2026-02-28 | Rate limit fixes (--max-parallel, retry delay) |
-| **v0.6.0** | **2026-03-01** | **Gemini Planner + DeepSeek aider + ReAct Loop** |
-| **v0.6.1** | **2026-03-01** | **Router precision fix, worktree merge rebase, test detection, --no-review** |
-| **v0.6.2** | **2026-03-01** | **Fix main uncommitted changes blocking merge** |
-| **v0.6.3** | **2026-03-01** | **WorkspacePool: per-task slot isolation + merge lock** |
-| **v0.6.4** | **2026-03-01** | **Claude Opus/Sonnet split, DeepSeek reasoner/chat分流, RoutingDecision, timeout分級** |
-| **v0.6.5** | **2026-03-01** | **index.lock cleanup, failed dependency propagation, model escalation (4級), heartbeat timeout** |
+- **Multi-agent routing**: 8 model ranks with automatic escalation
+- **Multi-account Claude pool**: Round-robin accounts with 15% balance threshold
+- **Closed-loop verify**: Regression check → bounded scan → convergence
+- **Spec feedback (Layer 3)**: Stuck gaps → root cause analysis → auto-fix spec
+- **Integration check (Layer 4)**: Cross-module typecheck + API contract validation
+- **Chunked evolution**: Large spec changes split into dependency-ordered batches
+- **Full resume**: Every step cached, crash-safe restart
+- **Build-after-merge**: Build check after each merge, auto-rollback on failure
+- **Docs-only detection**: Skip build check for non-code merges
+- **Manual mode signals**: CONTINUE / SKIP / STOP for human-in-the-loop
+
+## Project Structure
+
+```
+src/
+├── orchestrator/   # Core pipeline (28 modules)
+│   ├── main.py              # CLI entry
+│   ├── design_loop.py       # Spec evolution orchestrator
+│   ├── dispatcher.py        # Wave-based parallel execution
+│   ├── project_loop.py      # Verify-fix outer loop
+│   ├── react_loop.py        # Per-task ReAct loop
+│   ├── router.py            # Model routing matrix
+│   ├── model_ranking.py     # 8-rank escalation
+│   ├── verifier.py          # Mechanical + LLM verification
+│   ├── gap_analyzer.py      # Gap → fix-plan conversion
+│   ├── spec_analyzer.py     # Delta analysis (Opus)
+│   ├── spec_refiner.py      # Chunking (Sonnet)
+│   ├── workspace.py         # Git worktree pool
+│   └── ...
+├── auth/           # CLI agent runners + multi-account pool
+├── context/        # SQLite persistence
+└── models/         # Dataclass models (Task, TaskPlan)
+```
+
+## Dependencies
+
+- Python ≥ 3.11, asyncio throughout
+- `pyyaml`, `google-generativeai` (optional)
+- CLI tools: `claude`, `aider`, `gemini`, `git`
+- Env vars: `XAI_API_KEY`, `DEEPSEEK_API_KEY`
