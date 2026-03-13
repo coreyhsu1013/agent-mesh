@@ -55,11 +55,11 @@ agents:
       # - "~/.claude-c"    # account C (uncomment after `claude-c login`)
     # Opus: 架構、安全、review（最強推理）
     model_opus: "claude-opus-4-6"
-    timeout_opus: 1200
+    timeout_opus: 3600
     idle_timeout_opus: 600   # ★ Opus 思考久，獨立 idle timeout
     # Sonnet: M 複雜度 coding（快 3x, 省 5x, 接近 Opus 水準）
     model_sonnet: "claude-sonnet-4-6"
-    timeout_sonnet: 600
+    timeout_sonnet: 1800
     max_parallel: 2
     # 什麼情況用 Opus（其他用 Sonnet）
     use_opus_for:

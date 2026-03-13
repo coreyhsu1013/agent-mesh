@@ -317,9 +317,12 @@ class ReactLoop:
                 error="Agent produced empty or minimal output",
             )
 
-        # 1) Git diff
+        # 1) Git diff (stage untracked files first so scaffold tasks show up)
+        await self._run_cmd(
+            f"cd {workspace_dir} && git add -A 2>/dev/null"
+        )
         diff = await self._run_cmd(
-            f"cd {workspace_dir} && git diff HEAD 2>/dev/null || git diff 2>/dev/null || echo ''"
+            f"cd {workspace_dir} && git diff --cached HEAD 2>/dev/null || git diff --cached 2>/dev/null || echo ''"
         )
 
         # 2) Build (skip in worktree if configured — real build at merge)
