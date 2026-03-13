@@ -30,6 +30,49 @@ from .cost_tracker import CostTracker
 
 logger = logging.getLogger(__name__)
 
+# ── Non-code file patterns (safe to skip build check) ──
+_DOCS_ONLY_EXTENSIONS = frozenset({
+    ".md", ".txt", ".rst", ".adoc",          # documentation
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", # images
+    ".ico", ".webp",
+})
+_DOCS_ONLY_DIRS = ("docs/", "doc/", ".github/", ".vscode/")
+_DOCS_ONLY_BASENAMES = frozenset({
+    "license", "changelog", "authors", "contributors",
+    "code_of_conduct", ".gitignore", ".gitattributes",
+    ".editorconfig",
+})
+
+
+def _should_run_build_check(changed_files: list[str]) -> bool:
+    """
+    Return True if build check should run after merge.
+    Returns False (skip build) only when ALL changed files are non-code.
+    Conservative: empty list or any ambiguous file → run build.
+    """
+    if not changed_files:
+        return True  # no info → be safe, run build
+
+    for f in changed_files:
+        f_lower = f.lower()
+        basename = os.path.basename(f_lower)
+        _, ext = os.path.splitext(f_lower)
+
+        # Check extension
+        if ext in _DOCS_ONLY_EXTENSIONS:
+            continue
+        # Check directory prefix
+        if any(f_lower.startswith(d) for d in _DOCS_ONLY_DIRS):
+            continue
+        # Check known non-code basenames
+        if basename in _DOCS_ONLY_BASENAMES:
+            continue
+
+        # This file could affect build → must run
+        return True
+
+    return False
+
 
 class Dispatcher:
 
@@ -324,7 +367,14 @@ class Dispatcher:
                             if len(parts) > 1:
                                 changed_files.append(parts[1])
 
-                    # 3d. Build check after merge
+                    # 3d. Build check after merge (skip for docs-only)
+                    if not _should_run_build_check(changed_files):
+                        merge_results[idx] = True
+                        logger.info(
+                            f"  ✅ task_{idx}: {label} (docs-only, build skipped)"
+                        )
+                        continue
+
                     build_ok, build_output = await self.pool.run_build_check(build_cmd)
                     if build_ok:
                         merge_results[idx] = True

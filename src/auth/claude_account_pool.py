@@ -30,6 +30,11 @@ MODEL_WEIGHTS = {
 }
 DEFAULT_WEIGHT = 1.0
 
+# Balance threshold: ignore token differences within this % (accounts considered balanced)
+BALANCE_THRESHOLD = 0.15
+# Bias scale: how aggressively to penalize higher-usage accounts (weight units)
+BALANCE_BIAS_SCALE = 20.0
+
 USAGE_FILE = os.path.expanduser("~/.agent-mesh/account-usage.json")
 
 # Module-level singleton
@@ -124,6 +129,7 @@ class ClaudeAccountPool:
         Accounts that already used more tokens this week get higher initial usage,
         so least-loaded picks the fresher account.
         Only applies on first load (startup bias).
+        Ignores differences within 15% (BALANCE_THRESHOLD) — considered balanced.
         """
         if len(self._accounts) <= 1:
             return
@@ -139,23 +145,31 @@ class ClaudeAccountPool:
         if max(week_tokens_per_account) == 0:
             return
 
-        # Normalize: convert token differences to weight units
-        # Use min as baseline, scale difference to weight-equivalent
         min_tokens = min(week_tokens_per_account)
         max_tokens = max(week_tokens_per_account)
-        token_range = max_tokens - min_tokens
 
-        if token_range == 0:
+        if max_tokens == 0:
             return
 
-        # Map token difference to 0-10 weight range (significant but not overwhelming)
+        # Skip if difference is within threshold — accounts are balanced enough
+        diff_pct = (max_tokens - min_tokens) / max_tokens
+        if diff_pct <= BALANCE_THRESHOLD:
+            logger.info(
+                f"[AccountPool] token diff {diff_pct:.0%} <= {BALANCE_THRESHOLD:.0%} threshold, "
+                f"no bias applied"
+            )
+            return
+
+        # Bias proportional to excess over the balanced range
+        # Higher-usage accounts get penalized so least-loaded picks the fresher one
         for i, account in enumerate(self._accounts):
-            bias = ((week_tokens_per_account[i] - min_tokens) / token_range) * 10.0
+            excess = (week_tokens_per_account[i] - min_tokens) / max_tokens
+            bias = excess * BALANCE_BIAS_SCALE
             account["usage"] += bias
             if bias > 0:
                 logger.info(
                     f"[AccountPool] {account['dir']}: week_tokens={week_tokens_per_account[i]:,}, "
-                    f"bias=+{bias:.1f}"
+                    f"diff={excess:.0%}, bias=+{bias:.1f}"
                 )
 
     async def next_env(self, model: str = "") -> dict[str, str]:
