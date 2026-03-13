@@ -40,10 +40,26 @@ _PROFILE_HEURISTICS: list[tuple[list[str], str]] = [
     (["webhook", "integration", "cross-module", "logistics"], "integration_basic"),
     # 5. Schema / migration — specific DB lifecycle keywords
     (["migration", "prisma", "migrate", "db schema"], "schema_critical"),
-    # 6. Auth / security / payment — "authentication" not "auth" to avoid matching "author"
-    (["authentication", "authorization", "security", "payment", "hmac", "jwt", "oauth"], "critical_backend"),
-    # 7. API / CRUD — broadest catch-all, must be last among backend profiles
+    # 6. Auth / security / payment — backend-only critical checks
+    #    "payment" removed here; handled context-sensitively in resolve_profile
+    (["authentication", "authorization", "security", "hmac", "jwt", "oauth"], "critical_backend"),
+    # 7. Payment — only backend gateway/callback/webhook/refund/invoice
+    (["payment gateway", "payment callback", "payment notify", "mpg", "newebpay",
+      "refund", "invoice", "allowance"], "critical_backend"),
+    # 8. API / CRUD — broadest catch-all, must be last among backend profiles
     (["api", "crud", "endpoint"], "api_basic"),
+]
+
+# ── Early-exit signals: scaffold/foundation → coding_basic ──
+_SCAFFOLD_KEYWORDS = [
+    "scaffold", "bootstrap", "foundation", "project setup",
+    "project scaffold", "init project", "boilerplate",
+]
+
+# ── Frontend signals (beyond category field) ──
+_FRONTEND_SIGNALS = [
+    "frontend:", "frontend ", "next.js", "react page", "tsx page",
+    "ui page", "admin page", "admin layout", "admin dashboard",
 ]
 
 
@@ -63,10 +79,12 @@ class GateRegistry:
         """
         Resolve the gate profile for a task.
         Priority:
-        1. task.gate_profile dict (explicit)
-        2. Title-based heuristic (high confidence — title is the primary intent signal)
-        3. Full-text heuristic (lower confidence — description can mention keywords incidentally)
-        4. Default: coding_basic
+        1. task.gate_profile dict (explicit from plan)
+        2. Scaffold/foundation → coding_basic (adding deps is expected)
+        3. Frontend category/signals → ui_operability_basic
+        4. Title-based heuristic (high confidence)
+        5. Full-text heuristic (lower confidence)
+        6. Default: coding_basic
         """
         # 1. Explicit gate_profile on task
         if task.gate_profile:
@@ -74,11 +92,24 @@ class GateRegistry:
                 profile_name = task.gate_profile["name"]
                 if profile_name in self.profiles:
                     return self.profiles[profile_name]
-                # Unknown profile name but has check lists → use as-is
                 return GateProfile.from_dict(task.gate_profile)
 
         title = (task.title or "").lower()
         category = (task.category or "").lower()
+
+        # 2. Scaffold/foundation tasks → coding_basic (no_new_dependency must not block)
+        if any(kw in title for kw in _SCAFFOLD_KEYWORDS):
+            logger.debug(f"[GateRegistry] '{task.title}' → coding_basic (scaffold)")
+            return CODING_BASIC
+
+        # 3. Frontend tasks → ui_operability_basic
+        #    Check category field AND title signals (planner may not set category)
+        if category == "frontend" or any(sig in title for sig in _FRONTEND_SIGNALS):
+            logger.debug(
+                f"[GateRegistry] '{task.title}' → ui_operability_basic (frontend)"
+            )
+            return self.profiles.get("ui_operability_basic", CODING_BASIC)
+
         full_text = " ".join([
             title,
             (task.description or "").lower(),
@@ -87,21 +118,17 @@ class GateRegistry:
             (task.module or "").lower(),
         ])
 
-        # 2. Category override: frontend tasks never get backend gate profiles
-        if category == "frontend":
-            return self.profiles.get("ui_operability_basic", CODING_BASIC)
-
-        # 3. Title-based match (high confidence — prevents description noise from overriding)
+        # 4. Title-based match (high confidence)
         result = self._match_heuristics(title, task.title or "")
         if result:
             return result
 
-        # 4. Full-text match (lower confidence fallback)
+        # 5. Full-text match (lower confidence fallback)
         result = self._match_heuristics(full_text, task.title or "")
         if result:
             return result
 
-        # 5. Default
+        # 6. Default
         return CODING_BASIC
 
     def _match_heuristics(self, text: str, title: str) -> GateProfile | None:
@@ -139,15 +166,25 @@ class GateRegistry:
     @staticmethod
     def _infer_task_type(task: Task) -> str:
         """Infer task_type from title/category."""
-        text = f"{task.title} {task.category} {task.module}".lower()
+        title = (task.title or "").lower()
+        category = (task.category or "").lower()
+        text = f"{title} {category} {task.module or ''}".lower()
+
+        # Frontend tasks: check category first, then title signals
+        if category == "frontend" or any(sig in title for sig in _FRONTEND_SIGNALS):
+            return "ui"
         if any(kw in text for kw in ["schema", "prisma", "migration"]):
             return "schema"
-        if any(kw in text for kw in ["auth", "security", "payment"]):
+        if any(kw in text for kw in ["scaffold", "bootstrap", "foundation"]):
+            return "setup"
+        if any(kw in text for kw in ["auth", "security"]):
+            return "auth"
+        # "payment" alone doesn't mean auth — only backend payment infra
+        if any(kw in text for kw in ["payment gateway", "payment callback", "mpg",
+                                      "newebpay", "refund", "invoice"]):
             return "auth"
         if any(kw in text for kw in ["api", "crud", "endpoint", "route"]):
             return "api"
-        if any(kw in text for kw in ["ui", "page", "component", "frontend"]):
-            return "ui"
         if any(kw in text for kw in ["test", "e2e", "playwright"]):
             return "test"
         if any(kw in text for kw in ["integration", "webhook", "sync"]):
