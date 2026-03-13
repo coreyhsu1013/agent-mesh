@@ -68,6 +68,12 @@ class Planner:
         if not project_name:
             project_name = os.path.basename(self.repo_dir)
 
+        # Auto-detect SpecOS canonical planning spec
+        spec_basename = os.path.basename(spec_path).lower()
+        is_canonical = "planning-spec" in spec_basename
+        if is_canonical:
+            logger.info("[Planner] Detected SpecOS canonical planning spec")
+
         logger.info(f"[Planner] Planning with provider={self.provider}")
 
         # Use GeminiPlanner (handles CLI → API → Claude fallback chain)
@@ -75,6 +81,7 @@ class Planner:
             spec_content=spec_content,
             agents_md=agents_md,
             project_name=project_name,
+            is_canonical=is_canonical,
         )
 
         plan = TaskPlan.from_dict(plan_dict)

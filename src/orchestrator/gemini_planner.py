@@ -53,14 +53,17 @@ class GeminiPlanner:
         spec_content: str,
         agents_md: str = "",
         project_name: str = "project",
+        is_canonical: bool = False,
     ) -> dict:
         """
         Two-phase planning with single-phase fallback.
-        Interface unchanged: spec → plan dict.
+        is_canonical=True when spec was pre-filtered by SpecOS (planning-spec.md).
         """
         # Try two-phase
         try:
-            plan = await self._plan_two_phase(spec_content, agents_md, project_name)
+            plan = await self._plan_two_phase(
+                spec_content, agents_md, project_name, is_canonical,
+            )
             logger.info(
                 f"[GeminiPlanner] Two-phase plan: {len(plan.get('tasks', []))} tasks"
             )
@@ -71,23 +74,30 @@ class GeminiPlanner:
             )
 
         # Fallback: single-phase (original flow)
-        return await self._plan_single_phase(spec_content, agents_md, project_name)
+        return await self._plan_single_phase(
+            spec_content, agents_md, project_name, is_canonical,
+        )
 
     # ══════════════════════════════════════════════════════════
     # Two-Phase Planning
     # ══════════════════════════════════════════════════════════
 
     async def _plan_two_phase(
-        self, spec_content: str, agents_md: str, project_name: str,
+        self,
+        spec_content: str,
+        agents_md: str,
+        project_name: str,
+        is_canonical: bool = False,
     ) -> dict:
         """Phase 1 classify → Phase 2 detail (parallel) → merge."""
 
         # ── Phase 1: Classification ──
         logger.info(
             f"[GeminiPlanner] Phase 1: classifying tasks with {self.model_classify}"
+            f"{' (canonical spec)' if is_canonical else ''}"
         )
         classify_prompt = self._build_classify_prompt(
-            spec_content, agents_md, project_name,
+            spec_content, agents_md, project_name, is_canonical,
         )
         raw = await self._call_model(self.model_classify, classify_prompt)
         skeleton = self._parse_plan(raw)
@@ -123,6 +133,7 @@ class GeminiPlanner:
                 self._detail_with_fallback(
                     self.model_backend, backend_tasks,
                     spec_content, agents_md, project_name, "backend",
+                    is_canonical,
                 )
             )
         if frontend_tasks:
@@ -130,6 +141,7 @@ class GeminiPlanner:
                 self._detail_with_fallback(
                     self.model_frontend, frontend_tasks,
                     spec_content, agents_md, project_name, "frontend",
+                    is_canonical,
                 )
             )
 
@@ -172,11 +184,12 @@ class GeminiPlanner:
         agents_md: str,
         project_name: str,
         label: str,
+        is_canonical: bool = False,
     ) -> list[dict]:
         """Try primary model for Phase 2, fallback if it fails."""
         try:
             result = await self._phase2_detail(
-                model, tasks, spec_content, agents_md, project_name,
+                model, tasks, spec_content, agents_md, project_name, is_canonical,
             )
             logger.info(
                 f"[GeminiPlanner] Phase 2 {label}: "
@@ -192,6 +205,7 @@ class GeminiPlanner:
             )
             result = await self._phase2_detail(
                 self.model_fallback, tasks, spec_content, agents_md, project_name,
+                is_canonical,
             )
             logger.info(
                 f"[GeminiPlanner] Phase 2 {label}: "
@@ -206,10 +220,11 @@ class GeminiPlanner:
         spec_content: str,
         agents_md: str,
         project_name: str,
+        is_canonical: bool = False,
     ) -> list[dict]:
         """Call model to produce detailed tasks from skeletons."""
         prompt = self._build_detail_prompt(
-            task_skeletons, spec_content, agents_md, project_name,
+            task_skeletons, spec_content, agents_md, project_name, is_canonical,
         )
         raw = await self._call_model(model, prompt)
         parsed = self._parse_json(raw)
@@ -232,10 +247,16 @@ class GeminiPlanner:
     # ══════════════════════════════════════════════════════════
 
     async def _plan_single_phase(
-        self, spec_content: str, agents_md: str, project_name: str,
+        self,
+        spec_content: str,
+        agents_md: str,
+        project_name: str,
+        is_canonical: bool = False,
     ) -> dict:
         """Original single-phase planning: spec → full plan in one shot."""
-        prompt = self._build_planning_prompt(spec_content, agents_md, project_name)
+        prompt = self._build_planning_prompt(
+            spec_content, agents_md, project_name, is_canonical,
+        )
 
         if self.provider == "gemini":
             # Gemini CLI → API → Claude fallback
@@ -439,12 +460,43 @@ class GeminiPlanner:
         spec_content: str,
         agents_md: str,
         project_name: str,
+        is_canonical: bool = False,
     ) -> str:
         """Phase 1: classify tasks into backend/frontend/fullstack."""
+
+        # SpecOS canonical spec preamble
+        canonical_preamble = ""
+        if is_canonical:
+            canonical_preamble = """
+## Spec Format Notice
+This specification has been pre-processed by SpecOS into a **canonical planning spec**.
+- All sections are normative and planning-relevant (gate policies, open questions, and UI-only sections have been removed).
+- Section headers carry structured tags (e.g. `[api]`, `[state]`, `[data-model]`) — use these as complexity signals.
+- Every requirement in this document is actionable. Do NOT skip or summarize sections.
+- If the spec defines acceptance criteria or business scenarios, reference them in task acceptance_criteria.
+"""
+
+        # Enhanced complexity guidelines with domain signals
+        complexity_section = """## Complexity Guidelines:
+- **L** (Lite): Pure scaffolding, config files, boilerplate — does NOT import types/services/schemas produced by other tasks
+- **S** (Simple): Simple logic but DOES import types/services/schemas from other tasks (e.g. CRUD using shared types, simple API route using a service)
+- **M** (Medium): Requires reasoning — auth logic, business rules, middleware, validation, tests with edge cases
+- **H** (Hard): Architecture decisions, security, payment, cross-module integration, complex state machines
+
+### Domain-Specific Complexity Floors:
+- Payment / billing / subscription / refund logic → **H minimum**
+- Auth / RBAC / session / token management → **M minimum** (H if cross-module)
+- State machines / workflow engines / order lifecycle → **H minimum**
+- Schema / migration / data model with FK constraints → **M minimum**
+- ERP / WMS / inventory / stock calculations → **M minimum**
+- API contracts with >3 related endpoints → **M minimum**
+
+Key distinction between L and S: if the task needs `import {{ SomeType }} from './other-task-output'`, it's at least S, not L."""
+
         return f"""You are a senior software architect. Read the project specification and break it into tasks with categories.
 
 ## Project: {project_name}
-
+{canonical_preamble}
 ## Specification:
 {spec_content}
 
@@ -458,13 +510,7 @@ class GeminiPlanner:
    - "fullstack": Cross-cutting tasks that span both frontend and backend (e.g. form + API + DB)
 3. Assign complexity (L/S/M/H) and identify dependencies
 
-## Complexity Guidelines:
-- **L** (Lite): Pure scaffolding, config files, boilerplate — does NOT import types/services/schemas produced by other tasks
-- **S** (Simple): Simple logic but DOES import types/services/schemas from other tasks (e.g. CRUD using shared types, simple API route using a service)
-- **M** (Medium): Requires reasoning — auth logic, business rules, middleware, validation, tests with edge cases
-- **H** (Hard): Architecture decisions, security, payment, cross-module integration, complex state machines
-
-Key distinction between L and S: if the task needs `import {{ SomeType }} from './other-task-output'`, it's at least S, not L.
+{complexity_section}
 
 ## Output Format (JSON only, no markdown):
 
@@ -513,20 +559,34 @@ Output ONLY valid JSON. No explanation, no markdown code blocks.
         spec_content: str,
         agents_md: str,
         project_name: str,
+        is_canonical: bool = False,
     ) -> str:
         """Phase 2: produce detailed implementation instructions for each task."""
         skeleton_json = json.dumps(task_skeletons, indent=2, ensure_ascii=False)
-        # Truncate spec to save tokens (Phase 2 already has task context)
-        spec_truncated = spec_content[:4000]
-        if len(spec_content) > 4000:
-            spec_truncated += "\n... (truncated)"
+
+        # Canonical specs are already filtered — include full content
+        if is_canonical:
+            spec_section = spec_content
+        else:
+            # Truncate spec to save tokens (Phase 2 already has task context)
+            spec_section = spec_content[:4000]
+            if len(spec_content) > 4000:
+                spec_section += "\n... (truncated)"
+
+        canonical_note = ""
+        if is_canonical:
+            canonical_note = """
+**Note**: This spec is a SpecOS canonical planning spec — all sections are normative and planning-relevant.
+Use section tags and acceptance criteria from the spec to write precise implementation instructions.
+If the spec defines state transitions, API contracts, or data models, reference them explicitly in the task description.
+"""
 
         return f"""You are a senior software engineer. Refine the following task skeletons into detailed implementation plans.
 
 ## Project: {project_name}
-
+{canonical_note}
 ## Specification (for context):
-{spec_truncated}
+{spec_section}
 
 {f"## Agent Rules:{chr(10)}{agents_md}" if agents_md else ""}
 
@@ -573,14 +633,41 @@ Output ONLY valid JSON. No explanation, no markdown code blocks.
         spec_content: str,
         agents_md: str,
         project_name: str,
+        is_canonical: bool = False,
     ) -> str:
-        """Single-phase full planning prompt (fallback, unchanged from v0.6)."""
+        """Single-phase full planning prompt (fallback)."""
+
+        canonical_preamble = ""
+        if is_canonical:
+            canonical_preamble = """
+## Spec Format Notice
+This specification has been pre-processed by SpecOS into a **canonical planning spec**.
+- All sections are normative and planning-relevant (gate policies, open questions, and UI-only sections have been removed).
+- Section headers carry structured tags (e.g. `[api]`, `[state]`, `[data-model]`) — use these as complexity signals.
+- Every requirement in this document is actionable. Do NOT skip or summarize sections.
+- If the spec defines acceptance criteria or business scenarios, reference them in task acceptance_criteria.
+"""
+
+        complexity_section = """## Complexity Guidelines:
+- **L** (Lite): Pure scaffolding, config, boilerplate — does NOT import types/services from other tasks
+- **S** (Simple): Simple logic but imports types/services/schemas from other tasks
+- **M** (Medium): Auth logic, business rules, middleware, validation, tests with edge cases
+- **H** (Hard): Architecture decisions, security/auth, payment, cross-module integration
+
+### Domain-Specific Complexity Floors:
+- Payment / billing / subscription / refund logic → **H minimum**
+- Auth / RBAC / session / token management → **M minimum** (H if cross-module)
+- State machines / workflow engines / order lifecycle → **H minimum**
+- Schema / migration / data model with FK constraints → **M minimum**
+- ERP / WMS / inventory / stock calculations → **M minimum**
+- API contracts with >3 related endpoints → **M minimum**"""
+
         return f"""You are a senior software architect and project planner.
 
 Read the following project specification and produce a detailed execution plan as JSON.
 
 ## Project: {project_name}
-
+{canonical_preamble}
 ## Specification:
 {spec_content}
 
@@ -619,11 +706,7 @@ Read the following project specification and produce a detailed execution plan a
   ]
 }}
 
-## Complexity Guidelines:
-- **L** (Lite): Pure scaffolding, config, boilerplate — does NOT import types/services from other tasks
-- **S** (Simple): Simple logic but imports types/services/schemas from other tasks
-- **M** (Medium): Auth logic, business rules, middleware, validation, tests with edge cases
-- **H** (Hard): Architecture decisions, security/auth, payment, cross-module integration
+{complexity_section}
 
 ## Category Guidelines:
 - **backend**: API, database, service logic, auth, payment, middleware
@@ -632,7 +715,6 @@ Read the following project specification and produce a detailed execution plan a
 
 ## Agent Type (leave empty for auto-routing, or specify):
 - `claude_code`: For H complexity, architecture, security, auth, payment
-- `deepseek_aider`: For L/M complexity, CRUD, boilerplate, refactoring, tests
 - `""` (empty): Let the router decide automatically (recommended)
 
 ## Rules:

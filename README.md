@@ -110,6 +110,7 @@ python -m src.orchestrator.main --plan plan.json --repo ~/project --resume
 - **Full resume**: Every step cached, crash-safe restart
 - **Build-after-merge**: Build check after each merge, auto-rollback on failure
 - **Docs-only detection**: Skip build check for non-code merges
+- **SpecOS-aware planning**: Auto-detects `planning-spec.md` from SpecOS, uses full normative content with domain-specific complexity signals
 - **Manual mode signals**: CONTINUE / SKIP / STOP for human-in-the-loop
 
 ## Project Structure
