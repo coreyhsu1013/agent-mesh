@@ -16,6 +16,23 @@ from src.auth.claude_account_pool import get_pool
 
 logger = logging.getLogger(__name__)
 
+# Keys to strip from child process env to avoid nested-session errors.
+# CLAUDE_CODE_SESSION_ACCESS_TOKEN causes child CLI to use parent's session
+# auth instead of local OAuth, resulting in "Not logged in" errors.
+_STRIP_ENV_KEYS = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+)
+
+
+def build_proc_env(extra: dict | None = None) -> dict:
+    """Build env dict for subprocess, stripping Claude Code nesting guards."""
+    env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV_KEYS}
+    if extra:
+        env.update(extra)
+    return env
+
 
 @dataclass
 class RunResult:
@@ -47,7 +64,7 @@ async def run_claude_prompt(prompt: str, cwd: str, timeout: int = 300,
 
         # Multi-account: inject CLAUDE_CONFIG_DIR
         account_env = await get_pool().next_env()
-        proc_env = {**os.environ, **account_env} if account_env else None
+        proc_env = build_proc_env(account_env)
 
         proc = await asyncio.create_subprocess_shell(
             cmd,

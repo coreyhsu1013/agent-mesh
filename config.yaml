@@ -6,11 +6,9 @@ version: "1.5"
 # ── Planner ──
 planner:
   provider: "claude"
-  classify: "claude-opus-4-6"          # Phase 1: task classification
-  backend: "claude-opus-4-6"           # Phase 2: backend planning
-  frontend: "claude-opus-4-6"          # Phase 2: frontend/UI planning
-  fallback: "claude-opus-4-6"          # when all else fails
-  timeout: 600
+  model: "claude-opus-4-6"             # single-phase planning model
+  fallback: "claude-opus-4-6"          # fallback (same for now)
+  timeout: 1800
 
 # ── Routing Matrix (escalation chains per complexity, smoke-tested) ──
 routing:

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import tempfile
 from typing import Optional
 
@@ -41,12 +42,12 @@ class GeminiPlanner:
     def __init__(self, config: dict):
         planner_cfg = config.get("planner", {})
         self.provider = planner_cfg.get("provider", "gemini")
-        self.model_classify = planner_cfg.get(
-            "classify", planner_cfg.get("model", "gemini-3-flash-preview")
-        )
-        self.model_backend = planner_cfg.get("backend", "gemini-3-flash-preview")
-        self.model_frontend = planner_cfg.get("frontend", "claude-opus-4-6")
-        self.model_fallback = planner_cfg.get("fallback", "claude-sonnet-4-6")
+        self.model = planner_cfg.get("model", "claude-opus-4-6")
+        self.model_fallback = planner_cfg.get("fallback", self.model)
+        # Legacy compat: two-phase fields (unused, kept for config backward compat)
+        self.model_classify = planner_cfg.get("classify", self.model)
+        self.model_backend = planner_cfg.get("backend", self.model)
+        self.model_frontend = planner_cfg.get("frontend", self.model)
         self.timeout = planner_cfg.get("timeout", 300)
 
     async def plan(
@@ -57,24 +58,9 @@ class GeminiPlanner:
         is_canonical: bool = False,
     ) -> dict:
         """
-        Two-phase planning with single-phase fallback.
+        Single-phase planning: spec → full plan in one shot.
         is_canonical=True when spec was pre-filtered by SpecOS (planning-spec.md).
         """
-        # Try two-phase
-        try:
-            plan = await self._plan_two_phase(
-                spec_content, agents_md, project_name, is_canonical,
-            )
-            logger.info(
-                f"[GeminiPlanner] Two-phase plan: {len(plan.get('tasks', []))} tasks"
-            )
-            return plan
-        except Exception as e:
-            logger.warning(
-                f"[GeminiPlanner] Two-phase failed ({e}), falling back to single-phase"
-            )
-
-        # Fallback: single-phase (original flow)
         return await self._plan_single_phase(
             spec_content, agents_md, project_name, is_canonical,
         )
@@ -187,9 +173,10 @@ class GeminiPlanner:
         label: str,
         is_canonical: bool = False,
     ) -> list[dict]:
-        """Try primary model for Phase 2, fallback if it fails."""
+        """Try primary model for Phase 2, fallback if it fails.
+        If all detail calls fail, return skeleton tasks (never crash)."""
         try:
-            result = await self._phase2_detail(
+            result = await self._phase2_detail_batched(
                 model, tasks, spec_content, agents_md, project_name, is_canonical,
             )
             logger.info(
@@ -199,20 +186,67 @@ class GeminiPlanner:
             return result
         except Exception as e:
             if model == self.model_fallback:
-                raise  # Already using fallback
+                logger.warning(
+                    f"[GeminiPlanner] Phase 2 {label} failed with fallback model ({e}), "
+                    f"using skeleton tasks"
+                )
+                return tasks  # Return skeleton instead of crashing
             logger.warning(
                 f"[GeminiPlanner] Phase 2 {label} with {model} failed ({e}), "
                 f"trying fallback {self.model_fallback}"
             )
-            result = await self._phase2_detail(
-                self.model_fallback, tasks, spec_content, agents_md, project_name,
-                is_canonical,
+            try:
+                result = await self._phase2_detail_batched(
+                    self.model_fallback, tasks, spec_content, agents_md, project_name,
+                    is_canonical,
+                )
+                logger.info(
+                    f"[GeminiPlanner] Phase 2 {label}: "
+                    f"{len(result)} tasks detailed with {self.model_fallback} (fallback)"
+                )
+                return result
+            except Exception as e2:
+                logger.warning(
+                    f"[GeminiPlanner] Phase 2 {label} fallback also failed ({e2}), "
+                    f"using skeleton tasks"
+                )
+                return tasks  # Return skeleton instead of crashing
+
+    async def _phase2_detail_batched(
+        self,
+        model: str,
+        tasks: list[dict],
+        spec_content: str,
+        agents_md: str,
+        project_name: str,
+        is_canonical: bool = False,
+    ) -> list[dict]:
+        """Split large task lists into batches to avoid output truncation."""
+        batch_size = self.max_tasks_per_detail
+        if len(tasks) <= batch_size:
+            return await self._phase2_detail(
+                model, tasks, spec_content, agents_md, project_name, is_canonical,
             )
+
+        # Split into batches
+        batches = [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
+        logger.info(
+            f"[GeminiPlanner] Splitting {len(tasks)} tasks into "
+            f"{len(batches)} batches of ~{batch_size}"
+        )
+
+        all_detailed: list[dict] = []
+        for i, batch in enumerate(batches):
             logger.info(
-                f"[GeminiPlanner] Phase 2 {label}: "
-                f"{len(result)} tasks detailed with {self.model_fallback} (fallback)"
+                f"[GeminiPlanner] Detail batch {i + 1}/{len(batches)}: "
+                f"{len(batch)} tasks with {model}"
             )
-            return result
+            detailed = await self._phase2_detail(
+                model, batch, spec_content, agents_md, project_name, is_canonical,
+            )
+            all_detailed.extend(detailed)
+
+        return all_detailed
 
     async def _phase2_detail(
         self,
@@ -293,7 +327,8 @@ class GeminiPlanner:
             return self._parse_plan(raw)
 
         elif self.provider == "claude":
-            raw = await self._call_claude_cli(prompt, self.model_fallback)
+            logger.info(f"[GeminiPlanner] Single-phase with {self.model}")
+            raw = await self._call_claude_cli(prompt, self.model)
             return self._parse_plan(raw)
 
         raise PlannerError(f"Unknown planner provider: {self.provider}")
@@ -386,10 +421,26 @@ class GeminiPlanner:
         finally:
             os.unlink(prompt_file)
 
+    # Machine-mode system prompt for planner Claude calls.
+    # Overrides any CLAUDE.md conversational instructions.
+    _PLANNER_SYSTEM_PROMPT = (
+        "You are a machine JSON generator. "
+        "Output ONLY the raw JSON object. "
+        "No prose, no markdown fences, no Chinese text, no summaries, "
+        "no follow-up questions, no greetings, no file writes. "
+        "Your entire stdout must be parseable by json.loads()."
+    )
+
     async def _call_claude_cli(
         self, prompt: str, model: str | None = None,
     ) -> str:
-        """Claude CLI for text generation."""
+        """Claude CLI for text generation.
+
+        Isolation strategy (no temp config dir needed):
+        - --setting-sources ""  → disables all user/project CLAUDE.md + settings
+        - --system-prompt       → explicit machine-mode instructions
+        - cwd=/tmp              → extra guard against project CLAUDE.md
+        """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(prompt)
             prompt_file = f.name
@@ -398,27 +449,43 @@ class GeminiPlanner:
             use_model = model or self.model_fallback
             cmd = (
                 f"cat {prompt_file} | claude -p "
-                f"--dangerously-skip-permissions "
                 f"--model {use_model} "
-                f"--output-format text"
+                f"--output-format text "
+                f"--no-session-persistence "
+                f'--setting-sources "" '
+                f'--tools "" '
+                f"--system-prompt {shlex.quote(self._PLANNER_SYSTEM_PROMPT)}"
             )
             # Multi-account: least-loaded account selection
+            from src.auth.cli_runner import build_proc_env
             account_env = await get_pool().next_env(model=use_model)
-            proc_env = {**os.environ, **account_env} if account_env else None
+            proc_env = build_proc_env(account_env)
+
+            logger.info(
+                f"[GeminiPlanner] Claude CLI running in isolated planner mode "
+                f"(model={use_model}, settings=disabled)"
+            )
 
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
+                cwd="/tmp",  # avoid project CLAUDE.md
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout
             )
 
             if proc.returncode != 0:
+                logger.error(
+                    f"[GeminiPlanner] Claude CLI exit={proc.returncode}, "
+                    f"stdout={stdout.decode()[:200]!r}, "
+                    f"stderr={stderr.decode()[:200]!r}"
+                )
                 raise PlannerError(
-                    f"Claude CLI ({use_model}) failed: {stderr.decode()[:500]}"
+                    f"Claude CLI ({use_model}) exit={proc.returncode}: "
+                    f"{stderr.decode()[:500] or stdout.decode()[:500]}"
                 )
 
             return stdout.decode()
@@ -761,7 +828,12 @@ Read the following project specification and produce a detailed execution plan a
         """
         plan = self._parse_json(raw_output)
         if not isinstance(plan, dict):
-            raise PlannerError(f"Plan is not a dict: {type(plan)}")
+            # Maybe it's a list of tasks directly
+            if isinstance(plan, list) and plan and isinstance(plan[0], dict):
+                logger.warning("[GeminiPlanner] Plan is a bare list, wrapping in dict")
+                plan = {"tasks": plan}
+            else:
+                raise PlannerError(f"Plan is not a dict: {type(plan)}")
 
         if "tasks" not in plan:
             raise PlannerError("Plan missing 'tasks' field")
