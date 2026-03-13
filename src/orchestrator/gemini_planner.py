@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from typing import Optional
 
@@ -452,6 +453,25 @@ class GeminiPlanner:
         return response.choices[0].message.content
 
     # ══════════════════════════════════════════════════════════
+    # Output Constraints
+    # ══════════════════════════════════════════════════════════
+
+    # Shared strict output constraint appended to ALL planning prompts
+    _OUTPUT_CONSTRAINT = """
+## CRITICAL: Output Contract
+You are a JSON generator, NOT a chat assistant.
+- Output ONLY the raw JSON object required by the schema above.
+- Do NOT include any explanation, summary, or commentary.
+- Do NOT include markdown code fences (no ```json, no ```).
+- Do NOT include any text before or after the JSON.
+- Do NOT ask follow-up questions (e.g. "要開始執行嗎？", "ready to execute?").
+- Do NOT announce completion (e.g. "plan generated", "產生完成", "here is the plan").
+- Do NOT include any prose, greetings, or sign-offs.
+- Your entire response must be parseable by json.loads() with zero preprocessing.
+- If you cannot fully comply, still return best-effort valid JSON only.
+"""
+
+    # ══════════════════════════════════════════════════════════
     # Prompts
     # ══════════════════════════════════════════════════════════
 
@@ -550,7 +570,7 @@ Key distinction between L and S: if the task needs `import {{ SomeType }} from '
 5. ALWAYS assign both category and complexity for every task
 6. For projects with >15 tasks, split into modules with interface layers
 
-Output ONLY valid JSON. No explanation, no markdown code blocks.
+{self._OUTPUT_CONSTRAINT}
 """
 
     def _build_detail_prompt(
@@ -625,7 +645,7 @@ IMPORTANT: Preserve the original id, title, category, complexity, module, depend
   ]
 }}
 
-Output ONLY valid JSON. No explanation, no markdown code blocks.
+{self._OUTPUT_CONSTRAINT}
 """
 
     def _build_planning_prompt(
@@ -726,7 +746,7 @@ Read the following project specification and produce a detailed execution plan a
 6. For projects with >15 tasks, split into modules with interface layers
 7. Always assign complexity (L/S/M/H) and category (backend/frontend/fullstack)
 
-Output ONLY valid JSON. No explanation, no markdown code blocks.
+{self._OUTPUT_CONSTRAINT}
 """
 
     # ══════════════════════════════════════════════════════════
@@ -750,34 +770,43 @@ Output ONLY valid JSON. No explanation, no markdown code blocks.
         return plan
 
     def _parse_json(self, raw_output: str):
-        """Generic JSON parser — strips markdown code blocks and leading text."""
+        """Generic JSON parser — strips markdown code blocks and leading prose."""
         text = raw_output.strip()
 
-        # Remove markdown code block
-        if "```json" in text:
-            start = text.index("```json") + 7
-            end = text.index("```", start)
-            text = text[start:end].strip()
-        elif "```" in text:
-            start = text.index("```") + 3
-            end = text.index("```", start)
-            text = text[start:end].strip()
+        # Strip markdown code fences (```json ... ``` or ``` ... ```)
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
 
+        # Try direct parse first
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # LLM sometimes prepends explanation text before JSON.
-        # Extract the outermost { ... } or [ ... ] block.
+        # LLM sometimes prepends/appends prose around JSON.
+        # Log a warning so we know the model misbehaved.
         first_brace = text.find("{")
         first_bracket = text.find("[")
         if first_brace == -1 and first_bracket == -1:
+            # Log first 300 chars to help diagnose chat-style responses
+            preview = text[:300].replace("\n", " ")
             logger.error(
-                f"[GeminiPlanner] No JSON object/array found in output\n"
-                f"Raw: {text[:500]}"
+                f"[GeminiPlanner] No JSON found in model output. "
+                f"Model may have returned prose instead of JSON.\n"
+                f"Preview: {preview}"
             )
-            raise PlannerError("No JSON found in LLM output")
+            raise PlannerError(
+                "No JSON found in LLM output — model returned prose instead of JSON"
+            )
+
+        # Warn: model didn't return clean JSON, extracting from prose
+        prefix = text[:first_brace if first_brace != -1 else first_bracket].strip()
+        if prefix:
+            logger.warning(
+                f"[GeminiPlanner] Model returned prose before JSON, "
+                f"extracting embedded JSON. Prose prefix: {prefix[:100]}"
+            )
 
         # Pick whichever comes first
         if first_bracket == -1 or (first_brace != -1 and first_brace < first_bracket):
