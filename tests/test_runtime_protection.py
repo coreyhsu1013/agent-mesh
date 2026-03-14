@@ -165,6 +165,14 @@ class TestGitAddExclusion(unittest.TestCase):
         source = inspect.getsource(ws.WorkspacePool._merge_branch)
         self.assertIn("':!.agent-mesh'", source)
 
+    def test_dispatcher_buildfix_excludes_runtime(self):
+        """Check dispatcher _fix_build_on_main excludes .agent-mesh."""
+        import src.orchestrator.dispatcher as dp
+        import inspect
+        source = inspect.getsource(dp.Dispatcher._fix_build_on_main)
+        self.assertIn("':!.agent-mesh'", source)
+        self.assertNotIn("add -A", source)
+
 
 if __name__ == "__main__":
     unittest.main()
