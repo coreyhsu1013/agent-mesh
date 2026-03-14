@@ -280,6 +280,10 @@ class GateRunner:
             logger.info(
                 f"[Gate] Failed checks: {', '.join(summary.failed_checks)}"
             )
+            # Log details for debugging (e.g. which artifact files were found)
+            for r in summary.results:
+                if not r.passed and r.details:
+                    logger.info(f"[Gate] Details: {r.details[:500]}")
         if summary.escalations:
             logger.info(
                 f"[Gate] ⚠️ Escalations: {', '.join(summary.escalations)}"
