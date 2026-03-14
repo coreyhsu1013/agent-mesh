@@ -229,6 +229,14 @@ class ReactLoop:
             # ── THINK ──
             prompt = self._build_prompt(task, shared_context, history)
 
+            # ── SAVE BASE COMMIT ──
+            # Record HEAD before agent runs so we can diff against it even if
+            # the agent commits during execution (claude -p --dangerously-skip-permissions
+            # gives agents full git access).
+            base_commit = (await self._run_cmd(
+                f"cd {workspace_dir} && git rev-parse HEAD"
+            )).strip()
+
             # ── ACT ──
             act_start = time.time()
             run_result = await current_runner.execute(
@@ -249,7 +257,7 @@ class ReactLoop:
                 )
 
             # ── OBSERVE ──
-            observation = await self._observe(workspace_dir, run_result)
+            observation = await self._observe(workspace_dir, run_result, base_commit)
             observation.duration_sec = act_duration
 
             # ── NO-FILE-CHANGES guard for must-change tasks ──
@@ -344,7 +352,8 @@ class ReactLoop:
 
         return "\n".join(parts)
 
-    async def _observe(self, workspace_dir: str, run_result: RunResult) -> Observation:
+    async def _observe(self, workspace_dir: str, run_result: RunResult,
+                       base_commit: str = "HEAD") -> Observation:
         # Agent 失敗或空輸出
         if not run_result.success:
             return Observation(
@@ -374,7 +383,7 @@ class ReactLoop:
             f"cd {workspace_dir} && git {GIT_ADD_PATHSPEC} 2>/dev/null"
         )
         diff = await self._run_cmd(
-            f"cd {workspace_dir} && git diff --cached HEAD 2>/dev/null || git diff --cached 2>/dev/null || echo ''"
+            f"cd {workspace_dir} && git diff --cached {base_commit} 2>/dev/null || git diff --cached 2>/dev/null || echo ''"
         )
 
         # 2) Build (skip in worktree if configured — real build at merge)
