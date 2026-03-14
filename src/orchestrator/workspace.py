@@ -76,59 +76,68 @@ def _ensure_gitignore(workspace_dir: str) -> None:
     logger.debug(f"[Workspace] .gitignore: added {len(missing)} entries")
 
 
-async def _untrack_artifacts(pool, workspace_dir: str) -> None:
+async def _untrack_artifacts_on_main(pool) -> None:
     """
-    Remove build artifact dirs from git tracking if they were previously committed.
-    .gitignore only affects untracked files — already-tracked dirs need 'git rm --cached'.
-    Searches both root-level and nested (monorepo) artifact dirs.
-    Commits the cleanup so the task's diff stays clean.
+    Remove build artifact dirs from git tracking on the MAIN branch.
+    Must run before slot creation so all slots inherit a clean baseline.
+    Repos initialized without .gitignore may have node_modules/ etc tracked.
     """
     import glob as globmod
 
+    repo_dir = pool.repo_dir
+    # Ensure .gitignore exists on main first
+    _ensure_gitignore(repo_dir)
+
     untracked = []
     for entry in _NESTED_EXCLUDES:
-        # Root-level
-        root_path = os.path.join(workspace_dir, entry)
-        if os.path.isdir(root_path):
-            try:
+        # Use git ls-files to check if anything is actually tracked
+        try:
+            result = await pool._run_git(
+                f"ls-files --cached {entry}", cwd=repo_dir
+            )
+            if result.strip():
                 await pool._run_git(
-                    f"rm -r --cached {entry}", cwd=workspace_dir
+                    f"rm -r --cached {entry}", cwd=repo_dir
                 )
                 untracked.append(entry)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         # Nested (e.g. apps/admin/.next, apps/api/node_modules)
         for nested in globmod.glob(
-            os.path.join(workspace_dir, "**", entry), recursive=True
+            os.path.join(repo_dir, "**", entry), recursive=True
         ):
             if os.path.isdir(nested):
-                rel = os.path.relpath(nested, workspace_dir)
+                rel = os.path.relpath(nested, repo_dir)
                 if rel == entry:
-                    continue  # Already handled above
+                    continue
                 try:
-                    await pool._run_git(
-                        f"rm -r --cached {rel}", cwd=workspace_dir
+                    result = await pool._run_git(
+                        f"ls-files --cached {rel}", cwd=repo_dir
                     )
-                    untracked.append(rel)
+                    if result.strip():
+                        await pool._run_git(
+                            f"rm -r --cached {rel}", cwd=repo_dir
+                        )
+                        untracked.append(rel)
                 except Exception:
                     pass
 
     if untracked:
         try:
-            await pool._run_git("add .gitignore", cwd=workspace_dir)
+            await pool._run_git("add .gitignore", cwd=repo_dir)
             dirs = ", ".join(untracked[:5])
             if len(untracked) > 5:
                 dirs += f" (+{len(untracked) - 5} more)"
             await pool._run_git(
-                f'commit -m "[agent-mesh] untrack build artifacts: {dirs}"',
-                cwd=workspace_dir,
+                f'commit -m "[agent-mesh] untrack build artifacts on main: {dirs}"',
+                cwd=repo_dir,
             )
             logger.info(
-                f"[Workspace] Untracked {len(untracked)} artifact dirs: {dirs}"
+                f"[Workspace] Untracked {len(untracked)} artifact dirs on main: {dirs}"
             )
         except Exception as e:
-            logger.debug(f"[Workspace] Untrack commit failed (ok): {e}")
+            logger.debug(f"[Workspace] Untrack on main failed (ok): {e}")
 
 
 class WorkspacePool:
@@ -161,6 +170,10 @@ class WorkspacePool:
         await self._cleanup_all_slots()
 
         await self._ensure_base_branch()
+
+        # Untrack build artifacts on main BEFORE creating slots
+        # so all slots inherit a clean baseline (no node_modules/.next in index)
+        await _untrack_artifacts_on_main(self)
 
         self._active_slots = {}
         self._task_branches = []
@@ -207,10 +220,6 @@ class WorkspacePool:
 
         # Ensure .gitignore covers build artifacts (even if repo lacks one)
         _ensure_gitignore(ws_dir)
-
-        # Untrack build artifacts that were previously committed (e.g. node_modules)
-        # .gitignore only affects untracked files; already-tracked dirs need explicit removal
-        await _untrack_artifacts(self, ws_dir)
 
         return ws_dir
 
