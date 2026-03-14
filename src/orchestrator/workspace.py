@@ -40,9 +40,10 @@ _STAGING_EXCLUDES = [
     ".cache",
 ]
 
-# Pre-built pathspec string for git add: -- . ':^.agent-mesh' ':^.next' ...
-# Uses ':^' (caret) instead of ':!' — ':!' breaks on some git/shell/locale combos.
-GIT_ADD_PATHSPEC = "add -- . " + " ".join(f"':^{p}'" for p in _STAGING_EXCLUDES)
+# Pre-built pathspec string for git add: -- . ':(exclude).agent-mesh' ...
+# Uses ':(exclude)' long form — ':!' and ':^' break on some git/shell/locale combos.
+_EXCLUDES = " ".join(f"':(exclude){p}'" for p in _STAGING_EXCLUDES)
+GIT_ADD_PATHSPEC = f"add -- . {_EXCLUDES}"
 
 # Entries to ensure in .gitignore (subset of _STAGING_EXCLUDES minus .agent-mesh)
 _GITIGNORE_ENTRIES = [e for e in _STAGING_EXCLUDES if e != ".agent-mesh"]
@@ -155,7 +156,11 @@ class WorkspacePool:
     async def commit_slot_task(self, slot_id: int, commit_msg: str):
         """Commit all changes in a worker slot (call before recycling)."""
         ws_dir = self._active_slots[slot_id]
-        await self._run_git(GIT_ADD_PATHSPEC, cwd=ws_dir)
+        try:
+            await self._run_git(GIT_ADD_PATHSPEC, cwd=ws_dir)
+        except RuntimeError:
+            # git add exits 1 when .gitignore blocks already-tracked files — safe to ignore
+            pass
         try:
             await self._run_git(
                 f'commit --allow-empty -m "{commit_msg}"',
