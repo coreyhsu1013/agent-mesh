@@ -361,8 +361,15 @@ class ReactLoop:
             )
 
         # 1) Git diff (stage untracked files first so scaffold tasks show up)
-        #    Exclude runtime files and build artifacts from staging
-        from .workspace import GIT_ADD_PATHSPEC
+        #    Exclude runtime files and build artifacts from staging.
+        #    Also remove any artifacts the agent may have staged/committed
+        #    during execution (e.g. via its own git add).
+        from .workspace import GIT_ADD_PATHSPEC, _NESTED_EXCLUDES
+        # Remove artifacts from index that agent may have added
+        artifact_globs = " ".join(f"'**/{a}'" for a in _NESTED_EXCLUDES)
+        await self._run_cmd(
+            f"cd {workspace_dir} && git rm -r --cached {artifact_globs} 2>/dev/null || true"
+        )
         await self._run_cmd(
             f"cd {workspace_dir} && git {GIT_ADD_PATHSPEC} 2>/dev/null"
         )

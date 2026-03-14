@@ -80,31 +80,52 @@ async def _untrack_artifacts(pool, workspace_dir: str) -> None:
     """
     Remove build artifact dirs from git tracking if they were previously committed.
     .gitignore only affects untracked files — already-tracked dirs need 'git rm --cached'.
+    Searches both root-level and nested (monorepo) artifact dirs.
     Commits the cleanup so the task's diff stays clean.
     """
+    import glob as globmod
+
     untracked = []
     for entry in _NESTED_EXCLUDES:
-        artifact_path = os.path.join(workspace_dir, entry)
-        if os.path.isdir(artifact_path):
+        # Root-level
+        root_path = os.path.join(workspace_dir, entry)
+        if os.path.isdir(root_path):
             try:
                 await pool._run_git(
                     f"rm -r --cached {entry}", cwd=workspace_dir
                 )
                 untracked.append(entry)
             except Exception:
-                pass  # Not tracked — fine
+                pass
+
+        # Nested (e.g. apps/admin/.next, apps/api/node_modules)
+        for nested in globmod.glob(
+            os.path.join(workspace_dir, "**", entry), recursive=True
+        ):
+            if os.path.isdir(nested):
+                rel = os.path.relpath(nested, workspace_dir)
+                if rel == entry:
+                    continue  # Already handled above
+                try:
+                    await pool._run_git(
+                        f"rm -r --cached {rel}", cwd=workspace_dir
+                    )
+                    untracked.append(rel)
+                except Exception:
+                    pass
 
     if untracked:
-        # Commit .gitignore + untrack so the task starts from a clean baseline
         try:
             await pool._run_git("add .gitignore", cwd=workspace_dir)
-            dirs = ", ".join(untracked)
+            dirs = ", ".join(untracked[:5])
+            if len(untracked) > 5:
+                dirs += f" (+{len(untracked) - 5} more)"
             await pool._run_git(
                 f'commit -m "[agent-mesh] untrack build artifacts: {dirs}"',
                 cwd=workspace_dir,
             )
             logger.info(
-                f"[Workspace] Untracked {len(untracked)} artifact dirs from git index: {dirs}"
+                f"[Workspace] Untracked {len(untracked)} artifact dirs: {dirs}"
             )
         except Exception as e:
             logger.debug(f"[Workspace] Untrack commit failed (ok): {e}")
