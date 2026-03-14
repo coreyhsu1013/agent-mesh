@@ -613,10 +613,15 @@ class Dispatcher:
                         "max_retries", 2
                     )
                     gate_attempt = 0
-                    current_chain_attempt = start_attempt
+                    # Track model level — use the attempt that actually
+                    # produced this result (may differ from start_attempt
+                    # if ReAct internally escalated).
+                    current_chain_attempt = max(
+                        result.attempts, start_attempt
+                    )
                     max_total_gate_runs = (max_gate_retries + 1) * max_att + 1
                     total_gate_runs = 0
-                    while result.status == "completed":
+                    while True:
                         total_gate_runs += 1
                         if total_gate_runs > max_total_gate_runs:
                             logger.error(
@@ -626,6 +631,43 @@ class Dispatcher:
                             result.status = "failed"
                             result.error = "Gate safety limit reached"
                             break
+
+                        # ReAct failed — try escalating before giving up
+                        if result.status != "completed":
+                            next_chain_attempt = (
+                                current_chain_attempt + 1
+                            )
+                            if next_chain_attempt <= max_att:
+                                next_decision = (
+                                    self.router.get_model_for_attempt(
+                                        complexity, next_chain_attempt,
+                                        log=False,
+                                    )
+                                )
+                                logger.warning(
+                                    f"[Gate] ⬆️ '{task.title}' ReAct "
+                                    f"failed, escalating to "
+                                    f"{next_decision.model_short} "
+                                    f"(attempt {next_chain_attempt})"
+                                )
+                                current_chain_attempt = next_chain_attempt
+                                gate_attempt = 0
+                                result = (
+                                    await self.react_loop.execute_task(
+                                        task=task,
+                                        runners=self.runners,
+                                        router=self.router,
+                                        workspace_dir=workspace_dir,
+                                        shared_context=self.shared_context,
+                                        start_attempt=current_chain_attempt,
+                                        single_attempt=True,
+                                    )
+                                )
+                                continue
+                            else:
+                                # No more models — keep failed result
+                                break
+
                         gate_attempt += 1
 
                         gate_summary = await self.gate_runner.run(
@@ -661,6 +703,7 @@ class Dispatcher:
                                 workspace_dir=workspace_dir,
                                 shared_context=self.shared_context,
                                 start_attempt=current_chain_attempt,
+                                single_attempt=True,
                             )
                             continue
 
@@ -689,6 +732,7 @@ class Dispatcher:
                                 workspace_dir=workspace_dir,
                                 shared_context=self.shared_context,
                                 start_attempt=current_chain_attempt,
+                                single_attempt=True,
                             )
                             continue
                         else:

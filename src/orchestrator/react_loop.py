@@ -18,6 +18,34 @@ from typing import Optional, Protocol, Any
 
 logger = logging.getLogger(__name__)
 
+# ── Must-change task detection ──
+# These tasks MUST produce file changes; 0-file diff = failed attempt.
+_MUST_CHANGE_KEYWORDS = [
+    "scaffold", "bootstrap", "foundation", "project setup",
+    "init project", "boilerplate", "layout", "initial setup",
+]
+
+
+def _is_must_change_task(task: Any) -> bool:
+    """Check if task metadata matches must-change keywords.
+    Checks title, task_type, category, and module.
+    """
+    parts = [
+        getattr(task, "title", None) or "",
+        getattr(task, "task_type", None) or "",
+        getattr(task, "category", None) or "",
+        getattr(task, "module", None) or "",
+    ]
+    text = " ".join(parts).lower()
+    return any(kw in text for kw in _MUST_CHANGE_KEYWORDS)
+
+
+def _has_meaningful_changes(observation: "Observation") -> bool:
+    """True if observation contains actual file changes (diff or files_changed)."""
+    has_files = bool(observation.files_changed)
+    has_diff = bool(observation.diff and observation.diff.strip() and len(observation.diff.strip()) > 10)
+    return has_files or has_diff
+
 
 @dataclass
 class RunResult:
@@ -157,6 +185,7 @@ class ReactLoop:
         workspace_dir: str,
         shared_context: str = "",
         start_attempt: int = 1,
+        single_attempt: bool = False,
     ) -> TaskResult:
         from ..models.task import AgentType
 
@@ -165,6 +194,9 @@ class ReactLoop:
         start_time = time.time()
         complexity = getattr(task, "complexity", "M")
         max_attempts = router.get_max_attempts(complexity)
+        # single_attempt: pin to one model (used by gate retry/escalation)
+        if single_attempt:
+            max_attempts = start_attempt
 
         for attempt in range(start_attempt, max_attempts + 1):
             # ★ Query routing matrix for this attempt
@@ -219,6 +251,17 @@ class ReactLoop:
             # ── OBSERVE ──
             observation = await self._observe(workspace_dir, run_result)
             observation.duration_sec = act_duration
+
+            # ── NO-FILE-CHANGES guard for must-change tasks ──
+            if (observation.success
+                    and not _has_meaningful_changes(observation)
+                    and _is_must_change_task(task)):
+                observation.success = False
+                observation.error = "no_file_changes"
+                logger.warning(
+                    f"[ReAct] Task '{task.title}' — "
+                    f"Execution failed: no file changes produced"
+                )
 
             history.add_attempt(
                 thinking=f"Attempt {attempt} ({model_label}): {task.title}",
