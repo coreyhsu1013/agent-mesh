@@ -385,6 +385,12 @@ class ReactLoop:
         diff = await self._run_cmd(
             f"cd {workspace_dir} && git diff --cached {base_commit} 2>/dev/null || git diff --cached 2>/dev/null || echo ''"
         )
+        # If staged diff is empty, the agent may have committed directly.
+        # Fall back to checking committed changes since base_commit.
+        if not diff.strip() and base_commit != "HEAD":
+            diff = await self._run_cmd(
+                f"cd {workspace_dir} && git diff {base_commit} HEAD 2>/dev/null || echo ''"
+            )
 
         # 2) Build (skip in worktree if configured — real build at merge)
         build_output = ""
