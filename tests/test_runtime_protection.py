@@ -141,37 +141,72 @@ class TestExtractChangedFiles(unittest.TestCase):
 
 
 class TestGitAddExclusion(unittest.TestCase):
-    """Verify git add command format excludes .agent-mesh/."""
+    """Verify staging exclusion covers runtime files AND build artifacts."""
 
-    def test_react_loop_git_add_excludes_runtime(self):
-        """Check the git add command in react_loop.py excludes .agent-mesh."""
+    def test_pathspec_excludes_runtime(self):
+        """GIT_ADD_PATHSPEC must exclude .agent-mesh."""
+        from src.orchestrator.workspace import GIT_ADD_PATHSPEC
+        self.assertIn("':!.agent-mesh'", GIT_ADD_PATHSPEC)
+
+    def test_pathspec_excludes_build_artifacts(self):
+        """GIT_ADD_PATHSPEC must exclude common build artifact dirs."""
+        from src.orchestrator.workspace import GIT_ADD_PATHSPEC
+        for artifact in [".next", "dist", "build", "out", "node_modules",
+                         "__pycache__", ".turbo", ".cache"]:
+            self.assertIn(f"':!{artifact}'", GIT_ADD_PATHSPEC, f"Missing: {artifact}")
+
+    def test_react_loop_uses_pathspec(self):
+        """react_loop._observe uses shared GIT_ADD_PATHSPEC."""
         import src.orchestrator.react_loop as rl
         import inspect
         source = inspect.getsource(rl.ReactLoop._observe)
-        self.assertIn("':!.agent-mesh'", source)
+        self.assertIn("GIT_ADD_PATHSPEC", source)
         self.assertNotIn("git add -A", source)
 
-    def test_workspace_commit_excludes_runtime(self):
-        """Check workspace commit_slot_task excludes .agent-mesh."""
+    def test_workspace_commit_uses_pathspec(self):
+        """workspace.commit_slot_task uses shared GIT_ADD_PATHSPEC."""
         import src.orchestrator.workspace as ws
         import inspect
         source = inspect.getsource(ws.WorkspacePool.commit_slot_task)
-        self.assertIn("':!.agent-mesh'", source)
+        self.assertIn("GIT_ADD_PATHSPEC", source)
 
-    def test_workspace_merge_excludes_runtime(self):
-        """Check workspace _merge_branch excludes .agent-mesh."""
+    def test_workspace_merge_uses_pathspec(self):
+        """workspace._merge_branch uses shared GIT_ADD_PATHSPEC."""
         import src.orchestrator.workspace as ws
         import inspect
         source = inspect.getsource(ws.WorkspacePool._merge_branch)
-        self.assertIn("':!.agent-mesh'", source)
+        self.assertIn("GIT_ADD_PATHSPEC", source)
 
-    def test_dispatcher_buildfix_excludes_runtime(self):
-        """Check dispatcher _fix_build_on_main excludes .agent-mesh."""
+    def test_dispatcher_buildfix_uses_pathspec(self):
+        """dispatcher._fix_build_on_main uses shared GIT_ADD_PATHSPEC."""
         import src.orchestrator.dispatcher as dp
         import inspect
         source = inspect.getsource(dp.Dispatcher._fix_build_on_main)
-        self.assertIn("':!.agent-mesh'", source)
-        self.assertNotIn("add -A", source)
+        self.assertIn("GIT_ADD_PATHSPEC", source)
+
+    def test_no_raw_git_add_a_in_src(self):
+        """No 'add -A' should remain anywhere in src/."""
+        import glob
+        for py_file in glob.glob("src/**/*.py", recursive=True):
+            with open(py_file) as f:
+                content = f.read()
+            self.assertNotIn(
+                '"add -A"', content,
+                f"Found raw 'add -A' in {py_file}"
+            )
+
+
+class TestBuildArtifactHint(unittest.TestCase):
+    """Verify no_build_artifacts gate hint is actionable."""
+
+    def test_hint_contains_cleanup_commands(self):
+        """Hint must include actual rm/git rm commands."""
+        from src.gates.runner import _CHECK_HINTS
+        hint = _CHECK_HINTS["no_build_artifacts"]
+        self.assertIn("rm -rf", hint)
+        self.assertIn(".next", hint)
+        self.assertIn("git rm", hint)
+        self.assertIn(".gitignore", hint)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,23 @@ logger = logging.getLogger(__name__)
 
 WORKSPACE_DIR = ".agent-mesh/workspaces"
 
+# Paths excluded from git staging across all execution paths.
+# Prevents runtime files and build artifacts from entering commits.
+_STAGING_EXCLUDES = [
+    ".agent-mesh",
+    ".next",
+    "dist",
+    "build",
+    "out",
+    "node_modules",
+    "__pycache__",
+    ".turbo",
+    ".cache",
+]
+
+# Pre-built pathspec string for git add: -- . ':!.agent-mesh' ':!.next' ...
+GIT_ADD_PATHSPEC = "add -- . " + " ".join(f"':!{p}'" for p in _STAGING_EXCLUDES)
+
 
 class WorkspacePool:
     """
@@ -106,7 +123,7 @@ class WorkspacePool:
     async def commit_slot_task(self, slot_id: int, commit_msg: str):
         """Commit all changes in a worker slot (call before recycling)."""
         ws_dir = self._active_slots[slot_id]
-        await self._run_git("add -- . ':!.agent-mesh'", cwd=ws_dir)
+        await self._run_git(GIT_ADD_PATHSPEC, cwd=ws_dir)
         try:
             await self._run_git(
                 f'commit --allow-empty -m "{commit_msg}"',
@@ -227,7 +244,7 @@ class WorkspacePool:
             # 1) Commit any pending changes on main
             try:
                 await self._run_git(
-                    "add -- . ':!.agent-mesh'", cwd=self.repo_dir
+                    GIT_ADD_PATHSPEC, cwd=self.repo_dir
                 )
                 await self._run_git(
                     'commit --allow-empty -m "[agent-mesh] pre-merge"',

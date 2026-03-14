@@ -908,7 +908,8 @@ class Dispatcher:
 
             # Commit fixes
             try:
-                await self.pool._run_git("add -- . ':!.agent-mesh'", cwd=self.repo_dir)
+                from .workspace import GIT_ADD_PATHSPEC
+                await self.pool._run_git(GIT_ADD_PATHSPEC, cwd=self.repo_dir)
                 await self.pool._run_git(
                     f'commit -m "[agent-mesh] build fix #{attempt} '
                     f'({model_label}): {task_title}"',

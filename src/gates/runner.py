@@ -43,8 +43,12 @@ _CHECK_HINTS: dict[str, str] = {
         "These are orchestrator runtime files (logs, db, state)."
     ),
     "no_build_artifacts": (
-        "Do not commit build artifacts (.next/, dist/, node_modules/, __pycache/, etc.). "
-        "Add them to .gitignore instead."
+        "Build artifacts were committed. Before finishing, you MUST:\n"
+        "1. Delete artifact dirs: rm -rf .next dist build out node_modules __pycache__ .turbo .cache\n"
+        "2. Add them to .gitignore if not already listed\n"
+        "3. Unstage any tracked artifacts: git rm -r --cached .next dist build out 2>/dev/null\n"
+        "4. Verify with 'git diff --cached --name-only' that no artifact paths remain staged\n"
+        "Do NOT just describe what to do — actually execute these cleanup steps."
     ),
     "no_monorepo_config": (
         "Do not modify root-level monorepo config files "
