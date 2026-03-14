@@ -606,13 +606,27 @@ class Dispatcher:
                             logger.debug(f"[Experience] Record failed: {e}")
 
                     # 3) Deterministic Gate (v2.0, before reviewer)
-                    #    Gate retry: up to 2 retries with structured feedback
+                    #    Gate retry: up to N retries with structured feedback.
+                    #    If all gate retries fail, escalate to next model in
+                    #    routing chain (e.g. Sonnet → Opus) before giving up.
                     max_gate_retries = self.config.get("gates", {}).get(
                         "max_retries", 2
                     )
-                    for gate_attempt in range(1, max_gate_retries + 2):
-                        if result.status != "completed":
+                    gate_attempt = 0
+                    current_chain_attempt = start_attempt
+                    max_total_gate_runs = (max_gate_retries + 1) * max_att + 1
+                    total_gate_runs = 0
+                    while result.status == "completed":
+                        total_gate_runs += 1
+                        if total_gate_runs > max_total_gate_runs:
+                            logger.error(
+                                f"[Gate] Safety limit reached for "
+                                f"'{task.title}'"
+                            )
+                            result.status = "failed"
+                            result.error = "Gate safety limit reached"
                             break
+                        gate_attempt += 1
 
                         gate_summary = await self.gate_runner.run(
                             task=task,
@@ -628,37 +642,69 @@ class Dispatcher:
                             task.gate_feedback = {}  # clear on success
                             break
 
-                        # Gate failed
-                        if gate_attempt > max_gate_retries:
-                            # Exhausted retries — final failure
+                        # Gate failed — check if we have retries left
+                        if gate_attempt <= max_gate_retries:
+                            # Normal gate retry with same model
+                            feedback = gate_summary.to_feedback(
+                                attempt=gate_attempt
+                            )
+                            task.gate_feedback = feedback.to_dict()
+                            logger.info(
+                                f"[Gate] 🔄 '{task.title}' gate retry "
+                                f"{gate_attempt}/{max_gate_retries} — "
+                                f"failed: {', '.join(feedback.failed_checks)}"
+                            )
+                            result = await self.react_loop.execute_task(
+                                task=task,
+                                runners=self.runners,
+                                router=self.router,
+                                workspace_dir=workspace_dir,
+                                shared_context=self.shared_context,
+                                start_attempt=current_chain_attempt,
+                            )
+                            continue
+
+                        # Gate retries exhausted — try escalating model
+                        next_chain_attempt = current_chain_attempt + 1
+                        if next_chain_attempt <= max_att:
+                            next_decision = self.router.get_model_for_attempt(
+                                complexity, next_chain_attempt, log=False
+                            )
+                            logger.warning(
+                                f"[Gate] ⬆️ '{task.title}' gate failed after "
+                                f"{max_gate_retries} retries, escalating to "
+                                f"{next_decision.model_short} "
+                                f"(attempt {next_chain_attempt})"
+                            )
+                            feedback = gate_summary.to_feedback(
+                                attempt=gate_attempt
+                            )
+                            task.gate_feedback = feedback.to_dict()
+                            current_chain_attempt = next_chain_attempt
+                            gate_attempt = 0  # reset gate retries for new model
+                            result = await self.react_loop.execute_task(
+                                task=task,
+                                runners=self.runners,
+                                router=self.router,
+                                workspace_dir=workspace_dir,
+                                shared_context=self.shared_context,
+                                start_attempt=current_chain_attempt,
+                            )
+                            continue
+                        else:
+                            # No more models — final failure
                             logger.warning(
                                 f"[Gate] ❌ '{task.title}' gate failed after "
-                                f"{max_gate_retries} retries: "
+                                f"{max_gate_retries} retries (no escalation "
+                                f"left): "
                                 f"{', '.join(gate_summary.failed_checks)}"
                             )
                             result.status = "failed"
                             result.error = (
-                                f"Gate failed: {', '.join(gate_summary.failed_checks)}"
+                                f"Gate failed: "
+                                f"{', '.join(gate_summary.failed_checks)}"
                             )
                             break
-
-                        # Store feedback and re-run ReactLoop
-                        feedback = gate_summary.to_feedback(attempt=gate_attempt)
-                        task.gate_feedback = feedback.to_dict()
-                        logger.info(
-                            f"[Gate] 🔄 '{task.title}' gate retry "
-                            f"{gate_attempt}/{max_gate_retries} — "
-                            f"failed: {', '.join(feedback.failed_checks)}"
-                        )
-
-                        result = await self.react_loop.execute_task(
-                            task=task,
-                            runners=self.runners,
-                            router=self.router,
-                            workspace_dir=workspace_dir,
-                            shared_context=self.shared_context,
-                            start_attempt=start_attempt,
-                        )
 
                     # 4) Review (optional, only if gate passed)
                     if result.status == "completed" and not self.no_review:
