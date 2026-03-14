@@ -209,5 +209,57 @@ class TestBuildArtifactHint(unittest.TestCase):
         self.assertIn(".gitignore", hint)
 
 
+class TestEnsureGitignore(unittest.TestCase):
+    """Verify _ensure_gitignore injects artifact entries."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def test_creates_gitignore_if_missing(self):
+        from src.orchestrator.workspace import _ensure_gitignore
+        _ensure_gitignore(self.tmpdir)
+        import os
+        gitignore = os.path.join(self.tmpdir, ".gitignore")
+        self.assertTrue(os.path.exists(gitignore))
+        with open(gitignore) as f:
+            content = f.read()
+        for entry in [".next/", "dist/", "node_modules/", "__pycache__/"]:
+            self.assertIn(entry, content, f"Missing: {entry}")
+
+    def test_appends_missing_entries(self):
+        import os
+        gitignore = os.path.join(self.tmpdir, ".gitignore")
+        with open(gitignore, "w") as f:
+            f.write("node_modules/\n.next/\n")
+        from src.orchestrator.workspace import _ensure_gitignore
+        _ensure_gitignore(self.tmpdir)
+        with open(gitignore) as f:
+            content = f.read()
+        # Should still have originals + add missing ones
+        self.assertIn("dist/", content)
+        self.assertIn("build/", content)
+        # Should not duplicate
+        self.assertEqual(content.count("node_modules"), 1)
+
+    def test_no_change_if_complete(self):
+        import os
+        from src.orchestrator.workspace import _GITIGNORE_ENTRIES, _ensure_gitignore
+        gitignore = os.path.join(self.tmpdir, ".gitignore")
+        with open(gitignore, "w") as f:
+            for e in _GITIGNORE_ENTRIES:
+                f.write(f"{e}/\n")
+        before = os.path.getmtime(gitignore)
+        import time; time.sleep(0.01)
+        _ensure_gitignore(self.tmpdir)
+        with open(gitignore) as f:
+            content = f.read()
+        self.assertNotIn("auto-added", content)
+
+
 if __name__ == "__main__":
     unittest.main()

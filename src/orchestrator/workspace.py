@@ -43,6 +43,34 @@ _STAGING_EXCLUDES = [
 # Pre-built pathspec string for git add: -- . ':!.agent-mesh' ':!.next' ...
 GIT_ADD_PATHSPEC = "add -- . " + " ".join(f"':!{p}'" for p in _STAGING_EXCLUDES)
 
+# Entries to ensure in .gitignore (subset of _STAGING_EXCLUDES minus .agent-mesh)
+_GITIGNORE_ENTRIES = [e for e in _STAGING_EXCLUDES if e != ".agent-mesh"]
+
+
+def _ensure_gitignore(workspace_dir: str) -> None:
+    """
+    Ensure .gitignore in workspace covers build artifacts.
+    Appends missing entries — does NOT overwrite existing content.
+    Handles repos that have no .gitignore or have node_modules tracked.
+    """
+    gitignore_path = os.path.join(workspace_dir, ".gitignore")
+    existing = set()
+    if os.path.exists(gitignore_path):
+        with open(gitignore_path, "r") as f:
+            for line in f:
+                existing.add(line.strip().rstrip("/"))
+
+    missing = [e for e in _GITIGNORE_ENTRIES if e not in existing]
+    if not missing:
+        return
+
+    with open(gitignore_path, "a") as f:
+        f.write("\n# agent-mesh: auto-added build artifact exclusions\n")
+        for entry in missing:
+            f.write(f"{entry}/\n")
+
+    logger.debug(f"[Workspace] .gitignore: added {len(missing)} entries")
+
 
 class WorkspacePool:
     """
@@ -117,6 +145,9 @@ class WorkspacePool:
         lock_file = os.path.join(ws_dir, ".git", "index.lock")
         if os.path.exists(lock_file):
             os.remove(lock_file)
+
+        # Ensure .gitignore covers build artifacts (even if repo lacks one)
+        _ensure_gitignore(ws_dir)
 
         return ws_dir
 
