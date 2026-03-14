@@ -16,18 +16,19 @@ logger = logging.getLogger(__name__)
 
 # ── Heuristic mapping: keyword patterns → profile name ──
 #
-# Two-pass matching (see resolve_profile):
-#   Pass 1: title only (high confidence — title is the primary intent signal)
-#   Pass 2: full text incl. description (lower confidence, catches incidental mentions)
+# NOTE: These heuristics only run AFTER the explicit precedence checks
+# in resolve_profile() (scaffold → coding_basic, frontend → ui_operability_basic).
+# So these rules only apply to non-scaffold, non-frontend tasks.
 #
 # Priority rationale (most specific / least ambiguous first):
-#   1. e2e/playwright/smoke — unambiguous test infra, must win over "auth"/"api" in description
-#   2. docs/architecture   — catch doc tasks before "page"/"api" in descriptions cause mismatch
-#   3. ui/selector/testid  — UI operability; removed "page"/"component" (too generic)
-#   4. webhook/integration — before api, because webhook descriptions often mention "api" incidentally
-#   5. schema/migration    — before auth, specific DB keywords
-#   6. auth/security       — removed "session" (catches login/e2e tests); use "authentication" instead
-#   7. api/crud            — broadest backend catch-all, checked last to avoid swallowing others
+#   1. e2e/playwright/smoke — unambiguous test infra
+#   2. docs/architecture   — catch doc tasks before "api" in descriptions
+#   3. ui/selector/testid  — UI operability signals
+#   4. webhook/integration — before api (webhook descriptions mention "api" incidentally)
+#   5. schema/migration    — specific DB lifecycle keywords
+#   6. auth/security       — backend auth/security (bare "payment" excluded, see rule 7)
+#   7. payment backend     — only backend-specific: gateway, callback, mpg, refund, invoice
+#   8. api/crud            — broadest backend catch-all, checked last
 
 _PROFILE_HEURISTICS: list[tuple[list[str], str]] = [
     # 1. E2E / Playwright — most specific; always a test task, never an auth task
@@ -57,9 +58,13 @@ _SCAFFOLD_KEYWORDS = [
 ]
 
 # ── Frontend signals (beyond category field) ──
+# Only high-confidence prefixes that unambiguously indicate frontend work.
+# Generic words like "page", "component", "client" are intentionally excluded.
 _FRONTEND_SIGNALS = [
-    "frontend:", "frontend ", "next.js", "react page", "tsx page",
-    "ui page", "admin page", "admin layout", "admin dashboard",
+    "frontend:", "frontend ", "admin frontend",
+    "next.js", "react page",
+    "admin layout", "admin dashboard", "admin login",
+    "admin a",  # "Admin A2 — Dashboard", "Admin A3 — Product management"
 ]
 
 
