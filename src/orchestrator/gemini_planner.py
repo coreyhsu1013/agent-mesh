@@ -687,7 +687,8 @@ For EACH task above, produce a detailed version with:
    - What functions/classes to implement
    - What patterns to follow
    - Error handling requirements
-2. **target_files**: Specific file paths that will be created or modified
+2. **target_files**: File paths to create/modify. For backend feature modules, include the
+   module directory (e.g. "apps/api/src/modules/products/") plus any schema file needed.
 3. **acceptance_criteria**: Testable conditions for success
 
 IMPORTANT: Preserve the original id, title, category, complexity, module, dependencies, priority from the input. Do NOT add or remove tasks.
@@ -809,7 +810,8 @@ Read the following project specification and produce a detailed execution plan a
 2. Tasks should be small enough to complete in 5-10 minutes
 3. Wave 0 must include all shared types, interfaces, and DB schema
 4. Dependencies must form a valid DAG (no cycles)
-5. Target files should be specific (not entire directories)
+5. For backend feature modules, use the module directory path in target_files.
+   For other tasks, list individual file paths.
 6. For projects with >15 tasks, split into modules with interface layers
 7. Always assign complexity (L/S/M/H) and category (backend/frontend/fullstack)
 

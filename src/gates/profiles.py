@@ -21,7 +21,7 @@ CODING_BASIC = GateProfile(
     name="coding_basic",
     input_checks=["target_files_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only", "no_secret_leak"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
     verification_checks=["diff_not_empty"],
     escalation_checks=[],
 )
@@ -30,7 +30,7 @@ API_BASIC = GateProfile(
     name="api_basic",
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only", "no_secret_leak"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
     verification_checks=["diff_not_empty", "build_pass"],
     escalation_checks=[],
 )
@@ -39,7 +39,7 @@ CRITICAL_BACKEND = GateProfile(
     name="critical_backend",
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only", "no_new_dependency", "no_secret_leak"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_new_dependency", "no_secret_leak"],
     verification_checks=["diff_not_empty", "build_pass", "tests_pass"],
     escalation_checks=["auth_or_payment_touched"],
 )
@@ -48,7 +48,7 @@ SCHEMA_CRITICAL = GateProfile(
     name="schema_critical",
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only", "no_secret_leak"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
     verification_checks=["diff_not_empty", "build_pass"],
     escalation_checks=["migration_detected"],
 )
@@ -57,7 +57,7 @@ INTEGRATION_BASIC = GateProfile(
     name="integration_basic",
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only", "no_secret_leak"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
     verification_checks=["diff_not_empty", "build_pass", "tests_pass"],
     escalation_checks=[],
 )
@@ -66,7 +66,7 @@ UI_OPERABILITY_BASIC = GateProfile(
     name="ui_operability_basic",
     input_checks=["target_files_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only", "no_secret_leak"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
     verification_checks=["diff_not_empty", "build_pass"],
     escalation_checks=[],
 )
@@ -75,7 +75,7 @@ PLAYWRIGHT_INFRA_BASIC = GateProfile(
     name="playwright_infra_basic",
     input_checks=["target_files_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only"],
     verification_checks=["diff_not_empty"],
     escalation_checks=[],
 )
@@ -84,7 +84,7 @@ E2E_SMOKE_GATE = GateProfile(
     name="e2e_smoke_gate",
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
-    rule_checks=["allowed_paths_only", "no_secret_leak"],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
     verification_checks=["diff_not_empty", "build_pass", "tests_pass"],
     escalation_checks=[],
 )

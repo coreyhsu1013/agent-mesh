@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # Maps check name → instruction the agent can act on.
 _CHECK_HINTS: dict[str, str] = {
     "allowed_paths_only": (
-        "Only modify files listed in target_files. "
-        "Do not create or touch files outside the task scope."
+        "Only modify files within your task's module directory and its companion directories "
+        "(prisma, test, config). Do not modify files in other modules or other apps."
     ),
     "no_new_dependency": (
         "Do not add new package dependencies (package.json / requirements.txt). "
@@ -37,6 +37,19 @@ _CHECK_HINTS: dict[str, str] = {
     "no_secret_leak": (
         "Do not hardcode API keys, tokens, passwords, or private keys. "
         "Use environment variables or config references instead."
+    ),
+    "no_runtime_modification": (
+        "Do not modify or delete files under .agent-mesh/. "
+        "These are orchestrator runtime files (logs, db, state)."
+    ),
+    "no_build_artifacts": (
+        "Do not commit build artifacts (.next/, dist/, node_modules/, __pycache/, etc.). "
+        "Add them to .gitignore instead."
+    ),
+    "no_monorepo_config": (
+        "Do not modify root-level monorepo config files "
+        "(pnpm-workspace.yaml, turbo.json, lockfiles, root package.json) "
+        "unless explicitly listed in your target_files."
     ),
     "diff_not_empty": (
         "Ensure your changes produce a non-empty diff. "

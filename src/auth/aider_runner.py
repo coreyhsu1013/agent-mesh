@@ -597,9 +597,9 @@ class ClaudeRunner:
         try:
             # Multi-account: least-loaded account selection
             account_env = await get_pool().next_env(model=use_model)
-            proc_env = None
+            from src.auth.cli_runner import build_proc_env
+            proc_env = build_proc_env(account_env) if account_env else build_proc_env()
             if account_env:
-                proc_env = {**os.environ, **account_env}
                 logger.info(f"[ClaudeRunner] using account: {account_env.get('CLAUDE_CONFIG_DIR', 'default')}")
 
             proc = await asyncio.create_subprocess_shell(

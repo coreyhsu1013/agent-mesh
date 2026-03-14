@@ -106,7 +106,7 @@ class WorkspacePool:
     async def commit_slot_task(self, slot_id: int, commit_msg: str):
         """Commit all changes in a worker slot (call before recycling)."""
         ws_dir = self._active_slots[slot_id]
-        await self._run_git("add -A", cwd=ws_dir)
+        await self._run_git("add -- . ':!.agent-mesh'", cwd=ws_dir)
         try:
             await self._run_git(
                 f'commit --allow-empty -m "{commit_msg}"',
@@ -226,7 +226,9 @@ class WorkspacePool:
         try:
             # 1) Commit any pending changes on main
             try:
-                await self._run_git("add -A", cwd=self.repo_dir)
+                await self._run_git(
+                    "add -- . ':!.agent-mesh'", cwd=self.repo_dir
+                )
                 await self._run_git(
                     'commit --allow-empty -m "[agent-mesh] pre-merge"',
                     cwd=self.repo_dir

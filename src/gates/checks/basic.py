@@ -42,10 +42,165 @@ def acceptance_defined(task, **kwargs) -> tuple[bool, str]:
 # Rule Checks — deterministic rule enforcement on diff
 # ══════════════════════════════════════════════════════════
 
+# Build artifact directories — no task should ever commit these.
+_BUILD_ARTIFACT_DIRS = {
+    ".next", "dist", "build", "out", "node_modules",
+    "__pycache__", ".turbo", ".cache",
+}
+
+# Root-level monorepo config files — need explicit target_files permission.
+_MONOREPO_PROTECTED = {
+    "pnpm-workspace.yaml", "workspace.yaml",
+    "turbo.json", "nx.json", "lerna.json",
+    "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "package-lock.json",
+    "package.json",
+}
+
+
+def no_build_artifacts(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Block build artifacts from being committed.
+    Catches .next/, dist/, node_modules/, etc. anywhere in the tree.
+    Always enforced — no opt-out.
+    """
+    if not diff:
+        return True, "No diff to check"
+
+    changed = _extract_changed_files(diff)
+    violations = [
+        f for f in changed
+        if any(part in _BUILD_ARTIFACT_DIRS for part in f.split("/"))
+    ]
+
+    if violations:
+        return False, (
+            f"Build artifacts committed (blocked): "
+            f"{', '.join(violations[:5])}"
+            + (f" (+{len(violations) - 5} more)" if len(violations) > 5 else "")
+        )
+    return True, "No build artifacts in diff"
+
+
+def no_monorepo_config(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Block modifications to root-level monorepo config files
+    unless explicitly listed in task target_files.
+    Protects: pnpm-workspace.yaml, turbo.json, lockfiles, root package.json.
+    """
+    if not diff:
+        return True, "No diff to check"
+
+    changed = _extract_changed_files(diff)
+    target_files = set(getattr(task, "target_files", None) or [])
+
+    violations = [
+        f for f in changed
+        if f in _MONOREPO_PROTECTED and f not in target_files
+    ]
+
+    if violations:
+        return False, (
+            f"Monorepo config modified without permission: "
+            f"{', '.join(violations)}"
+        )
+    return True, "No unauthorized monorepo config changes"
+
+
+def no_runtime_modification(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """
+    Block modifications to orchestrator runtime/control-plane files.
+    Protects: .agent-mesh/ (logs, db, state, events, workspace metadata).
+    Always enforced — no opt-out.
+    """
+    if not diff:
+        return True, "No diff to check"
+
+    changed = _extract_changed_files(diff)
+    violations = [f for f in changed if f.startswith(".agent-mesh/")]
+
+    if violations:
+        return False, (
+            f"Runtime files modified (blocked): "
+            f"{', '.join(violations[:5])}"
+        )
+    return True, "No runtime files touched"
+
+
+# Companion directories that backend feature tasks commonly need
+# beyond their own module directory.
+_FEATURE_COMPANION_DIRS = {
+    "prisma", "drizzle", "typeorm", "sequelize", "db", "database",
+    "test", "tests", "__tests__", "spec", "e2e",
+    "config", "configs", "scripts", "migrations", "schemas", "graphql",
+}
+
+# Boundary markers for app root detection (monorepo)
+_APP_BOUNDARY_MARKERS = {"apps", "packages", "services", "libs"}
+
+
+def _is_backend_feature_task(task) -> bool:
+    """Detect if a task is a backend feature task (CRUD, service, module, etc.)."""
+    category = (getattr(task, "category", "") or "").lower()
+    if category not in ("backend", "fullstack"):
+        return False
+    task_type = (getattr(task, "task_type", "") or "").lower()
+    title = (getattr(task, "title", "") or "").lower()
+    # Feature indicators in task_type or title
+    feature_keywords = {
+        "crud", "service", "module", "controller", "resolver",
+        "endpoint", "api", "resource", "handler",
+    }
+    combined = f"{task_type} {title}"
+    return any(kw in combined for kw in feature_keywords)
+
+
+def _find_app_root(dir_path: str) -> str:
+    """
+    Find the app boundary directory from a path.
+    - "apps/api/src/modules/products" → "apps/api"
+    - "packages/shared/src/types"     → "packages/shared"
+    - "src/modules/products"          → "" (flat project, repo root)
+    """
+    parts = dir_path.split("/")
+    for i, part in enumerate(parts):
+        if part in _APP_BOUNDARY_MARKERS and i + 1 < len(parts):
+            return "/".join(parts[:i + 2])
+    return ""
+
+
+def _expand_for_feature_slice(task, allowed_dirs: set[str]) -> set[str]:
+    """
+    For backend feature tasks, add companion directories (prisma, test, config, etc.)
+    under the same app root.
+    Returns the set of additional allowed directories (empty if not applicable).
+    """
+    if not _is_backend_feature_task(task):
+        return set()
+
+    expanded = set()
+    # Collect unique app roots from existing allowed dirs
+    app_roots = set()
+    for d in allowed_dirs:
+        if not d:
+            continue
+        root = _find_app_root(d)
+        app_roots.add(root)
+
+    for root in app_roots:
+        prefix = (root + "/") if root else ""
+        for companion in _FEATURE_COMPANION_DIRS:
+            expanded.add(f"{prefix}{companion}")
+
+    return expanded
+
+
 def allowed_paths_only(task, diff: str = "", workspace_dir: str = "", **kwargs) -> tuple[bool, str]:
     """
     Check that changed files are within expected paths.
     Conservative: if no target_files defined, pass (don't block).
+
+    For backend feature tasks, companion directories (prisma, test, config, etc.)
+    under the same app root are automatically allowed.
     """
     if not diff:
         return True, "No diff to check"
@@ -66,12 +221,16 @@ def allowed_paths_only(task, diff: str = "", workspace_dir: str = "", **kwargs) 
         allowed_dirs.add(os.path.dirname(tf))
         allowed_dirs.add(tf)
 
+    # Expand for backend feature tasks (prisma, test, config, etc.)
+    expanded = _expand_for_feature_slice(task, allowed_dirs)
+    all_allowed = allowed_dirs | expanded
+
     # Check each changed file
     violations = []
     for f in changed:
         # Check if file or its parent is in allowed set
         in_allowed = False
-        for allowed in allowed_dirs:
+        for allowed in all_allowed:
             if not allowed:  # root dir
                 in_allowed = True
                 break
@@ -83,7 +242,8 @@ def allowed_paths_only(task, diff: str = "", workspace_dir: str = "", **kwargs) 
 
     if violations:
         return False, f"Files outside target paths: {', '.join(violations[:5])}"
-    return True, f"{len(changed)} files all within allowed paths"
+    suffix = f" (+{len(expanded)} companion dirs)" if expanded else ""
+    return True, f"{len(changed)} files all within allowed paths{suffix}"
 
 
 def no_new_dependency(task, diff: str = "", **kwargs) -> tuple[bool, str]:
@@ -264,6 +424,9 @@ CHECK_REGISTRY: dict[str, callable] = {
     "target_files_defined": target_files_defined,
     "acceptance_defined": acceptance_defined,
     # Rule checks
+    "no_runtime_modification": no_runtime_modification,
+    "no_build_artifacts": no_build_artifacts,
+    "no_monorepo_config": no_monorepo_config,
     "allowed_paths_only": allowed_paths_only,
     "no_new_dependency": no_new_dependency,
     "no_secret_leak": no_secret_leak,

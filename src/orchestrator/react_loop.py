@@ -361,8 +361,9 @@ class ReactLoop:
             )
 
         # 1) Git diff (stage untracked files first so scaffold tasks show up)
+        #    Exclude .agent-mesh/ to protect runtime files (logs, db, state)
         await self._run_cmd(
-            f"cd {workspace_dir} && git add -A 2>/dev/null"
+            f"cd {workspace_dir} && git add -- . ':!.agent-mesh' 2>/dev/null"
         )
         diff = await self._run_cmd(
             f"cd {workspace_dir} && git diff --cached HEAD 2>/dev/null || git diff --cached 2>/dev/null || echo ''"
