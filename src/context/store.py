@@ -103,7 +103,25 @@ class ContextStore:
         return run_id
 
     def _upsert_task(self, cursor: sqlite3.Cursor, task: Task):
-        """Insert or update a task."""
+        """Insert or update a task. Preserves completed status on re-import."""
+        # Check if task already exists with completed status
+        cursor.execute("SELECT status FROM tasks WHERE id = ?", (task.id,))
+        existing = cursor.fetchone()
+        if existing and existing[0] == "completed":
+            # Don't overwrite completed tasks — just update metadata
+            cursor.execute("""
+                UPDATE tasks SET
+                    title = ?, description = ?, complexity = ?, module = ?,
+                    target_files = ?, dependencies = ?, acceptance_criteria = ?,
+                    priority = ?
+                WHERE id = ?
+            """, (
+                task.title, task.description, task.complexity, task.module,
+                json.dumps(task.target_files), json.dumps(task.dependencies),
+                task.acceptance_criteria, task.priority, task.id,
+            ))
+            return
+
         cursor.execute("""
             INSERT OR REPLACE INTO tasks
             (id, title, description, agent_type, complexity, module,
