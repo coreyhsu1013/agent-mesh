@@ -28,25 +28,27 @@ WORKSPACE_DIR = ".agent-mesh/workspaces"
 
 # Paths excluded from git staging across all execution paths.
 # Prevents runtime files and build artifacts from entering commits.
-_STAGING_EXCLUDES = [
-    ".agent-mesh",
-    ".next",
-    "dist",
-    "build",
-    "out",
-    "node_modules",
-    "__pycache__",
-    ".turbo",
-    ".cache",
+# Root-only paths (only appear at repo root):
+_ROOT_EXCLUDES = [".agent-mesh"]
+# Nestable paths (can appear at any depth in monorepos, e.g. apps/admin/node_modules):
+_NESTED_EXCLUDES = [
+    ".next", "dist", "build", "out", "node_modules",
+    "__pycache__", ".turbo", ".cache",
 ]
 
-# Pre-built pathspec string for git add: -- . ':(exclude).agent-mesh' ...
+# Combined flat list for .gitignore injection (everything except .agent-mesh)
+_STAGING_EXCLUDES = _ROOT_EXCLUDES + _NESTED_EXCLUDES
+
+# Pre-built pathspec string for git add: -- . ':(exclude).agent-mesh' ':(exclude)**/...' ...
 # Uses ':(exclude)' long form — ':!' and ':^' break on some git/shell/locale combos.
-_EXCLUDES = " ".join(f"':(exclude){p}'" for p in _STAGING_EXCLUDES)
+# Nested paths use **/ glob to match at any depth (e.g. apps/admin/node_modules).
+_EXCLUDES_PARTS = [f"':(exclude){p}'" for p in _ROOT_EXCLUDES]
+_EXCLUDES_PARTS += [f"':(exclude)**/{p}'" for p in _NESTED_EXCLUDES]
+_EXCLUDES = " ".join(_EXCLUDES_PARTS)
 GIT_ADD_PATHSPEC = f"add -- . {_EXCLUDES}"
 
-# Entries to ensure in .gitignore (subset of _STAGING_EXCLUDES minus .agent-mesh)
-_GITIGNORE_ENTRIES = [e for e in _STAGING_EXCLUDES if e != ".agent-mesh"]
+# Entries to ensure in .gitignore (build artifacts only, not .agent-mesh)
+_GITIGNORE_ENTRIES = list(_NESTED_EXCLUDES)
 
 
 def _ensure_gitignore(workspace_dir: str) -> None:

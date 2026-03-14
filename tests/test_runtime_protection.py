@@ -149,11 +149,11 @@ class TestGitAddExclusion(unittest.TestCase):
         self.assertIn("':(exclude).agent-mesh'", GIT_ADD_PATHSPEC)
 
     def test_pathspec_excludes_build_artifacts(self):
-        """GIT_ADD_PATHSPEC must exclude common build artifact dirs."""
+        """GIT_ADD_PATHSPEC must exclude common build artifact dirs with **/ glob."""
         from src.orchestrator.workspace import GIT_ADD_PATHSPEC
         for artifact in [".next", "dist", "build", "out", "node_modules",
                          "__pycache__", ".turbo", ".cache"]:
-            self.assertIn(f"':(exclude){artifact}'", GIT_ADD_PATHSPEC, f"Missing: {artifact}")
+            self.assertIn(f"':(exclude)**/{artifact}'", GIT_ADD_PATHSPEC, f"Missing: {artifact}")
 
     def test_react_loop_uses_pathspec(self):
         """react_loop._observe uses shared GIT_ADD_PATHSPEC."""
