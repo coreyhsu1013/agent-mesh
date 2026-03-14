@@ -40,8 +40,9 @@ _STAGING_EXCLUDES = [
     ".cache",
 ]
 
-# Pre-built pathspec string for git add: -- . ':!.agent-mesh' ':!.next' ...
-GIT_ADD_PATHSPEC = "add -- . " + " ".join(f"':!{p}'" for p in _STAGING_EXCLUDES)
+# Pre-built pathspec string for git add: -- . ':^.agent-mesh' ':^.next' ...
+# Uses ':^' (caret) instead of ':!' — ':!' breaks on some git/shell/locale combos.
+GIT_ADD_PATHSPEC = "add -- . " + " ".join(f"':^{p}'" for p in _STAGING_EXCLUDES)
 
 # Entries to ensure in .gitignore (subset of _STAGING_EXCLUDES minus .agent-mesh)
 _GITIGNORE_ENTRIES = [e for e in _STAGING_EXCLUDES if e != ".agent-mesh"]
