@@ -76,6 +76,40 @@ def _ensure_gitignore(workspace_dir: str) -> None:
     logger.debug(f"[Workspace] .gitignore: added {len(missing)} entries")
 
 
+async def _untrack_artifacts(pool, workspace_dir: str) -> None:
+    """
+    Remove build artifact dirs from git tracking if they were previously committed.
+    .gitignore only affects untracked files — already-tracked dirs need 'git rm --cached'.
+    Commits the cleanup so the task's diff stays clean.
+    """
+    untracked = []
+    for entry in _NESTED_EXCLUDES:
+        artifact_path = os.path.join(workspace_dir, entry)
+        if os.path.isdir(artifact_path):
+            try:
+                await pool._run_git(
+                    f"rm -r --cached {entry}", cwd=workspace_dir
+                )
+                untracked.append(entry)
+            except Exception:
+                pass  # Not tracked — fine
+
+    if untracked:
+        # Commit .gitignore + untrack so the task starts from a clean baseline
+        try:
+            await pool._run_git("add .gitignore", cwd=workspace_dir)
+            dirs = ", ".join(untracked)
+            await pool._run_git(
+                f'commit -m "[agent-mesh] untrack build artifacts: {dirs}"',
+                cwd=workspace_dir,
+            )
+            logger.info(
+                f"[Workspace] Untracked {len(untracked)} artifact dirs from git index: {dirs}"
+            )
+        except Exception as e:
+            logger.debug(f"[Workspace] Untrack commit failed (ok): {e}")
+
+
 class WorkspacePool:
     """
     Wave-based git worktree pool.
@@ -152,6 +186,10 @@ class WorkspacePool:
 
         # Ensure .gitignore covers build artifacts (even if repo lacks one)
         _ensure_gitignore(ws_dir)
+
+        # Untrack build artifacts that were previously committed (e.g. node_modules)
+        # .gitignore only affects untracked files; already-tracked dirs need explicit removal
+        await _untrack_artifacts(self, ws_dir)
 
         return ws_dir
 
