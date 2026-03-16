@@ -64,7 +64,9 @@ class SpecRefiner:
     def __init__(self, config: dict):
         design_cfg = config.get("design", {})
         self.model = design_cfg.get("refiner_model", "claude-sonnet-4-6")
+        self.fallback_model = design_cfg.get("refiner_fallback_model", "claude-opus-4-6")
         self.max_tasks_per_chunk = design_cfg.get("max_tasks_per_chunk", 10)
+        self._call_failures = 0
 
     async def plan_chunks(
         self, changes: list[DesignChange], spec_content: str
@@ -82,12 +84,19 @@ class SpecRefiner:
         Each chunk gets a self-contained partial_spec from full spec.
         """
         prompt = self._build_chunking_prompt(changes, spec_content)
-        raw = await self._call_claude(prompt)
 
-        chunks = self._parse_chunks(raw)
+        # Retry chunking up to 3 times (leverages _call_claude escalation)
+        chunks = []
+        for attempt in range(3):
+            raw = await self._call_claude(prompt)
+            chunks = self._parse_chunks(raw)
+            if chunks:
+                break
+            logger.warning(f"[SpecRefiner] Chunking attempt {attempt + 1} failed, retrying...")
+
         if not chunks:
             # Fallback: one chunk with all changes
-            logger.warning("[SpecRefiner] LLM chunking failed, using single chunk fallback")
+            logger.warning("[SpecRefiner] LLM chunking failed after 3 attempts, using single chunk fallback")
             chunks = [DesignChunk(
                 chunk_id="chunk-1-all",
                 title="All changes",
@@ -299,32 +308,47 @@ If no chunks need adjustment, return an empty array: []
 """
 
     async def _call_claude(self, prompt: str) -> str:
-        """Call Claude CLI with prompt."""
+        """Call Claude CLI with prompt. Escalates to fallback model after 2 failures."""
+        # Escalate to fallback model after 2 failures, timeout doubles each retry
+        base_timeout = 600
+        timeout = base_timeout * (2 ** self._call_failures)
+        escalated = self._call_failures >= 2 and self.fallback_model != self.model
+        if escalated:
+            model = self.fallback_model
+            logger.info(f"[SpecRefiner] Escalating to {model} (timeout={timeout}s) after {self._call_failures} failures")
+        else:
+            model = self.model
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
             f.write(prompt)
             prompt_file = f.name
 
         try:
             proc = await asyncio.create_subprocess_shell(
-                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {self.model} --output-format text',
+                f'cat {prompt_file} | claude -p --dangerously-skip-permissions --model {model} --output-format text',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=600
+                proc.communicate(), timeout=timeout
             )
             result = stdout.decode().strip()
             if proc.returncode != 0:
                 logger.warning(
-                    f"[SpecRefiner] Claude returned code {proc.returncode}: "
+                    f"[SpecRefiner] Claude ({model}) returned code {proc.returncode}: "
                     f"{stderr.decode()[:200]}"
                 )
+                self._call_failures += 1
+            else:
+                self._call_failures = 0  # reset on success
             return result
         except asyncio.TimeoutError:
-            logger.error("[SpecRefiner] Claude CLI timed out (600s)")
+            self._call_failures += 1
+            logger.error(f"[SpecRefiner] Claude ({model}) timed out ({timeout}s), failures={self._call_failures}")
             return "[]"
         except Exception as e:
-            logger.error(f"[SpecRefiner] Claude CLI error: {e}")
+            self._call_failures += 1
+            logger.error(f"[SpecRefiner] Claude ({model}) error: {e}, failures={self._call_failures}")
             return "[]"
         finally:
             try:
