@@ -124,8 +124,9 @@ class ProjectLoop:
             return report, None
 
         # Generate fix-plan
-        # v1.3: pass cycle to gap_analyzer for fix-cycle merge
+        # v1.3: pass cycle + chunk_id to gap_analyzer for unique fix task IDs
         self.gap_analyzer.fix_cycle = cycle
+        self.gap_analyzer.chunk_id = self.config.get("current_chunk_id", "")
         plan = self.gap_analyzer.generate_fix_plan(report)
         plan_path = os.path.join(self.repo_dir, f".agent-mesh/fix-plan-{cycle}.json")
         self.gap_analyzer.save_fix_plan(plan, plan_path)
@@ -435,8 +436,9 @@ class ProjectLoop:
         if report.passed:
             return report, None
 
-        # v1.3: pass cycle to gap_analyzer for fix-cycle merge
+        # v1.3: pass cycle + chunk_id to gap_analyzer for unique fix task IDs
         self.gap_analyzer.fix_cycle = cycle
+        self.gap_analyzer.chunk_id = self.config.get("current_chunk_id", "")
         plan = self.gap_analyzer.generate_fix_plan(report)
         plan_path = os.path.join(self.repo_dir, f".agent-mesh/fix-plan-{cycle}.json")
         self.gap_analyzer.save_fix_plan(plan, plan_path)

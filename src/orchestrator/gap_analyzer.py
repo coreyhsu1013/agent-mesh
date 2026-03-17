@@ -47,6 +47,7 @@ class GapAnalyzer:
         verify_cfg = config.get("verify", {})
         self.exclude_modules: list[str] = verify_cfg.get("exclude_modules", [])
         self.fix_cycle: int = 0
+        self.chunk_id: str = ""  # set by project_loop for unique task IDs
 
     def generate_fix_plan(self, report: VerifyReport) -> dict:
         """
@@ -77,6 +78,19 @@ class GapAnalyzer:
         all_tasks = []
         task_counter = 0
 
+        # Unique prefix: include chunk_id to avoid ID collision across chunks
+        # "chunk-3-contract-backend" → "c3"
+        chunk_prefix = ""
+        if self.chunk_id:
+            parts = self.chunk_id.split("-")
+            if len(parts) >= 2:
+                chunk_prefix = f"c{parts[1]}-"
+
+        def _tid() -> str:
+            nonlocal task_counter
+            task_counter += 1
+            return f"fix-{chunk_prefix}{report.cycle}-{task_counter}"
+
         # ── Phase 0: Mechanical fixes (conflicts, build errors) ──
         conflict_issues = [i for i in report.issues if i.category == "conflict"]
         build_issues = [i for i in report.issues if i.category == "build"]
@@ -85,8 +99,7 @@ class GapAnalyzer:
         phase0_ids = []
 
         if conflict_issues:
-            task_counter += 1
-            tid = f"fix-{report.cycle}-{task_counter}"
+            tid = _tid()
             phase0_ids.append(tid)
             all_tasks.append(self._make_task(
                 id=tid,
@@ -99,8 +112,7 @@ class GapAnalyzer:
             ))
 
         if build_issues:
-            task_counter += 1
-            tid = f"fix-{report.cycle}-{task_counter}"
+            tid = _tid()
             phase0_ids.append(tid)
             all_tasks.append(self._make_task(
                 id=tid,
@@ -112,8 +124,7 @@ class GapAnalyzer:
             ))
 
         if test_issues:
-            task_counter += 1
-            tid = f"fix-{report.cycle}-{task_counter}"
+            tid = _tid()
             phase0_ids.append(tid)
             all_tasks.append(self._make_task(
                 id=tid,
@@ -135,8 +146,7 @@ class GapAnalyzer:
 
         schema_task_ids = []
         if all_schema_issues:
-            task_counter += 1
-            tid = f"fix-{report.cycle}-{task_counter}"
+            tid = _tid()
             schema_task_ids.append(tid)
             all_tasks.append(self._make_task(
                 id=tid,
@@ -154,8 +164,7 @@ class GapAnalyzer:
         all_schema_deps = phase0_ids + schema_task_ids
 
         for cluster in clusters:
-            task_counter += 1
-            tid = f"fix-{report.cycle}-{task_counter}"
+            tid = _tid()
 
             # Derive module name from cluster issues
             mod_names = list(dict.fromkeys(i.module or "General" for i in cluster))
@@ -188,9 +197,8 @@ class GapAnalyzer:
         # ── Phase 3: Lint fixes (lowest priority, parallel) ──
         lint_issues = [i for i in report.issues if i.category == "lint"]
         if lint_issues:
-            task_counter += 1
             all_tasks.append(self._make_task(
-                id=f"fix-{report.cycle}-{task_counter}",
+                id=_tid(),
                 title="Fix lint warnings",
                 description=self._build_lint_desc(lint_issues),
                 complexity="L",
@@ -202,8 +210,7 @@ class GapAnalyzer:
         spec_feedback_issues = [i for i in report.issues if i.category == "spec_feedback"]
         if spec_feedback_issues:
             for idx, issue in enumerate(spec_feedback_issues):
-                task_counter += 1
-                tid = f"spec-fix-{report.cycle}-{task_counter}"
+                tid = _tid()
                 all_tasks.append(self._make_task(
                     id=tid,
                     title=f"Spec correction: {(issue.message[:60])}",
@@ -225,8 +232,7 @@ class GapAnalyzer:
             # Integration tasks depend on ALL other fix tasks
             all_prior_ids = [t["id"] for t in all_tasks]
             for idx, issue in enumerate(integration_issues):
-                task_counter += 1
-                tid = f"integration-fix-{report.cycle}-{task_counter}"
+                tid = _tid()
                 all_tasks.append(self._make_task(
                     id=tid,
                     title=f"Integration: {(issue.message[:60])}",

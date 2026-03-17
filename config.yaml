@@ -50,9 +50,13 @@ agents:
     # Multi-account: round-robin CLAUDE_CONFIG_DIR for 3x rate limit
     # Each dir must have `claude login` completed beforehand
     accounts:
-      - "~/.claude"        # account A (default)
-      - "~/.claude-b"      # account B
-      # - "~/.claude-c"    # account C (uncomment after `claude-c login`)
+      # Dict format: path + initial_usage for weighting (higher = used less often)
+      # String format still works: "~/.claude" (initial_usage=0)
+      - path: "~/.claude"
+        initial_usage: 0     # account A — 調高此值讓 B 優先
+      - path: "~/.claude-b"
+        initial_usage: 0     # account B
+      # - path: "~/.claude-c"  # account C (uncomment after `claude-c login`)
     # Opus: 架構、安全、review（最強推理）
     model_opus: "claude-opus-4-6"
     timeout_opus: 3600

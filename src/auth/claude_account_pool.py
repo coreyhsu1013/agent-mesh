@@ -104,15 +104,24 @@ def _read_stats_cache(config_dir: str) -> dict:
 class ClaudeAccountPool:
     """Least-loaded pool of Claude config directories."""
 
-    def __init__(self, config_dirs: list[str]):
+    def __init__(self, config_dirs: list[str | dict]):
         self._accounts: list[dict] = []
         self._lock = asyncio.Lock()
 
         if config_dirs:
-            for d in config_dirs:
+            for entry in config_dirs:
+                # Support both string and dict format:
+                #   "~/.claude"  OR  {"path": "~/.claude", "initial_usage": 100}
+                if isinstance(entry, dict):
+                    d = entry.get("path", "")
+                    initial = float(entry.get("initial_usage", 0))
+                else:
+                    d = entry
+                    initial = 0.0
                 self._accounts.append({
                     "dir": os.path.expanduser(d),
-                    "usage": 0.0,
+                    "usage": initial,
+                    "initial_usage": initial,
                     "calls": 0,
                     "calls_opus": 0,
                     "calls_sonnet": 0,
@@ -120,8 +129,12 @@ class ClaudeAccountPool:
                 })
             self._load_usage()
             self._apply_real_token_bias()
-            dirs = [a["dir"] for a in self._accounts]
-            logger.info(f"[AccountPool] {len(self._accounts)} Claude accounts: {dirs}")
+            dirs_info = [
+                f"{a['dir']}(+{a['initial_usage']:.0f})" if a.get("initial_usage", 0) > 0
+                else a["dir"]
+                for a in self._accounts
+            ]
+            logger.info(f"[AccountPool] {len(self._accounts)} Claude accounts: {dirs_info}")
 
     def _apply_real_token_bias(self) -> None:
         """
@@ -236,15 +249,16 @@ class ClaudeAccountPool:
             saved = data.get("accounts", {})
             for account in self._accounts:
                 acct_data = saved.get(account["dir"], {})
+                initial = account.get("initial_usage", 0.0)
                 if isinstance(acct_data, dict):
-                    account["usage"] = acct_data.get("usage", 0.0)
+                    account["usage"] = acct_data.get("usage", 0.0) + initial
                     account["calls"] = acct_data.get("calls", 0)
                     account["calls_opus"] = acct_data.get("calls_opus", 0)
                     account["calls_sonnet"] = acct_data.get("calls_sonnet", 0)
                     account["calls_other"] = acct_data.get("calls_other", 0)
                 else:
                     # Backward compat: old format stored just a float
-                    account["usage"] = float(acct_data)
+                    account["usage"] = float(acct_data) + initial
 
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"[AccountPool] failed to load usage: {e}")
