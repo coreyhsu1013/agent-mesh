@@ -163,9 +163,15 @@ class Dispatcher:
         refinement_count = 0
         for t in tasks:
             if not t.allowed_no_diff and not t.target_files:
+                # v2.2: include inference_miss details in warning
+                miss_info = ""
+                if t.inference_miss:
+                    reason = t.inference_miss.get("reason", "unknown")
+                    suggested = t.inference_miss.get("suggested_paths", [])
+                    miss_info = f" (inference: {reason}, suggested: {suggested[:3]})"
                 logger.warning(
                     f"[Dispatcher] ⏳ DEFER '{t.title}': needs target_files "
-                    f"(task_type={t.task_type})"
+                    f"(task_type={t.task_type}){miss_info}"
                 )
                 t.status = TaskStatus.NEEDS_REFINEMENT.value
                 t.error = "Needs refinement: no target_files for implementation task"

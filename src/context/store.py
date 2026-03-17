@@ -94,6 +94,9 @@ class ContextStore:
             ("allowed_no_diff", "INTEGER DEFAULT 0"),        # boolean
             ("source_gaps", "TEXT DEFAULT '[]'"),             # JSON list
             ("depends_on", "TEXT DEFAULT '[]'"),              # JSON list
+            # v2.2: target_files inference
+            ("inference_miss", "TEXT DEFAULT '{}'"),              # JSON dict
+            ("related_dirs", "TEXT DEFAULT '[]'"),               # JSON list
         ]
         for col_name, col_type in _v21_columns:
             try:
@@ -273,6 +276,7 @@ class ContextStore:
             "target_files", "dependencies",
             "definition_of_done", "verifier_scope", "out_of_scope",
             "required_target_files", "source_gaps", "depends_on",
+            "related_dirs",
         )
         for fld in _json_list_fields:
             if isinstance(d.get(fld), str):
@@ -280,6 +284,14 @@ class ContextStore:
                     d[fld] = json.loads(d[fld])
                 except (json.JSONDecodeError, TypeError):
                     d[fld] = []
+        # Parse JSON dict fields
+        _json_dict_fields = ("inference_miss",)
+        for fld in _json_dict_fields:
+            if isinstance(d.get(fld), str):
+                try:
+                    d[fld] = json.loads(d[fld])
+                except (json.JSONDecodeError, TypeError):
+                    d[fld] = {}
         # Parse boolean stored as INTEGER
         if "allowed_no_diff" in d:
             d["allowed_no_diff"] = bool(d["allowed_no_diff"])

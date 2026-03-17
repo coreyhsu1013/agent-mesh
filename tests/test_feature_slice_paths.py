@@ -16,18 +16,19 @@ from src.gates.checks.basic import (
     allowed_paths_only,
     _is_backend_feature_task,
     _find_app_root,
-    _expand_for_feature_slice,
+    _expand_allowed_dirs,
 )
 
 
 # ── Minimal task stub ──
 
 class FakeTask:
-    def __init__(self, target_files=None, category="", task_type="", title=""):
+    def __init__(self, target_files=None, category="", task_type="", title="", related_dirs=None):
         self.target_files = target_files or []
         self.category = category
         self.task_type = task_type
         self.title = title
+        self.related_dirs = related_dirs or []
 
 
 # ── Diff helpers ──

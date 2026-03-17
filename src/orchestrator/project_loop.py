@@ -56,7 +56,7 @@ class ProjectLoop:
         self.repo_dir = repo_dir
         self.spec_path = spec_path
         self.verifier = Verifier(repo_dir, config)
-        self.gap_analyzer = GapAnalyzer(config)
+        self.gap_analyzer = GapAnalyzer(config, repo_dir=repo_dir)
         self.escalation = OuterLoopEscalation(config)
         self.retrospective = RetrospectiveAnalyzer(config, repo_dir)
         self.cycle_history: list[dict] = []
@@ -162,6 +162,10 @@ class ProjectLoop:
             chunk_id=chunk_id_for_ctx,
             spec_path=self.spec_path or "",
         )
+
+        # v2.2: Pass chunk/module hints to verifier for canonical path resolution
+        if verify_ctx.scope_modules:
+            self.verifier.set_module_hints(verify_ctx.scope_modules)
 
         logger.info(f"\n{'='*60}")
         logger.info(f"  🔍 Verify Cycle {cycle} (closed-loop)")
@@ -282,6 +286,16 @@ class ProjectLoop:
             if key not in seen_keys:
                 seen_keys.add(key)
                 report.issues.append(issue)
+
+        # v2.2: count path resolution categories before scope filter
+        false_positive_count = len([i for i in report.issues if i.category == "verify_false_positive"])
+        legacy_artifact_count = len([i for i in report.issues if i.category == "legacy_artifact_mismatch"])
+        if false_positive_count or legacy_artifact_count:
+            logger.info(
+                f"[Verify] Path resolution: "
+                f"{false_positive_count} false positives filtered, "
+                f"{legacy_artifact_count} legacy paths resolved"
+            )
 
         all_gap_count = len([i for i in report.issues if i.category == "spec_gap"])
         report.spec_gap_count = all_gap_count

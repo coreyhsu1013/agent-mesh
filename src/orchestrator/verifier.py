@@ -120,6 +120,10 @@ class Verifier:
         self._code_tree_ts: float = 0
         self._spec_cache: dict[str, str] = {}  # path → content
 
+        # v2.2: Canonical path resolution cache
+        self._file_index_cache: dict[str, list[str]] | None = None
+        self._module_hints: list[str] = []  # from VerifyContext.scope_modules
+
     async def run(self, cycle: int = 1, spec_path: str | None = None) -> VerifyReport:
         """Run all verification steps and return report."""
         t0 = time.time()
@@ -914,7 +918,7 @@ If everything is implemented correctly, return an empty array: []
                 pass
 
     def _parse_gap_json(self, raw: str, source: str) -> list[VerifyIssue]:
-        """Parse JSON gap report from LLM output."""
+        """Parse JSON gap report from LLM output with canonical path resolution."""
         # Try to extract JSON array from response
         raw = raw.strip()
         # Remove markdown fences if present
@@ -941,20 +945,159 @@ If everything is implemented correctly, return an empty array: []
                 return []
 
         issues = []
+        resolved_count = 0
+        false_positive_count = 0
+        legacy_count = 0
+
         for gap in gaps:
             if not isinstance(gap, dict):
                 continue
-            issues.append(VerifyIssue(
+
+            issue = VerifyIssue(
                 category="spec_gap",
                 severity=gap.get("severity", "MEDIUM"),
                 message=f"{gap.get('module', '?')}: {gap.get('requirement', '?')} — {gap.get('status', '?')}",
                 module=gap.get("module"),
                 found_by=[source],
-            ))
+            )
+
+            # v2.2: Canonical path resolution for file references
+            # Extract file path from affected_files or evidence
+            file_ref = None
+            affected = gap.get("affected_files", [])
+            if affected and isinstance(affected, list):
+                file_ref = affected[0] if affected else None
+            if not file_ref:
+                # Try extracting from evidence text
+                evidence = gap.get("evidence", "")
+                import re as _re
+                file_match = _re.search(r'([a-zA-Z][\w./\-]*\.\w{1,10})', evidence)
+                if file_match and '/' in file_match.group(1):
+                    file_ref = file_match.group(1)
+
+            if file_ref:
+                resolved, classification = self._resolve_canonical_path(file_ref)
+                if classification == "resolved":
+                    logger.debug(f"[Verifier] Path resolved: {file_ref} → {resolved}")
+                    issue.file = resolved
+                elif classification == "LEGACY_ARTIFACT_MISMATCH":
+                    logger.debug(f"[Verifier] Legacy artifact: {file_ref} → {resolved}")
+                    issue.file = resolved  # use the real path
+                    issue.category = "legacy_artifact_mismatch"
+                    legacy_count += 1
+                elif classification == "VERIFY_FALSE_POSITIVE":
+                    logger.debug(f"[Verifier] False positive: {file_ref} not in codebase")
+                    issue.category = "verify_false_positive"
+                    false_positive_count += 1
+                else:
+                    issue.file = file_ref  # canonical — exists as-is
+
+            issues.append(issue)
+
+        if resolved_count or false_positive_count or legacy_count:
+            logger.info(
+                f"[Verifier] Path resolution ({source}): "
+                f"{resolved_count} resolved, {legacy_count} legacy artifacts, "
+                f"{false_positive_count} false positives"
+            )
+
         return issues
+
+    def set_module_hints(self, hints: list[str]) -> None:
+        """Set chunk/module hints for canonical path resolution preference."""
+        self._module_hints = [h.lower() for h in hints if h]
 
     def invalidate_caches(self):
         """Clear all caches (call between cycles if needed)."""
         self._code_tree_cache = None
         self._code_tree_ts = 0
         self._spec_cache.clear()
+        self._file_index_cache = None
+
+    # ── Canonical Path Resolution (v2.2) ──
+
+    def _build_file_index(self) -> dict[str, list[str]]:
+        """Build basename → [full paths] index from repo. Cached per cycle."""
+        if self._file_index_cache is not None:
+            return self._file_index_cache
+
+        index: dict[str, list[str]] = {}
+        skip_dirs = {
+            "node_modules", ".git", ".agent-mesh", "__pycache__",
+            ".next", "dist", "build", ".turbo", ".cache", "venv", ".venv",
+        }
+        for root, dirs, files in os.walk(self.repo_dir):
+            # Prune skip_dirs
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for fname in files:
+                rel = os.path.relpath(os.path.join(root, fname), self.repo_dir)
+                basename = os.path.basename(rel)
+                index.setdefault(basename, []).append(rel)
+
+        self._file_index_cache = index
+        return index
+
+    def _resolve_canonical_path(self, file_path: str) -> tuple[str | None, str]:
+        """
+        Resolve a file path to its canonical location in the repo.
+
+        Returns (resolved_path, classification):
+        - "canonical"                — file exists at given path
+        - "resolved"                 — resolved to different canonical path
+        - "VERIFY_FALSE_POSITIVE"    — file doesn't exist, no match found
+        - "LEGACY_ARTIFACT_MISMATCH" — file doesn't exist but basename matched elsewhere
+
+        Preference order for basename fallback:
+        1. Paths under app/... preferred over src/models/... (runtime > legacy)
+        2. Paths matching current chunk/module hints preferred
+        3. Shortest path wins (less nesting = more likely canonical)
+        4. Basename-only fallback used only when unique or strong preference match
+        """
+        if not file_path:
+            return None, "VERIFY_FALSE_POSITIVE"
+
+        # Check if file exists at given path
+        full = os.path.join(self.repo_dir, file_path)
+        if os.path.exists(full):
+            return file_path, "canonical"
+
+        # Try basename fallback
+        basename = os.path.basename(file_path)
+        index = self._build_file_index()
+        candidates = index.get(basename, [])
+
+        if not candidates:
+            return None, "VERIFY_FALSE_POSITIVE"
+
+        # Score candidates by preference
+        scored: list[tuple[float, str]] = []
+        for cand in candidates:
+            score = 0.0
+            cand_lower = cand.lower()
+
+            # Prefer app/... over src/models/... (runtime > legacy layout)
+            if cand_lower.startswith("app/"):
+                score += 10.0
+            elif cand_lower.startswith("src/") and "/models/" not in cand_lower:
+                score += 5.0
+
+            # Prefer paths matching module hints (from VerifyContext)
+            for hint in self._module_hints:
+                if hint in cand_lower:
+                    score += 20.0
+                    break
+
+            # Prefer shorter paths (less nesting)
+            score -= len(cand.split("/")) * 0.1
+
+            scored.append((score, cand))
+
+        scored.sort(key=lambda x: -x[0])
+        best_path = scored[0][1]
+
+        # Only use basename fallback if unique match or strong preference
+        if len(candidates) == 1 or scored[0][0] > scored[1][0] + 5.0:
+            return best_path, "LEGACY_ARTIFACT_MISMATCH"
+
+        # Ambiguous — still pick the best but with lower confidence
+        return best_path, "LEGACY_ARTIFACT_MISMATCH"

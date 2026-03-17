@@ -39,6 +39,7 @@ def convert_changes_to_plan(
     project_name: str = "",
     shared_context: dict | None = None,
     chunk_title: str = "",
+    repo_dir: str = "",
 ) -> dict:
     """
     Convert DesignChange list into a TaskPlan-compatible dict.
@@ -111,7 +112,7 @@ def convert_changes_to_plan(
     from ..models.task import Task
     normalizer = TaskNormalizer()
     task_objects = [Task.from_dict(t) for t in tasks]
-    normalizer.normalize_plan(task_objects, chunk_id=chunk_title or "")
+    normalizer.normalize_plan(task_objects, chunk_id=chunk_title or "", repo_dir=repo_dir)
     plan["tasks"] = [t.to_dict() for t in task_objects]
 
     logger.info(

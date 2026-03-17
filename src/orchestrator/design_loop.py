@@ -836,6 +836,7 @@ class DesignLoop:
                     project_name=os.path.basename(self.repo_dir),
                     shared_context={"chunk": chunk.chunk_id},
                     chunk_title=chunk.title,
+                    repo_dir=self.repo_dir,
                 )
                 tasks = plan_dict.get("tasks", [])
                 with open(plan_path, 'w') as f:
@@ -1139,6 +1140,7 @@ class DesignLoop:
                 project_name=project_name,
                 shared_context={"chunk": chunk.chunk_id, "title": chunk.title},
                 chunk_title=chunk.title,
+                repo_dir=self.repo_dir,
             )
 
             if not plan_dict.get("tasks"):

@@ -168,28 +168,59 @@ def _find_app_root(dir_path: str) -> str:
     return ""
 
 
-def _expand_for_feature_slice(task, allowed_dirs: set[str]) -> set[str]:
-    """
-    For backend feature tasks, add companion directories (prisma, test, config, etc.)
-    under the same app root.
-    Returns the set of additional allowed directories (empty if not applicable).
-    """
-    if not _is_backend_feature_task(task):
-        return set()
+# Sibling shared directories — conservative: only shared and common
+_SIBLING_SHARED_DIRS = {"shared", "common"}
 
+
+def _expand_allowed_dirs(task, target_dirs: set[str]) -> set[str]:
+    """
+    Conservative expansion of allowed directories:
+    1. Sibling shared/common under same parent as target modules
+    2. Same app-root shared/common
+    3. Companion dirs (prisma, test, config) — backend feature tasks only
+    4. Task-provided related_dirs (from normalizer inference, repo-aware filtered)
+    """
     expanded = set()
-    # Collect unique app roots from existing allowed dirs
     app_roots = set()
-    for d in allowed_dirs:
+    parent_dirs = set()
+
+    for d in target_dirs:
         if not d:
             continue
         root = _find_app_root(d)
         app_roots.add(root)
+        parts = d.rstrip("/").split("/")
+        if len(parts) > 1:
+            parent_dirs.add("/".join(parts[:-1]))
 
+    # 1. Sibling shared/common (same parent as target module)
+    for pdir in parent_dirs:
+        for sd in _SIBLING_SHARED_DIRS:
+            expanded.add(f"{pdir}/{sd}")
+
+    # 2. App root shared/common
     for root in app_roots:
         prefix = (root + "/") if root else ""
-        for companion in _FEATURE_COMPANION_DIRS:
-            expanded.add(f"{prefix}{companion}")
+        for sd in _SIBLING_SHARED_DIRS:
+            expanded.add(f"{prefix}{sd}")
+
+    # 3. Companion dirs (backend feature tasks only, existing logic)
+    if _is_backend_feature_task(task):
+        for root in app_roots:
+            prefix = (root + "/") if root else ""
+            for companion in _FEATURE_COMPANION_DIRS:
+                expanded.add(f"{prefix}{companion}")
+
+    # 4. Task-provided related dirs (from normalizer, already repo-aware filtered)
+    for rd in getattr(task, "related_dirs", []) or []:
+        expanded.add(rd.rstrip("/"))
+
+    if expanded:
+        logger.debug(
+            f"[Gate] Expanded allowed dirs for '{getattr(task, 'title', '?')}': "
+            f"+{len(expanded)} dirs (shared={len(parent_dirs) * len(_SIBLING_SHARED_DIRS)}, "
+            f"related={len(getattr(task, 'related_dirs', []) or [])})"
+        )
 
     return expanded
 
@@ -221,8 +252,8 @@ def allowed_paths_only(task, diff: str = "", workspace_dir: str = "", **kwargs) 
         allowed_dirs.add(os.path.dirname(tf))
         allowed_dirs.add(tf)
 
-    # Expand for backend feature tasks (prisma, test, config, etc.)
-    expanded = _expand_for_feature_slice(task, allowed_dirs)
+    # Expand: sibling shared/common + companion dirs + related_dirs
+    expanded = _expand_allowed_dirs(task, allowed_dirs)
     all_allowed = allowed_dirs | expanded
 
     # Check each changed file

@@ -43,8 +43,9 @@ SCHEMA_KEYWORDS = ["model ", "field ", "prisma", "schema", " enum ", " fk ", "fk
 class GapAnalyzer:
     """Analyzes verification report and generates executable plan.json."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, repo_dir: str = ""):
         self.config = config
+        self._repo_dir_hint = repo_dir  # for existence checks on legacy artifact paths
         verify_cfg = config.get("verify", {})
         self.exclude_modules: list[str] = verify_cfg.get("exclude_modules", [])
         self.fix_cycle: int = 0
@@ -61,6 +62,30 @@ class GapAnalyzer:
                 "shared_context": {"cycle": report.cycle, "status": "PASSED"},
                 "tasks": [],
             }
+
+        # v2.2: Filter verify_false_positive (never produce fix tasks for phantom paths)
+        false_positives = [i for i in report.issues if i.category == "verify_false_positive"]
+        if false_positives:
+            report.issues = [i for i in report.issues if i.category != "verify_false_positive"]
+            logger.info(
+                f"[GapAnalyzer] Filtered {len(false_positives)} verify_false_positive issues"
+            )
+
+        # v2.2: legacy_artifact_mismatch — MUST NOT produce fix tasks against stale paths.
+        # These have already been rewritten to canonical runtime paths by verifier.
+        # Treat them as regular spec_gap for fix-plan generation.
+        for issue in report.issues:
+            if issue.category == "legacy_artifact_mismatch":
+                # Safety: ensure file is the resolved canonical path (not stale)
+                if not issue.file or not os.path.exists(os.path.join(self._repo_dir_hint, issue.file)):
+                    # No trustworthy canonical path — exclude
+                    issue.category = "verify_false_positive"
+                else:
+                    # Rewrite to spec_gap so downstream clustering picks it up
+                    issue.category = "spec_gap"
+
+        # Re-filter after legacy rewrite
+        report.issues = [i for i in report.issues if i.category != "verify_false_positive"]
 
         # Safety net: filter out excluded modules before generating tasks
         if self.exclude_modules:
@@ -260,11 +285,11 @@ class GapAnalyzer:
             "tasks": all_tasks,
         }
 
-        # v2.1: normalize fix tasks
+        # v2.1: normalize fix tasks (v2.2: with repo_dir for path inference)
         from ..models.task import Task
         normalizer = TaskNormalizer()
         task_objects = [Task.from_dict(t) for t in all_tasks]
-        normalizer.normalize_plan(task_objects, chunk_id=self.chunk_id)
+        normalizer.normalize_plan(task_objects, chunk_id=self.chunk_id, repo_dir=self._repo_dir_hint)
         plan["tasks"] = [t.to_dict() for t in task_objects]
 
         logger.info(

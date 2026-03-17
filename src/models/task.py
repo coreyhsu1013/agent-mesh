@@ -176,6 +176,10 @@ class Task:
     source_gaps: list[str] = field(default_factory=list)  # 產生此 task 的 gap IDs
     depends_on: list[str] = field(default_factory=list)   # 顯式依賴
 
+    # v2.2: target_files inference + path expansion
+    inference_miss: dict = field(default_factory=dict)     # structured reason when inference fails
+    related_dirs: list[str] = field(default_factory=list)  # normalizer-inferred related directories
+
     @classmethod
     def from_dict(cls, d: dict) -> Task:
         return cls(
@@ -220,6 +224,9 @@ class Task:
             allowed_no_diff=d.get("allowed_no_diff", False),
             source_gaps=d.get("source_gaps", []),
             depends_on=d.get("depends_on", []),
+            # v2.2
+            inference_miss=d.get("inference_miss", {}),
+            related_dirs=d.get("related_dirs", []),
         )
 
     def to_dict(self) -> dict:
@@ -285,6 +292,10 @@ class Task:
             d["source_gaps"] = self.source_gaps
         if self.depends_on:
             d["depends_on"] = self.depends_on
+        if self.inference_miss:
+            d["inference_miss"] = self.inference_miss
+        if self.related_dirs:
+            d["related_dirs"] = self.related_dirs
         return d
 
 

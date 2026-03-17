@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # Maps check name → instruction the agent can act on.
 _CHECK_HINTS: dict[str, str] = {
     "allowed_paths_only": (
-        "Only modify files within your task's module directory and its companion directories "
-        "(prisma, test, config). Do not modify files in other modules or other apps."
+        "Only modify files within your task's module and sibling shared/common directories. "
+        "Do not modify files in unrelated modules or other apps."
     ),
     "no_new_dependency": (
         "Do not add new package dependencies (package.json / requirements.txt). "

@@ -143,6 +143,105 @@ class TestVerifierScope:
         assert task.verifier_scope == []
 
 
+class TestInferTargetFiles:
+    def test_no_overwrite_existing(self, normalizer):
+        """Existing target_files should not be overwritten."""
+        task = Task(title="Fix auth", target_files=["src/auth.ts"])
+        normalizer.normalize(task)
+        assert task.target_files == ["src/auth.ts"]
+
+    def test_promote_required_target_files(self, normalizer):
+        """required_target_files should promote to target_files."""
+        task = Task(title="Fix auth module", required_target_files=["app/auth/models.py"])
+        normalizer.normalize(task)
+        assert "app/auth/models.py" in task.target_files
+
+    def test_infer_from_source_gaps(self, normalizer):
+        """source_gaps containing file paths should be extracted."""
+        task = Task(
+            title="Fix sales gaps",
+            source_gaps=["sales: Missing CRUD — file: app/sales/models.py"],
+        )
+        normalizer.normalize(task)
+        assert "app/sales/models.py" in task.target_files
+
+    def test_infer_from_description_file_path(self, normalizer):
+        """File paths in description should be extracted."""
+        task = Task(
+            title="Fix finance module",
+            description="The file app/finance/models.py is missing the Invoice model",
+        )
+        normalizer.normalize(task)
+        assert "app/finance/models.py" in task.target_files
+
+    def test_infer_from_module_name(self, normalizer, tmp_path):
+        """Module name should generate candidate dirs, filtered by existence."""
+        # Create a matching directory
+        (tmp_path / "app" / "sales").mkdir(parents=True)
+        task = Task(title="Fix sales", module="sales")
+        normalizer.normalize(task, repo_dir=str(tmp_path))
+        assert "app/sales" in task.target_files
+
+    def test_regex_fallback_last(self, normalizer):
+        """When only regex can find paths, it should still work."""
+        task = Task(
+            title="Update lib/utils/format.py with new logic",
+            description="No structured paths here",
+        )
+        normalizer.normalize(task)
+        assert "lib/utils/format.py" in task.target_files
+
+    def test_analysis_no_inference(self, normalizer):
+        """Analysis tasks should not get target_files inferred."""
+        task = Task(title="Analysis of app/sales/models.py file")
+        normalizer.normalize(task)
+        assert task.task_type == "analysis"
+        assert task.target_files == []
+
+    def test_cap_at_8_files(self, normalizer):
+        """Inferred target_files should be capped at 8."""
+        paths = " ".join(f"app/mod{i}/file.py" for i in range(15))
+        task = Task(title="Fix all modules", description=paths)
+        normalizer.normalize(task)
+        assert len(task.target_files) <= 8
+
+    def test_inference_miss_recorded(self, normalizer):
+        """When inference fails, inference_miss should have structured reason."""
+        task = Task(title="Do something vague", module="core")
+        normalizer.normalize(task)
+        assert task.inference_miss.get("reason") == "no_paths_found"
+
+    def test_repo_aware_filtering(self, normalizer, tmp_path):
+        """Non-existent paths should be filtered when repo_dir is provided."""
+        task = Task(
+            title="Fix stuff",
+            description="Update app/nonexistent/models.py",
+        )
+        normalizer.normalize(task, repo_dir=str(tmp_path))
+        # Path doesn't exist in tmp_path, should be filtered out
+        assert "app/nonexistent/models.py" not in task.target_files
+
+    def test_related_dirs_inferred(self, normalizer, tmp_path):
+        """related_dirs should be inferred from target_files with existence check."""
+        (tmp_path / "app" / "shared").mkdir(parents=True)
+        task = Task(
+            title="Fix sales module",
+            target_files=["app/sales/models.py"],
+        )
+        normalizer.normalize(task, repo_dir=str(tmp_path))
+        assert "app/shared" in task.related_dirs
+
+    def test_related_dirs_not_speculative(self, normalizer, tmp_path):
+        """related_dirs should not contain dirs that don't exist."""
+        task = Task(
+            title="Fix sales module",
+            target_files=["app/sales/models.py"],
+        )
+        normalizer.normalize(task, repo_dir=str(tmp_path))
+        # app/shared doesn't exist, should not be in related_dirs
+        assert "app/shared" not in task.related_dirs
+
+
 class TestBackwardCompat:
     def test_old_plan_no_v21_fields(self):
         """Old plan.json without v2.1 fields should still load."""

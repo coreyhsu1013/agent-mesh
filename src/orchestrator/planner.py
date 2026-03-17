@@ -112,7 +112,8 @@ class Planner:
         )
 
         # v2.1: normalize tasks (task_type, allowed_no_diff, required_target_files)
-        self.normalizer.normalize_plan(plan.tasks)
+        # v2.2: pass repo_dir for path existence filtering
+        self.normalizer.normalize_plan(plan.tasks, repo_dir=self.repo_dir)
 
     @staticmethod
     def save_plan(plan: TaskPlan, output_path: str):

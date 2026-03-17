@@ -59,8 +59,14 @@ class ScopeFilter:
             return result
 
         for issue in report.issues:
-            # Non-gap issues always pass through
-            if issue.category != "spec_gap":
+            # v2.2: verify_false_positive → always drop
+            if issue.category == "verify_false_positive":
+                result.false_positives.append(issue)
+                continue
+
+            # Non-gap issues always pass through (including legacy_artifact_mismatch
+            # which has already been rewritten to canonical path)
+            if issue.category not in ("spec_gap",):
                 result.executable.append(issue)
                 continue
 
