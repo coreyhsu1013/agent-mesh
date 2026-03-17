@@ -22,7 +22,7 @@ CODING_BASIC = GateProfile(
     input_checks=["target_files_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
-    verification_checks=["diff_not_empty"],
+    verification_checks=["diff_not_empty", "dod_diff_required"],
     escalation_checks=[],
 )
 
@@ -31,7 +31,7 @@ API_BASIC = GateProfile(
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
-    verification_checks=["diff_not_empty", "build_pass"],
+    verification_checks=["diff_not_empty", "dod_diff_required", "build_pass"],
     escalation_checks=[],
 )
 
@@ -40,7 +40,7 @@ CRITICAL_BACKEND = GateProfile(
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_new_dependency", "no_secret_leak"],
-    verification_checks=["diff_not_empty", "build_pass", "tests_pass"],
+    verification_checks=["diff_not_empty", "dod_diff_required", "dod_must_change_files", "build_pass", "tests_pass"],
     escalation_checks=["auth_or_payment_touched"],
 )
 
@@ -49,7 +49,7 @@ SCHEMA_CRITICAL = GateProfile(
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
-    verification_checks=["diff_not_empty", "build_pass"],
+    verification_checks=["diff_not_empty", "dod_diff_required", "dod_must_change_files", "build_pass"],
     escalation_checks=["migration_detected"],
 )
 
@@ -58,7 +58,7 @@ INTEGRATION_BASIC = GateProfile(
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
-    verification_checks=["diff_not_empty", "build_pass", "tests_pass"],
+    verification_checks=["diff_not_empty", "dod_diff_required", "dod_must_change_files", "build_pass", "tests_pass"],
     escalation_checks=[],
 )
 
@@ -67,7 +67,7 @@ UI_OPERABILITY_BASIC = GateProfile(
     input_checks=["target_files_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
-    verification_checks=["diff_not_empty", "build_pass"],
+    verification_checks=["diff_not_empty", "dod_diff_required", "build_pass"],
     escalation_checks=[],
 )
 
@@ -76,7 +76,7 @@ PLAYWRIGHT_INFRA_BASIC = GateProfile(
     input_checks=["target_files_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only"],
-    verification_checks=["diff_not_empty"],
+    verification_checks=["diff_not_empty", "dod_diff_required"],
     escalation_checks=[],
 )
 
@@ -85,7 +85,27 @@ E2E_SMOKE_GATE = GateProfile(
     input_checks=["target_files_defined", "acceptance_defined"],
     format_checks=[],
     rule_checks=["no_runtime_modification", "no_build_artifacts", "no_monorepo_config", "allowed_paths_only", "no_secret_leak"],
-    verification_checks=["diff_not_empty", "build_pass", "tests_pass"],
+    verification_checks=["diff_not_empty", "dod_diff_required", "dod_must_change_files", "build_pass", "tests_pass"],
+    escalation_checks=[],
+)
+
+# v2.1: Analysis tasks — no diff/target_files required
+ANALYSIS_GATE = GateProfile(
+    name="analysis_gate",
+    input_checks=[],
+    format_checks=[],
+    rule_checks=["no_runtime_modification", "no_build_artifacts"],
+    verification_checks=[],
+    escalation_checks=[],
+)
+
+# v2.1: Test-only tasks
+TEST_GATE = GateProfile(
+    name="test_gate",
+    input_checks=["target_files_defined"],
+    format_checks=[],
+    rule_checks=["no_runtime_modification", "no_build_artifacts", "allowed_paths_only"],
+    verification_checks=["diff_not_empty", "dod_diff_required", "tests_pass"],
     escalation_checks=[],
 )
 
@@ -101,4 +121,6 @@ ALL_PROFILES: dict[str, GateProfile] = {
     "ui_operability_basic": UI_OPERABILITY_BASIC,
     "playwright_infra_basic": PLAYWRIGHT_INFRA_BASIC,
     "e2e_smoke_gate": E2E_SMOKE_GATE,
+    "analysis_gate": ANALYSIS_GATE,
+    "test_gate": TEST_GATE,
 }

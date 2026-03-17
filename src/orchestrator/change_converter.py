@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 from .spec_analyzer import DesignChange
+from .task_normalizer import TaskNormalizer
 
 logger = logging.getLogger("agent-mesh")
 
@@ -105,6 +106,13 @@ def convert_changes_to_plan(
         "modules": modules,
         "tasks": tasks,
     }
+
+    # v2.1: normalize tasks
+    from ..models.task import Task
+    normalizer = TaskNormalizer()
+    task_objects = [Task.from_dict(t) for t in tasks]
+    normalizer.normalize_plan(task_objects, chunk_id=chunk_title or "")
+    plan["tasks"] = [t.to_dict() for t in task_objects]
 
     logger.info(
         f"[Converter] {len(changes)} changes → {len(tasks)} tasks "

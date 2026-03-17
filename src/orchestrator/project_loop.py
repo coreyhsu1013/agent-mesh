@@ -27,6 +27,8 @@ from .gap_analyzer import GapAnalyzer
 from .model_ranking import OuterLoopEscalation
 from .retrospective import RetrospectiveAnalyzer
 from .run_history import RunHistoryRecorder
+from .scope_filter import ScopeFilter, ScopeFilterResult
+from .verify_context import VerifyContextLoader, VerifyContext
 
 logger = logging.getLogger("agent-mesh")
 
@@ -153,6 +155,14 @@ class ProjectLoop:
         max_new = verify_cfg.get("max_new_gaps_per_cycle", 5)
         convergence_threshold = verify_cfg.get("convergence_threshold", 0)
 
+        # v2.1: load verify context for scoped verification
+        chunk_id_for_ctx = self.config.get("current_chunk_id", "")
+        ctx_loader = VerifyContextLoader(self.config, self.repo_dir)
+        verify_ctx = ctx_loader.load(
+            chunk_id=chunk_id_for_ctx,
+            spec_path=self.spec_path or "",
+        )
+
         logger.info(f"\n{'='*60}")
         logger.info(f"  🔍 Verify Cycle {cycle} (closed-loop)")
         logger.info(f"{'='*60}")
@@ -197,8 +207,10 @@ class ProjectLoop:
         new_gap_issues = []
         if report.build_ok:  # only scan if build passes
             new_gap_issues = await self.verifier.run_bounded_scan(
-                self.spec_path, code_tree, exclude_modules, max_new,
+                verify_ctx.effective_spec_path() or self.spec_path,
+                code_tree, exclude_modules, max_new,
                 known_gaps=remaining_gaps,
+                verify_context=verify_ctx,
             )
             logger.info(f"[ClosedLoop] New scan: {len(new_gap_issues)} new gaps (max {max_new})")
         else:
@@ -274,35 +286,28 @@ class ProjectLoop:
         all_gap_count = len([i for i in report.issues if i.category == "spec_gap"])
         report.spec_gap_count = all_gap_count
 
-        # Step 2.6: Scope filter — remove gaps not belonging to current chunk
+        # Step 2.6: Scope filter (v2.1: extracted to ScopeFilter class)
         chunk_id = self.config.get("current_chunk_id", "")
         if chunk_id and all_gap_count > 0:
-            scope_modules = self._get_chunk_scope_modules(chunk_id)
-            if scope_modules:
-                in_scope = []
-                deferred = []
-                for issue in report.issues:
-                    if issue.category != "spec_gap":
-                        in_scope.append(issue)
-                        continue
-                    if self._issue_in_scope(issue, scope_modules):
-                        in_scope.append(issue)
-                    else:
-                        deferred.append(issue)
-
-                if deferred:
-                    logger.info(
-                        f"[ScopeFilter] {len(deferred)} gaps out of chunk scope, "
-                        f"deferring to later chunks"
-                    )
-                    for d in deferred:
-                        logger.info(f"  ↳ deferred: [{d.module}] {d.message[:80]}")
-                    self._save_deferred_gaps(deferred)
-                    report.issues = in_scope
-                    all_gap_count = len([
-                        i for i in report.issues if i.category == "spec_gap"
-                    ])
-                    report.spec_gap_count = all_gap_count
+            scope_filter = ScopeFilter(self.config, self.repo_dir)
+            filter_result = scope_filter.filter(report, chunk_id)
+            if filter_result.out_of_scope:
+                for d in filter_result.out_of_scope:
+                    logger.info(f"  ↳ deferred: [{d.module}] {d.message[:80]}")
+                self._save_deferred_gaps(filter_result.out_of_scope)
+            if filter_result.false_positives:
+                logger.info(
+                    f"[ScopeFilter] Dropped {len(filter_result.false_positives)} false positives"
+                )
+            if filter_result.contradictions:
+                logger.warning(
+                    f"[ScopeFilter] {len(filter_result.contradictions)} spec contradictions"
+                )
+            report.issues = filter_result.executable
+            all_gap_count = len([
+                i for i in report.issues if i.category == "spec_gap"
+            ])
+            report.spec_gap_count = all_gap_count
 
         # Save report
         report_path = os.path.join(self.repo_dir, f".agent-mesh/verify-report-{cycle}.json")
@@ -436,9 +441,23 @@ class ProjectLoop:
         if report.passed:
             return report, None
 
+        # v2.1: Re-filter before fix-plan — guard against issues added by retro/layer3/4
+        chunk_id = self.config.get("current_chunk_id", "")
+        if chunk_id and report.issues:
+            scope_filter = ScopeFilter(self.config, self.repo_dir)
+            pre_plan_result = scope_filter.filter(report, chunk_id)
+            if pre_plan_result.out_of_scope:
+                logger.info(
+                    f"[ScopeFilter] Pre-plan: deferred {len(pre_plan_result.out_of_scope)} "
+                    f"out-of-scope issues from fix-plan"
+                )
+                self._save_deferred_gaps(pre_plan_result.out_of_scope)
+            report.issues = pre_plan_result.executable
+            report.spec_gap_count = len([i for i in report.issues if i.category == "spec_gap"])
+
         # v1.3: pass cycle + chunk_id to gap_analyzer for unique fix task IDs
         self.gap_analyzer.fix_cycle = cycle
-        self.gap_analyzer.chunk_id = self.config.get("current_chunk_id", "")
+        self.gap_analyzer.chunk_id = chunk_id
         plan = self.gap_analyzer.generate_fix_plan(report)
         plan_path = os.path.join(self.repo_dir, f".agent-mesh/fix-plan-{cycle}.json")
         self.gap_analyzer.save_fix_plan(plan, plan_path)

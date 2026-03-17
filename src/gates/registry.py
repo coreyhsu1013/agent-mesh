@@ -68,6 +68,24 @@ _FRONTEND_SIGNALS = [
 ]
 
 
+# ── task_type → profile mapping (v2.1) ──
+# Takes precedence over heuristic-based resolution, but after explicit gate_profile.
+_TASK_TYPE_TO_PROFILE: dict[str, str] = {
+    "analysis":   "analysis_gate",
+    "schema":     "schema_critical",
+    "migration":  "schema_critical",
+    "model":      "coding_basic",
+    "service":    "critical_backend",
+    "router":     "api_basic",
+    "listener":   "integration_basic",
+    "scheduler":  "integration_basic",
+    "frontend":   "ui_operability_basic",
+    "test_only":  "test_gate",
+    "config":     "coding_basic",
+    "general":    "coding_basic",       # keyword-unmatched fallback
+}
+
+
 class GateRegistry:
     """Registry for gate profiles."""
 
@@ -98,6 +116,16 @@ class GateRegistry:
                 if profile_name in self.profiles:
                     return self.profiles[profile_name]
                 return GateProfile.from_dict(task.gate_profile)
+
+        # 1.5 (v2.1): task_type → profile mapping (before heuristic)
+        if task.task_type:
+            mapped_profile = _TASK_TYPE_TO_PROFILE.get(task.task_type)
+            if mapped_profile and mapped_profile in self.profiles:
+                logger.debug(
+                    f"[GateRegistry] '{task.title}' → {mapped_profile} "
+                    f"(task_type={task.task_type})"
+                )
+                return self.profiles[mapped_profile]
 
         title = (task.title or "").lower()
         category = (task.category or "").lower()

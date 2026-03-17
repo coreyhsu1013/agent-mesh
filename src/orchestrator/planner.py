@@ -18,6 +18,7 @@ from ..models.task import TaskPlan
 from ..auth.cli_runner import run_claude_prompt, run_gemini_prompt
 from ..gates.registry import GateRegistry
 from .gemini_planner import GeminiPlanner
+from .task_normalizer import TaskNormalizer
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class Planner:
 
         # v2.0: gate registry for task enrichment
         self.gate_registry = GateRegistry()
+        # v2.1: task normalizer
+        self.normalizer = TaskNormalizer()
 
     async def plan(
         self,
@@ -107,6 +110,9 @@ class Planner:
             f"[Planner] Gate profiles assigned: "
             + ", ".join(f"{k}={v}" for k, v in sorted(profile_counts.items()))
         )
+
+        # v2.1: normalize tasks (task_type, allowed_no_diff, required_target_files)
+        self.normalizer.normalize_plan(plan.tasks)
 
     @staticmethod
     def save_plan(plan: TaskPlan, output_path: str):

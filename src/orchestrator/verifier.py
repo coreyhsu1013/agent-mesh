@@ -336,6 +336,7 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
         exclude_modules: list[str],
         max_gaps: int = 5,
         known_gaps: list[dict] | None = None,
+        verify_context: "VerifyContext | None" = None,
     ) -> list[VerifyIssue]:
         """
         Bounded scan for NEW critical gaps not previously identified.
@@ -345,9 +346,14 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
         verify_cfg = self.config.get("verify", {})
         model = verify_cfg.get("scan_model", "claude-opus-4-6")
 
-        spec_content = self._read_spec(spec_path)
-        if not spec_content:
-            return []
+        # v2.1: use verify_context for scoped verification
+        effective_spec = spec_path
+        scope_instruction = ""
+        if verify_context:
+            effective_spec = verify_context.effective_spec_path() or spec_path
+            scope_instruction = verify_context.scope_instruction()
+            if verify_context.exclude_modules:
+                exclude_modules = list(set(exclude_modules) | set(verify_context.exclude_modules))
 
         exclude_str = ", ".join(exclude_modules) if exclude_modules else "none"
 
@@ -365,6 +371,13 @@ Each item: {{"index": N, "status": "FIXED" | "REMAINING" | "PARTIAL", "evidence"
                 + "\n"
             )
 
+        spec_content = self._read_spec(effective_spec)
+        if not spec_content:
+            # fallback to original spec_path
+            spec_content = self._read_spec(spec_path)
+            if not spec_content:
+                return []
+
         prompt = f"""You are scanning for NEW critical gaps not previously identified.
 
 ## SCOPE RESTRICTION (CRITICAL)
@@ -372,7 +385,7 @@ You are verifying a PARTIAL specification for one chunk of a larger project.
 ONLY report gaps for requirements that are EXPLICITLY listed in the SPECIFICATION section below.
 Do NOT report issues for features, modules, or requirements not mentioned in this specification.
 If a feature is not mentioned in the spec, it is handled by a different chunk — IGNORE it completely.
-
+{scope_instruction}
 ## CONSTRAINTS
 - Only report HIGH severity gaps that affect core functionality
 - Maximum {max_gaps} new gaps

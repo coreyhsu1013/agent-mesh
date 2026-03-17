@@ -133,8 +133,22 @@ class Dispatcher:
         if resume:
             db_tasks = self.store.get_all_tasks()
             completed_from_db = {t.id for t in db_tasks if t.status == TaskStatus.COMPLETED.value}
+
+            # Preflight: verify completed tasks' merge commits are on current main
+            if completed_from_db:
+                stale_ids = await self._verify_completed_on_main(
+                    [t for t in db_tasks if t.id in completed_from_db]
+                )
+                if stale_ids:
+                    logger.warning(
+                        f"[Dispatcher] ⚠️ {len(stale_ids)} completed tasks not found on main, resetting to pending"
+                    )
+                    for task_id in stale_ids:
+                        self.store.reset_task_status(task_id)
+                    completed_from_db -= stale_ids
+
             tasks = [t for t in tasks if t.id not in completed_from_db]
-            logger.info(f"[Dispatcher] Resume: {len(completed_from_db)} already done, {len(tasks)} remaining")
+            logger.info(f"[Dispatcher] Resume: {len(completed_from_db)} verified done, {len(tasks)} remaining")
 
         if not tasks:
             logger.info("[Dispatcher] No tasks to execute")
@@ -143,6 +157,27 @@ class Dispatcher:
         # Apply complexity floor for foundational tasks
         for t in tasks:
             self.router.apply_complexity_floor(t)
+
+        # v2.1: Pre-dispatch — implementation tasks must have target_files
+        validated = []
+        refinement_count = 0
+        for t in tasks:
+            if not t.allowed_no_diff and not t.target_files:
+                logger.warning(
+                    f"[Dispatcher] ⏳ DEFER '{t.title}': needs target_files "
+                    f"(task_type={t.task_type})"
+                )
+                t.status = TaskStatus.NEEDS_REFINEMENT.value
+                t.error = "Needs refinement: no target_files for implementation task"
+                self.store.update_task(t)
+                refinement_count += 1
+            else:
+                validated.append(t)
+        if refinement_count:
+            logger.warning(
+                f"[Dispatcher] ⚠️ {refinement_count} tasks deferred (needs_refinement)"
+            )
+        tasks = validated
 
         self._print_routing_preview(tasks)
 
@@ -430,6 +465,13 @@ class Dispatcher:
                     if merge_results.get(task_idx, False):
                         task.status = TaskStatus.COMPLETED.value
                         task.diff = tr.final_diff[:5000] if tr else ""
+                        # Record merge commit SHA for resume verification
+                        try:
+                            task.merge_commit = await self.pool._run_git(
+                                "rev-parse HEAD", cwd=self.repo_dir
+                            )
+                        except Exception:
+                            task.merge_commit = ""
                         completed_ids.add(task.id)
                         dur = task.duration_sec
                         model = (
@@ -494,6 +536,26 @@ class Dispatcher:
                     pending.remove(task)
 
         self._print_summary(plan)
+
+    async def _verify_completed_on_main(self, completed_tasks: list[Task]) -> set[str]:
+        """Verify completed tasks' merge commits exist on current HEAD. Return stale task IDs."""
+        stale = set()
+        for task in completed_tasks:
+            if not task.merge_commit:
+                continue  # old data without SHA — trust DB (backward compat)
+            try:
+                await self.pool._run_git(
+                    f"merge-base --is-ancestor {task.merge_commit} HEAD",
+                    cwd=self.repo_dir,
+                )
+            except Exception:
+                # Non-zero exit = not ancestor = stale
+                stale.add(task.id)
+                logger.warning(
+                    f"[Dispatcher] Task '{task.title}' merge_commit "
+                    f"{task.merge_commit[:8]} not on current HEAD"
+                )
+        return stale
 
     async def _execute_task_in_slot(
         self, task: Task, slot_id: int, workspace_dir: str

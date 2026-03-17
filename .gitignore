@@ -11,3 +11,5 @@ dist/
 plan.json
 CLAUDE.local.md
 .claude/settings.local.json
+.DS_Store
+*-plan.json

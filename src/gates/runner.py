@@ -59,6 +59,14 @@ _CHECK_HINTS: dict[str, str] = {
         "Ensure your changes produce a non-empty diff. "
         "The task must create or modify at least one file."
     ),
+    "dod_diff_required": (
+        "Implementation task MUST produce code changes. "
+        "Ensure you create or modify at least one file."
+    ),
+    "dod_must_change_files": (
+        "Must modify specific files listed in required_target_files. "
+        "Check the task's required_target_files field and ensure those files are changed."
+    ),
     "build_pass": (
         "Fix the build errors shown below. "
         "The project must compile/build without errors."

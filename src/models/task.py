@@ -41,12 +41,22 @@ AGENT_TO_WORKSPACE = {
 }
 
 
+def _ensure_list(val) -> list[str]:
+    """Convert str→[str], pass through list, default to []."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str) and val:
+        return [val]
+    return []
+
+
 class TaskStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    NEEDS_REFINEMENT = "needs_refinement"  # v2.1: missing target_files
 
 
 # ── Gate Architecture (v2.0) ──
@@ -141,6 +151,7 @@ class Task:
     diff: str = ""                     # 最終 git diff（截斷）
     duration_sec: float = 0.0          # 執行耗時
     error: str = ""                    # 錯誤訊息
+    merge_commit: str = ""             # merge commit SHA (for resume verification)
 
     # v2.0: Task-Gate Architecture
     task_type: str = ""                # e.g. "api", "schema", "ui", "auth"
@@ -153,6 +164,17 @@ class Task:
     retry_reason: str = ""
     escalation_reason: str = ""
     verification_artifacts: dict = field(default_factory=dict)
+
+    # v2.1: Task Schema v2 — scope control
+    chunk_id: str = ""                                    # 所屬 chunk
+    definition_of_done: list[str] = field(default_factory=list)   # DoD criteria list
+    verifier_scope: list[str] = field(default_factory=list)       # verifier scope entries
+    out_of_scope: list[str] = field(default_factory=list)         # 排除的檔案/模組
+    required_target_files: list[str] = field(default_factory=list)  # 必須修改的檔案
+    min_changed_files: int = 0                            # 最少要改幾個檔案
+    allowed_no_diff: bool = False                         # analysis task = True
+    source_gaps: list[str] = field(default_factory=list)  # 產生此 task 的 gap IDs
+    depends_on: list[str] = field(default_factory=list)   # 顯式依賴
 
     @classmethod
     def from_dict(cls, d: dict) -> Task:
@@ -176,6 +198,7 @@ class Task:
             diff=d.get("diff", ""),
             duration_sec=d.get("duration_sec", 0.0),
             error=d.get("error", ""),
+            merge_commit=d.get("merge_commit", ""),
             # v2.0: gate fields (safe fallback for old plan.json)
             task_type=d.get("task_type", ""),
             input_requirements=d.get("input_requirements", []),
@@ -187,6 +210,16 @@ class Task:
             retry_reason=d.get("retry_reason", ""),
             escalation_reason=d.get("escalation_reason", ""),
             verification_artifacts=d.get("verification_artifacts", {}),
+            # v2.1: scope control
+            chunk_id=d.get("chunk_id", ""),
+            definition_of_done=_ensure_list(d.get("definition_of_done", [])),
+            verifier_scope=_ensure_list(d.get("verifier_scope", [])),
+            out_of_scope=d.get("out_of_scope", []),
+            required_target_files=d.get("required_target_files", d.get("must_change_files", [])),
+            min_changed_files=d.get("min_changed_files", 0),
+            allowed_no_diff=d.get("allowed_no_diff", False),
+            source_gaps=d.get("source_gaps", []),
+            depends_on=d.get("depends_on", []),
         )
 
     def to_dict(self) -> dict:
@@ -210,6 +243,7 @@ class Task:
             "diff": self.diff,
             "duration_sec": self.duration_sec,
             "error": self.error,
+            "merge_commit": self.merge_commit,
         }
         # v2.0: gate fields (only include if non-empty to keep backward compat)
         if self.task_type:
@@ -232,6 +266,25 @@ class Task:
             d["escalation_reason"] = self.escalation_reason
         if self.verification_artifacts:
             d["verification_artifacts"] = self.verification_artifacts
+        # v2.1: scope control (only include non-default)
+        if self.chunk_id:
+            d["chunk_id"] = self.chunk_id
+        if self.definition_of_done:
+            d["definition_of_done"] = self.definition_of_done
+        if self.verifier_scope:
+            d["verifier_scope"] = self.verifier_scope
+        if self.out_of_scope:
+            d["out_of_scope"] = self.out_of_scope
+        if self.required_target_files:
+            d["required_target_files"] = self.required_target_files
+        if self.min_changed_files:
+            d["min_changed_files"] = self.min_changed_files
+        if self.allowed_no_diff:
+            d["allowed_no_diff"] = self.allowed_no_diff
+        if self.source_gaps:
+            d["source_gaps"] = self.source_gaps
+        if self.depends_on:
+            d["depends_on"] = self.depends_on
         return d
 
 

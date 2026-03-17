@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .verifier import VerifyReport, VerifyIssue
+from .task_normalizer import TaskNormalizer
 
 logger = logging.getLogger("agent-mesh")
 
@@ -258,6 +259,13 @@ class GapAnalyzer:
             },
             "tasks": all_tasks,
         }
+
+        # v2.1: normalize fix tasks
+        from ..models.task import Task
+        normalizer = TaskNormalizer()
+        task_objects = [Task.from_dict(t) for t in all_tasks]
+        normalizer.normalize_plan(task_objects, chunk_id=self.chunk_id)
+        plan["tasks"] = [t.to_dict() for t in task_objects]
 
         logger.info(
             f"[GapAnalyzer] Generated plan.json: {len(all_tasks)} tasks "

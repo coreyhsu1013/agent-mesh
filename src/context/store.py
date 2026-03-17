@@ -77,6 +77,30 @@ class ContextStore:
                 total_react_attempts INTEGER DEFAULT 0
             );
         """)
+        # Schema migration: add merge_commit column (idempotent)
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN merge_commit TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # v2.1: Task Schema v2 — scope control columns (idempotent)
+        _v21_columns = [
+            ("chunk_id", "TEXT DEFAULT ''"),
+            ("definition_of_done", "TEXT DEFAULT '[]'"),     # JSON list
+            ("verifier_scope", "TEXT DEFAULT '[]'"),          # JSON list
+            ("out_of_scope", "TEXT DEFAULT '[]'"),            # JSON list
+            ("required_target_files", "TEXT DEFAULT '[]'"),   # JSON list
+            ("min_changed_files", "INTEGER DEFAULT 0"),
+            ("allowed_no_diff", "INTEGER DEFAULT 0"),        # boolean
+            ("source_gaps", "TEXT DEFAULT '[]'"),             # JSON list
+            ("depends_on", "TEXT DEFAULT '[]'"),              # JSON list
+        ]
+        for col_name, col_type in _v21_columns:
+            try:
+                cursor.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
         self.conn.commit()
 
     # ── Task Operations ──
@@ -127,8 +151,8 @@ class ContextStore:
             (id, title, description, agent_type, complexity, module,
              target_files, dependencies, acceptance_criteria, priority,
              status, agent_used, attempts, react_history, observation,
-             routed_by, duration_sec, diff, error, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             routed_by, duration_sec, diff, error, merge_commit, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             task.id, task.title, task.description, task.agent_type,
             task.complexity, task.module,
@@ -136,6 +160,7 @@ class ContextStore:
             task.acceptance_criteria, task.priority, task.status,
             task.agent_used, task.attempts, task.react_history,
             "", task.routed_by, task.duration_sec, task.diff, task.error,
+            task.merge_commit,
             datetime.now().isoformat(),
         ))
 
@@ -147,6 +172,7 @@ class ContextStore:
                 status = ?, agent_used = ?, attempts = ?,
                 react_history = ?, routed_by = ?,
                 duration_sec = ?, diff = ?, error = ?,
+                merge_commit = ?,
                 updated_at = ?
             WHERE id = ?
         """, (
@@ -155,6 +181,7 @@ class ContextStore:
             task.duration_sec,
             task.diff,
             task.error,
+            task.merge_commit,
             datetime.now().isoformat(),
             task.id,
         ))
@@ -241,14 +268,66 @@ class ContextStore:
     def _row_to_task(row: sqlite3.Row) -> Task:
         """Convert DB row to Task object."""
         d = dict(row)
-        # Parse JSON fields
-        for field in ("target_files", "dependencies"):
-            if isinstance(d.get(field), str):
+        # Parse JSON list fields
+        _json_list_fields = (
+            "target_files", "dependencies",
+            "definition_of_done", "verifier_scope", "out_of_scope",
+            "required_target_files", "source_gaps", "depends_on",
+        )
+        for fld in _json_list_fields:
+            if isinstance(d.get(fld), str):
                 try:
-                    d[field] = json.loads(d[field])
+                    d[fld] = json.loads(d[fld])
                 except (json.JSONDecodeError, TypeError):
-                    d[field] = []
+                    d[fld] = []
+        # Parse boolean stored as INTEGER
+        if "allowed_no_diff" in d:
+            d["allowed_no_diff"] = bool(d["allowed_no_diff"])
         return Task.from_dict(d)
+
+    def consistency_report(self) -> dict:
+        """Return merge_commit consistency stats for completed tasks."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed' AND merge_commit != ''")
+        with_sha = cursor.fetchone()[0]
+        return {"completed": total, "with_sha": with_sha, "without_sha": total - with_sha}
+
+    def backfill_merge_commits(self, head_sha: str) -> list[str]:
+        """Backfill merge_commit with current HEAD for completed tasks missing SHA. Returns backfilled task IDs."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id FROM tasks WHERE status = 'completed' AND (merge_commit = '' OR merge_commit IS NULL)"
+        )
+        ids = [row[0] for row in cursor.fetchall()]
+        if ids:
+            cursor.executemany(
+                "UPDATE tasks SET merge_commit = ? WHERE id = ?",
+                [(head_sha, tid) for tid in ids],
+            )
+            self.conn.commit()
+        return ids
+
+    def repair_unverifiable(self) -> list[str]:
+        """Reset completed tasks without merge_commit back to pending. Returns reset task IDs."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id FROM tasks WHERE status = 'completed' AND (merge_commit = '' OR merge_commit IS NULL)"
+        )
+        ids = [row[0] for row in cursor.fetchall()]
+        for task_id in ids:
+            self.reset_task_status(task_id)
+        return ids
+
+    def reset_task_status(self, task_id: str):
+        """Reset a task to pending (for resume preflight repair)."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE tasks SET status = 'pending', merge_commit = '', error = '' WHERE id = ?",
+            (task_id,)
+        )
+        self.conn.commit()
 
     def close(self):
         """Close DB connection."""

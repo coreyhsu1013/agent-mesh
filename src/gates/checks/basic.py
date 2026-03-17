@@ -318,6 +318,27 @@ def diff_not_empty(task, diff: str = "", **kwargs) -> tuple[bool, str]:
     return False, "Diff is empty — task produced no changes"
 
 
+def dod_diff_required(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """Analysis task skip; implementation task must have diff."""
+    if getattr(task, "allowed_no_diff", False):
+        return True, "Analysis task — diff not required"
+    if not diff or len(diff.strip()) <= 10:
+        return False, "Implementation task produced no diff"
+    return True, ""
+
+
+def dod_must_change_files(task, diff: str = "", **kwargs) -> tuple[bool, str]:
+    """Must change at least one file from required_target_files."""
+    must = getattr(task, "required_target_files", [])
+    if not must:
+        return True, ""
+    changed = _extract_changed_files(diff)
+    for mf in must:
+        if any(mf in c or c.endswith(mf) for c in changed):
+            return True, f"Required file changed: {mf}"
+    return False, f"None of required_target_files in diff: {must[:3]}"
+
+
 async def build_pass(task, workspace_dir: str = "", **kwargs) -> tuple[bool, str]:
     """
     Run build check in workspace.
@@ -432,6 +453,8 @@ CHECK_REGISTRY: dict[str, callable] = {
     "no_secret_leak": no_secret_leak,
     # Verification checks
     "diff_not_empty": diff_not_empty,
+    "dod_diff_required": dod_diff_required,
+    "dod_must_change_files": dod_must_change_files,
     "build_pass": build_pass,
     "tests_pass": tests_pass,
     # Escalation checks
