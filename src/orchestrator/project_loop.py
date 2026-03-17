@@ -382,8 +382,13 @@ class ProjectLoop:
 
         # Step 3: Convergence check
         total_gaps = all_gap_count
-        defer_threshold = self.config.get("verify", {}).get("defer_remaining_threshold", 0)
-        if (total_gaps > convergence_threshold
+        is_last_chunk = self.config.get("is_last_chunk", False)
+        defer_base = self.config.get("verify", {}).get("defer_remaining_threshold", 2)
+        # Progressive tolerance: threshold increases each cycle (cycle 2=base, 3=base+1, ...)
+        defer_threshold = defer_base + max(0, cycle - 2)
+
+        if (not is_last_chunk
+                and total_gaps > convergence_threshold
                 and total_gaps <= defer_threshold
                 and cycle >= 2
                 and report.build_ok):
@@ -393,8 +398,8 @@ class ProjectLoop:
             ]
             self._save_deferred_gaps(remaining_issues)
             logger.info(
-                f"✅ Deferred: {total_gaps} gaps <= defer threshold {defer_threshold}, "
-                f"passing to next chunk (cycle {cycle})"
+                f"✅ Deferred: {total_gaps} gaps <= defer threshold {defer_threshold} "
+                f"(base={defer_base}, cycle={cycle}), passing to next chunk"
             )
             report.issues = []  # mark as passed
             return report, None

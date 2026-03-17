@@ -568,12 +568,20 @@ class DesignLoop:
         self._emit_event(f"CHUNK_START {chunk.chunk_id} — {chunk.title} ({len(chunk.changes)} tasks)")
         self.run_history.start_chunk(chunk.chunk_id, chunk.title, chunk.wave_order)
 
+        # Determine if this is the last chunk (no more pending after this)
+        remaining_after = [
+            c for c in all_chunks
+            if c.chunk_id != chunk.chunk_id and c.status == "pending"
+        ]
+        is_last_chunk = len(remaining_after) == 0
+
         total_attempts = 0
 
         while True:
             result = await self._run_chunk(
                 chunk, max_inner_cycles, max_parallel, no_review,
                 target_branch=target_branch,
+                is_last_chunk=is_last_chunk,
             )
             total_attempts += 1
 
@@ -1082,6 +1090,7 @@ class DesignLoop:
         max_parallel: int,
         no_review: bool,
         target_branch: str = "main",
+        is_last_chunk: bool = False,
     ) -> dict:
         """
         Execute one chunk through the Implementation Pipeline.
@@ -1211,6 +1220,7 @@ class DesignLoop:
 
         # v1.3: set current chunk for checkpoint tracking
         self.config["current_chunk_id"] = chunk.chunk_id
+        self.config["is_last_chunk"] = is_last_chunk
 
         loop = ProjectLoop(self.config, self.repo_dir, spec_path,
                            run_history=self.run_history)
