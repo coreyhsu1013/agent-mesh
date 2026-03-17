@@ -1,4 +1,4 @@
-# Agent Mesh Architecture (v1.0)
+# Agent Mesh Architecture (v2.2)
 
 ## Five-Layer Architecture
 ```

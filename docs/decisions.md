@@ -2,6 +2,19 @@
 
 ## Version History
 
+### v2.2 — Target Files Inference + Path Resolution (2026-03-18)
+- **Problem**: evolve-run-19 19/118 tasks fail — weak target_files inference, strict gate paths, stale verifier paths
+- **Solution 1**: 6-layer target_files inference (required → source_gaps → description → module → regex), repo-aware filtering
+- **Solution 2**: Conservative allowed_paths_only relaxation — sibling shared/common + task-provided related_dirs
+- **Solution 3**: Canonical path resolution in verifier — VERIFY_FALSE_POSITIVE (phantom) + LEGACY_ARTIFACT_MISMATCH (stale→canonical)
+- **Key decisions**: related_dirs must be repo-aware filtered; legacy_artifact_mismatch never generates fix tasks against stale paths; canonical path uses chunk/module context from VerifyContext
+- Commit: 45c1e87
+
+### v2.1 — Task Schema v2: Scope Control + Gate Routing (2026-03-16)
+- **Problem**: Tasks lack scope metadata, verifier can't scope to chunks, no deterministic quality gates
+- **Solution**: Task Schema v2 fields (chunk_id, definition_of_done, verifier_scope, required_target_files), TaskNormalizer, Gate Architecture (GateProfile/GateRunner/check registry)
+- Commits: cdd7929
+
 ### v1.0 — Design Pipeline: Spec Evolution (2026-03-04)
 - **Problem**: 有固定 spec 的 Layer 1-4 無法處理 spec 大改版（如 v1→v2，新增 3 模組、26 API、改 8 張 table）
 - **Solution**: Design Pipeline — delta analysis → chunking → per-chunk implementation (inner Layer 1-4) → validation → recursion
