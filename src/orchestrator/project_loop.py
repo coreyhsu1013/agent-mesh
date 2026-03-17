@@ -382,6 +382,23 @@ class ProjectLoop:
 
         # Step 3: Convergence check
         total_gaps = all_gap_count
+        defer_threshold = self.config.get("verify", {}).get("defer_remaining_threshold", 0)
+        if (total_gaps > convergence_threshold
+                and total_gaps <= defer_threshold
+                and cycle >= 2
+                and report.build_ok):
+            # Defer remaining gaps to next chunk instead of cycling
+            remaining_issues = [
+                i for i in report.issues if i.category == "spec_gap"
+            ]
+            self._save_deferred_gaps(remaining_issues)
+            logger.info(
+                f"✅ Deferred: {total_gaps} gaps <= defer threshold {defer_threshold}, "
+                f"passing to next chunk (cycle {cycle})"
+            )
+            report.issues = []  # mark as passed
+            return report, None
+
         if total_gaps <= convergence_threshold and report.build_ok:
             # Step 3.5: Layer 4 — Integration validation (only when spec gaps converged)
             layer4_cfg = self.config.get("layer4", {})

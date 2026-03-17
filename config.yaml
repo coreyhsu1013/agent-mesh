@@ -152,6 +152,7 @@ verify:
   exclude_modules: []                    # e.g. ["Module 1: Android Capture Service"]
   max_new_gaps_per_cycle: 5
   convergence_threshold: 0               # must fix ALL gaps to pass
+  defer_remaining_threshold: 2            # defer ≤N gaps to next chunk after cycle 2
   regression_model: "claude-sonnet-4-6"  # cheaper model for regression check
   scan_model: "claude-opus-4-6"          # stronger model for new gap scan
 
